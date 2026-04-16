@@ -29,6 +29,14 @@ from utils.models import extract_model_size_b as _extract_model_size_b
 
 def _friendly_error(exc: Exception) -> str:
     """Extract a user-friendly message from known llama-server errors."""
+    # httpx transport-layer failures reaching the managed llama-server —
+    # raised by the async pass-through helpers that talk to llama-server
+    # directly. Treat any RequestError subclass (ConnectError, ReadError,
+    # RemoteProtocolError, WriteError, PoolTimeout, ...) as "the upstream
+    # subprocess is unreachable", which for Studio always means the
+    # llama-server subprocess crashed or is still coming up.
+    if isinstance(exc, httpx.RequestError):
+        return "Lost connection to the model server. It may have crashed -- try reloading the model."
     msg = str(exc)
     m = _re.search(
         r"request \((\d+) tokens?\) exceeds the available context size \((\d+) tokens?\)",
@@ -106,6 +114,7 @@ from models.inference import (
 from core.inference.anthropic_compat import (
     anthropic_messages_to_openai,
     anthropic_tools_to_openai,
+    anthropic_tool_choice_to_openai,
     AnthropicStreamEmitter,
     AnthropicPassthroughEmitter,
 )
@@ -1122,6 +1131,60 @@ async def openai_chat_completions(
                 )
                 return JSONResponse(content = response.model_dump())
 
+    # ── Standard OpenAI function-calling pass-through (GGUF only) ────
+    # When a client (opencode / Claude Code via OpenAI compat / Cursor /
+    # Continue / ...) sends standard OpenAI `tools` without Studio's
+    # `enable_tools` shorthand, forward the request to llama-server
+    # verbatim so structured `tool_calls` flow back to the client. This
+    # branch runs BEFORE `_extract_content_parts` because that helper is
+    # unaware of `role="tool"` messages and assistant messages that only
+    # carry `tool_calls` (content=None) — both of which are valid in
+    # multi-turn client-side tool loops.
+    _has_tool_messages = any(m.role == "tool" or m.tool_calls for m in payload.messages)
+    _has_inline_image = any(
+        isinstance(m.content, list)
+        and any(getattr(p, "type", None) == "image_url" for p in m.content)
+        for m in payload.messages
+    )
+    _openai_tool_passthrough = (
+        using_gguf
+        and llama_backend.supports_tools
+        and not payload.enable_tools
+        and (bool(payload.tools) or _has_tool_messages)
+    )
+    if _openai_tool_passthrough:
+        if (payload.image_base64 or _has_inline_image) and not llama_backend.is_vision:
+            raise HTTPException(
+                status_code = 400,
+                detail = "Image provided but current GGUF model does not support vision.",
+            )
+        cancel_event = threading.Event()
+        if payload.stream:
+            return await _openai_passthrough_stream(
+                request,
+                cancel_event,
+                llama_backend,
+                payload,
+            )
+        return await _openai_passthrough_non_streaming(
+            llama_backend,
+            payload,
+        )
+
+    _has_unsupported_tool_shape = any(
+        (m.role == "assistant" and m.content is None and m.tool_calls)
+        or m.role == "tool"
+        for m in payload.messages
+    )
+    if _has_unsupported_tool_shape:
+        raise HTTPException(
+            status_code = 400,
+            detail = (
+                "Messages with role='tool' or assistant tool_calls-only turns "
+                "are only supported on the GGUF llama-server tool passthrough path."
+            ),
+        )
+
     # ── Parse messages (handles multimodal content parts) ─────
     system_prompt, chat_messages, extracted_image_b64 = _extract_content_parts(
         payload.messages
@@ -1933,25 +1996,32 @@ async def openai_completions(
     if is_stream:
 
         async def _stream():
-            # Manual httpx client/response lifecycle — see
-            # _anthropic_passthrough_stream for the full rationale. Briefly:
-            # `async with` inside an async generator causes
-            # "Attempted to exit cancel scope in a different task" /
-            # "async generator ignored GeneratorExit" on Python 3.13 +
-            # httpcore 1.0.x when the generator is orphaned and finalized
-            # by GC. Closing via a finally block that catches Exception
-            # (but not BaseException) suppresses the anyio cleanup noise
-            # while letting GeneratorExit propagate cleanly.
+            # Manual httpx client/response lifecycle AND explicit
+            # aiter_bytes() iterator close — see _anthropic_passthrough_stream
+            # for the full rationale. Saving `bytes_iter = resp.aiter_bytes()`
+            # and `await bytes_iter.aclose()` in the finally block is the
+            # part that matters for avoiding the Python 3.13 + httpcore
+            # 1.0.x "Exception ignored in: <async_generator>" / anyio
+            # cancel-scope trace: an anonymous async for leaves the
+            # iterator unclosed, so Python's asyncgen GC finalizer runs
+            # cleanup on a later pass in a different asyncio task.
             client = httpx.AsyncClient(timeout = 600)
             resp = None
+            bytes_iter = None
             try:
                 req = client.build_request("POST", target_url, json = body)
                 resp = await client.send(req, stream = True)
-                async for chunk in resp.aiter_bytes():
+                bytes_iter = resp.aiter_bytes()
+                async for chunk in bytes_iter:
                     yield chunk
             except Exception as e:
                 logger.error("openai_completions stream error: %s", e)
             finally:
+                if bytes_iter is not None:
+                    try:
+                        await bytes_iter.aclose()
+                    except Exception:
+                        pass
                 if resp is not None:
                     try:
                         await resp.aclose()
@@ -2339,22 +2409,17 @@ async def anthropic_messages(
     )
     stop = payload.stop_sequences or None
 
-    # tool_choice is declared on AnthropicMessagesRequest for Anthropic SDK
-    # compatibility (the SDK often sets it by default), but it is not
-    # currently honored by Unsloth's backend. Warn once per request so the
-    # silent drop is visible to operators instead of looking like a model
-    # quality issue to clients.
-    if payload.tool_choice is not None:
-        logger.warning(
-            "anthropic_messages.tool_choice_ignored",
-            tool_choice = payload.tool_choice,
-            note = (
-                "tool_choice is accepted for Anthropic SDK compatibility but not "
-                "honored by Unsloth. Use enable_tools / enabled_tools (server-side "
-                "built-in tools) or restrict the `tools` array (client-side) to "
-                "control which tools the model sees."
-            ),
-        )
+    # Translate Anthropic tool_choice to OpenAI format for forwarding to
+    # llama-server. Falls back to "auto" when unset or unrecognized, which
+    # matches the prior hardcoded behavior.
+    openai_tool_choice = anthropic_tool_choice_to_openai(payload.tool_choice)
+    if openai_tool_choice is None:
+        if payload.tool_choice is not None:
+            logger.warning(
+                "anthropic_messages.tool_choice_unrecognized",
+                tool_choice = payload.tool_choice,
+            )
+        openai_tool_choice = "auto"
 
     cancel_event = threading.Event()
 
@@ -2364,6 +2429,14 @@ async def anthropic_messages(
     # 2. tools=[...] only  → client-side pass-through (standard Anthropic behavior)
     # 3. neither           → plain chat
     server_tools = payload.enable_tools and llama_backend.supports_tools
+    if server_tools and payload.tool_choice is not None:
+        raise HTTPException(
+            status_code = 400,
+            detail = (
+                "tool_choice is not honored when enable_tools=true. "
+                "Use client-side tools (omit enable_tools) to control tool_choice."
+            ),
+        )
     client_tools = (
         not server_tools
         and payload.tools
@@ -2392,6 +2465,7 @@ async def anthropic_messages(
                 min_p = min_p,
                 repetition_penalty = repetition_penalty,
                 presence_penalty = presence_penalty,
+                tool_choice = openai_tool_choice,
             )
         return await _anthropic_passthrough_non_streaming(
             llama_backend,
@@ -2407,6 +2481,7 @@ async def anthropic_messages(
             min_p = min_p,
             repetition_penalty = repetition_penalty,
             presence_penalty = presence_penalty,
+            tool_choice = openai_tool_choice,
         )
 
     if server_tools:
@@ -2738,6 +2813,11 @@ async def _anthropic_plain_non_streaming(run_gen, message_id, model_name):
 # =====================================================================
 
 
+def _llama_auth_headers(llama_backend):
+    api_key = getattr(llama_backend, "_api_key", None)
+    return {"Authorization": f"Bearer {api_key}"} if api_key else None
+
+
 def _build_passthrough_payload(
     openai_messages,
     openai_tools,
@@ -2750,16 +2830,18 @@ def _build_passthrough_payload(
     min_p = None,
     repetition_penalty = None,
     presence_penalty = None,
+    tool_choice = "auto",
 ):
     body = {
         "messages": openai_messages,
-        "tools": openai_tools,
-        "tool_choice": "auto",
         "temperature": temperature,
         "top_p": top_p,
         "top_k": top_k,
         "stream": stream,
     }
+    if openai_tools is not None:
+        body["tools"] = openai_tools
+        body["tool_choice"] = tool_choice
     if stream:
         body["stream_options"] = {"include_usage": True}
     if max_tokens is not None:
@@ -2792,6 +2874,7 @@ async def _anthropic_passthrough_stream(
     min_p = None,
     repetition_penalty = None,
     presence_penalty = None,
+    tool_choice = "auto",
 ):
     """Streaming client-side pass-through: forward tools to llama-server and
     translate its streaming response to Anthropic SSE without executing anything."""
@@ -2808,6 +2891,7 @@ async def _anthropic_passthrough_stream(
         min_p = min_p,
         repetition_penalty = repetition_penalty,
         presence_penalty = presence_penalty,
+        tool_choice = tool_choice,
     )
 
     async def _stream():
@@ -2815,33 +2899,42 @@ async def _anthropic_passthrough_stream(
         for line in emitter.start(message_id, model_name):
             yield line
 
-        # Manage the httpx client and response MANUALLY — no `async with`.
+        # Manage the httpx client, response, AND the aiter_lines() async
+        # generator MANUALLY — no `async with`, no anonymous iterator.
         #
-        # On Python 3.13 + httpcore 1.0.x, an orphaned async generator (e.g.
-        # when the client disconnects mid-stream and Starlette drops the
-        # StreamingResponse iterator without explicitly calling aclose())
-        # is finalized by Python's asyncgen GC hook in a DIFFERENT asyncio
-        # task than the one that originally entered the httpx context
-        # managers. When `async with` exits run in the wrong task, httpcore's
-        # internal `HTTP11ConnectionByteStream.aclose()` hits
-        # `anyio.CancelScope.__exit__` with a mismatched task and raises
-        # RuntimeError("Attempted to exit cancel scope in a different task"),
-        # which escapes as "Exception ignored in:" because it happens during
-        # GC finalization outside any user-owned try/except.
+        # On Python 3.13 + httpcore 1.0.x, `async for raw_line in
+        # resp.aiter_lines():` creates an anonymous async generator. When
+        # the loop exits via `break` (or the generator is orphaned when a
+        # client disconnects mid-stream), Python's `async for` protocol
+        # does NOT auto-close the iterator the way a sync `for` loop
+        # would. The iterator remains reachable only from the current
+        # coroutine frame; once `_stream()` returns, the frame is GC'd
+        # and the iterator becomes unreachable. Python's asyncgen
+        # finalizer hook then runs its aclose() on a LATER GC pass in a
+        # DIFFERENT asyncio task, where httpcore's
+        # `HTTP11ConnectionByteStream.aclose()` enters
+        # `anyio.CancelScope.__exit__` with a mismatched task and prints
+        # `RuntimeError: Attempted to exit cancel scope in a different
+        # task` / `RuntimeError: async generator ignored GeneratorExit`
+        # as "Exception ignored in:" unraisable warnings.
         #
-        # The fix: do not use `async with` for the client/response. Close
-        # them in a finally block wrapped in `try: ... except Exception: pass`.
-        # This narrowly suppresses RuntimeError / other Exception subclasses
-        # from the anyio cleanup noise while letting GeneratorExit (a
-        # BaseException, not Exception) propagate through cleanly so the
-        # generator terminates as Python expects.
-        client = httpx.AsyncClient(timeout = 600)
+        # The fix: save `resp.aiter_lines()` as `lines_iter`, and in the
+        # finally block explicitly `await lines_iter.aclose()` BEFORE
+        # `resp.aclose()` / `client.aclose()`. This closes the iterator
+        # inside our own task's event loop, so the internal httpcore
+        # byte-stream is cleaned up before Python's asyncgen finalizer
+        # has anything orphaned to finalize. Each aclose is wrapped in
+        # `try: ... except Exception: pass` so anyio cleanup noise from
+        # nested aclose paths can't bubble out.
+        client = httpx.AsyncClient(timeout = 600, headers = _llama_auth_headers(llama_backend))
         resp = None
+        lines_iter = None
         try:
             req = client.build_request("POST", target_url, json = body)
             resp = await client.send(req, stream = True)
 
-            async for raw_line in resp.aiter_lines():
+            lines_iter = resp.aiter_lines()
+            async for raw_line in lines_iter:
                 if await request.is_disconnected():
                     cancel_event.set()
                     break
@@ -2859,6 +2952,11 @@ async def _anthropic_passthrough_stream(
         except Exception as e:
             logger.error("anthropic_messages passthrough stream error: %s", e)
         finally:
+            if lines_iter is not None:
+                try:
+                    await lines_iter.aclose()
+                except Exception:
+                    pass
             if resp is not None:
                 try:
                     await resp.aclose()
@@ -2897,6 +2995,7 @@ async def _anthropic_passthrough_non_streaming(
     min_p = None,
     repetition_penalty = None,
     presence_penalty = None,
+    tool_choice = "auto",
 ):
     """Non-streaming client-side pass-through."""
     target_url = f"{llama_backend.base_url}/v1/chat/completions"
@@ -2912,10 +3011,18 @@ async def _anthropic_passthrough_non_streaming(
         min_p = min_p,
         repetition_penalty = repetition_penalty,
         presence_penalty = presence_penalty,
+        tool_choice = tool_choice,
     )
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(target_url, json = body, timeout = 600)
+    try:
+        async with httpx.AsyncClient(headers = _llama_auth_headers(llama_backend)) as client:
+            resp = await client.post(target_url, json = body, timeout = 600)
+    except httpx.RequestError as e:
+        logger.error("anthropic passthrough non-streaming: upstream unreachable: %s", e)
+        raise HTTPException(
+            status_code = 502,
+            detail = _friendly_error(e),
+        )
 
     if resp.status_code != 200:
         raise HTTPException(
@@ -2969,3 +3076,248 @@ async def _anthropic_passthrough_non_streaming(
         ),
     )
     return JSONResponse(content = resp_obj.model_dump())
+
+
+# =====================================================================
+# Client-side tool pass-through (OpenAI-native /v1/chat/completions)
+# =====================================================================
+
+
+def _openai_messages_for_passthrough(payload) -> list[dict]:
+    """Build OpenAI-format message dicts for the /v1/chat/completions
+    passthrough path.
+
+    Messages from ``payload.messages`` are dumped through Pydantic (dropping
+    unset optional fields) so they are already in standard OpenAI format
+    — including ``role="tool"`` tool-result messages and assistant messages
+    that carry structured ``tool_calls``. Content-parts images already in
+    the message list are left untouched.
+
+    When a client uses Studio's legacy ``image_base64`` top-level field, the
+    image is re-encoded to PNG (llama-server's stb_image has limited format
+    support) and spliced into the last user message as an OpenAI
+    ``image_url`` content part so vision + function-calling requests work
+    transparently.
+    """
+    messages = [m.model_dump(exclude_none = True) for m in payload.messages]
+
+    if not payload.image_base64:
+        return messages
+
+    last_user = next(
+        (m for m in reversed(messages) if m.get("role") == "user"), None
+    )
+    if last_user is not None:
+        content = last_user.get("content")
+        if isinstance(content, list) and any(
+            isinstance(p, dict) and p.get("type") == "image_url" for p in content
+        ):
+            return messages
+
+    try:
+        import base64 as _b64
+        from io import BytesIO as _BytesIO
+        from PIL import Image as _Image
+
+        raw = _b64.b64decode(payload.image_base64)
+        img = _Image.open(_BytesIO(raw))
+        if img.mode == "RGBA":
+            img = img.convert("RGB")
+        buf = _BytesIO()
+        img.save(buf, format = "PNG")
+        png_b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as e:
+        raise HTTPException(
+            status_code = 400,
+            detail = f"Failed to process image: {e}",
+        )
+
+    data_url = f"data:image/png;base64,{png_b64}"
+    image_part = {"type": "image_url", "image_url": {"url": data_url}}
+
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        existing = msg.get("content")
+        if isinstance(existing, str):
+            msg["content"] = [{"type": "text", "text": existing}, image_part]
+        elif isinstance(existing, list):
+            existing.append(image_part)
+        else:
+            msg["content"] = [image_part]
+        break
+    else:
+        messages.append({"role": "user", "content": [image_part]})
+
+    return messages
+
+
+def _build_openai_passthrough_body(payload) -> dict:
+    """Assemble the llama-server request body from a ChatCompletionRequest.
+
+    Only explicitly-known OpenAI / llama-server fields are forwarded so that
+    Studio-specific extensions (``enable_tools``, ``enabled_tools``,
+    ``session_id``, ...) never leak to the backend.
+    """
+    messages = _openai_messages_for_passthrough(payload)
+    tool_choice = payload.tool_choice if payload.tool_choice is not None else "auto"
+    return _build_passthrough_payload(
+        messages,
+        payload.tools,
+        payload.temperature,
+        payload.top_p,
+        payload.top_k,
+        payload.max_tokens,
+        payload.stream,
+        stop = payload.stop,
+        min_p = payload.min_p,
+        repetition_penalty = payload.repetition_penalty,
+        presence_penalty = payload.presence_penalty,
+        tool_choice = tool_choice,
+    )
+
+
+async def _openai_passthrough_stream(
+    request,
+    cancel_event,
+    llama_backend,
+    payload,
+):
+    """Streaming client-side pass-through for /v1/chat/completions.
+
+    Forwards the client's OpenAI function-calling request to llama-server and
+    relays the SSE stream back verbatim. This preserves llama-server's
+    native response ``id``, ``finish_reason`` (including ``"tool_calls"``),
+    ``delta.tool_calls``, and the trailing ``usage`` chunk so the client
+    observes a standard OpenAI response.
+    """
+    target_url = f"{llama_backend.base_url}/v1/chat/completions"
+    body = _build_openai_passthrough_body(payload)
+
+    async def _stream():
+        # Same httpx lifecycle pattern as _anthropic_passthrough_stream:
+        # avoid `async with` on the client/response AND explicitly save
+        # resp.aiter_lines() so we can close it ourselves in the finally
+        # block. See the long comment there for the full rationale on
+        # why the anonymous `async for raw_line in resp.aiter_lines():`
+        # pattern leaks an unclosed async generator that Python's
+        # asyncgen GC hook then finalizes in a different asyncio task,
+        # producing "Exception ignored in:" / "async generator ignored
+        # GeneratorExit" / anyio cancel-scope traces on Python 3.13 +
+        # httpcore 1.0.x.
+        client = httpx.AsyncClient(timeout = 600, headers = _llama_auth_headers(llama_backend))
+        resp = None
+        lines_iter = None
+        try:
+            req = client.build_request("POST", target_url, json = body)
+            resp = await client.send(req, stream = True)
+
+            if resp.status_code != 200:
+                err_bytes = await resp.aread()
+                err_text = err_bytes.decode("utf-8", errors = "replace")
+                logger.error(
+                    "openai passthrough upstream error: status=%s body=%s",
+                    resp.status_code,
+                    err_text[:500],
+                )
+                err = {
+                    "error": {
+                        "message": f"llama-server error: {err_text[:500]}",
+                        "type": "server_error",
+                    },
+                }
+                yield f"data: {json.dumps(err)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            lines_iter = resp.aiter_lines()
+            async for raw_line in lines_iter:
+                if await request.is_disconnected():
+                    cancel_event.set()
+                    break
+                if not raw_line:
+                    continue
+                if not raw_line.startswith("data: "):
+                    continue
+                # Relay the llama-server SSE chunk verbatim so the client
+                # sees its native `id`, `finish_reason`, `delta.tool_calls`,
+                # and final `usage` unchanged.
+                yield raw_line + "\n\n"
+                if raw_line[6:].strip() == "[DONE]":
+                    break
+        except Exception as e:
+            logger.error("openai passthrough stream error: %s", e)
+            err = {
+                "error": {
+                    "message": _friendly_error(e),
+                    "type": "server_error",
+                },
+            }
+            yield f"data: {json.dumps(err)}\n\n"
+            yield "data: [DONE]\n\n"
+        finally:
+            if lines_iter is not None:
+                try:
+                    await lines_iter.aclose()
+                except Exception:
+                    pass
+            if resp is not None:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        _stream(),
+        media_type = "text/event-stream",
+        headers = {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _openai_passthrough_non_streaming(
+    llama_backend,
+    payload,
+):
+    """Non-streaming client-side pass-through for /v1/chat/completions.
+
+    Returns llama-server's JSON response verbatim (via JSONResponse) so the
+    client sees the native response ``id``, ``finish_reason`` (including
+    ``"tool_calls"``), structured ``tool_calls``, and accurate ``usage``
+    token counts.
+    """
+    target_url = f"{llama_backend.base_url}/v1/chat/completions"
+    body = _build_openai_passthrough_body(payload)
+
+    try:
+        async with httpx.AsyncClient(headers = _llama_auth_headers(llama_backend)) as client:
+            resp = await client.post(target_url, json = body, timeout = 600)
+    except httpx.RequestError as e:
+        # llama-server subprocess crashed / still starting / unreachable.
+        # Surface the same friendly message the sync chat path emits so
+        # operators don't see a bare 500 with no diagnostic.
+        logger.error("openai passthrough non-streaming: upstream unreachable: %s", e)
+        raise HTTPException(
+            status_code = 502,
+            detail = _friendly_error(e),
+        )
+
+    if resp.status_code != 200:
+        logger.error(
+            "openai passthrough non-streaming upstream error: status=%s body=%s",
+            resp.status_code,
+            resp.text[:500],
+        )
+        raise HTTPException(
+            status_code = resp.status_code,
+            detail = f"llama-server error: {resp.text[:500]}",
+        )
+
+    return JSONResponse(content = resp.json())
