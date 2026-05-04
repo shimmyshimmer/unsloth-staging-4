@@ -601,7 +601,16 @@ class FastGemma2Model(FastLlamaModel):
         Gemma2SdpaAttention.forward = Gemma2Attention_fast_forward
         Gemma2FlashAttention2.forward = Gemma2Attention_fast_forward
         Gemma2DecoderLayer.forward = Gemma2DecoderLayer_fast_forward
-        Gemma2Model.forward = LlamaModel_fast_forward
+        # why: PaliGemma 2 in transformers >= 5 passes a dict causal_mask_mapping
+        # to language_model; LlamaModel_fast_forward reads attention_mask.shape,
+        # so delegate dict masks back to the original Gemma2Model.forward.
+        _orig_gemma2_model_forward = Gemma2Model.forward
+        def _gemma2_model_forward_dispatch(self, *args, **kwargs):
+            am = kwargs.get("attention_mask", None)
+            if isinstance(am, dict):
+                return _orig_gemma2_model_forward(self, *args, **kwargs)
+            return LlamaModel_fast_forward(self, *args, **kwargs)
+        Gemma2Model.forward = _gemma2_model_forward_dispatch
         Gemma2ForCausalLM.forward = CausalLM_fast_forward(
             Gemma2Model_fast_forward_inference
         )
