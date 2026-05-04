@@ -1135,6 +1135,8 @@ class FastModel(FastBaseModel):
                     trust_remote_code = trust_remote_code,
                 )
                 model_types = sorted(set(model_types) | set(_base_model_types))
+            except ImportError:
+                raise
             except Exception as _e:
                 logger.warning_once(
                     "Unsloth: Could not inspect base model config for PaliGemma "
