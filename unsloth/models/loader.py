@@ -1186,11 +1186,28 @@ class FastModel(FastBaseModel):
             if is_rdna():
                 os.environ["UNSLOTH_COMPILE_DISABLE"] = "partial"
         # PaliGemma (v1: Gemma backbone, v2: Gemma2 backbone)
-        # Must be checked before generic "gemma2"/"gemma" to apply fast kernels
-        # to the inner language_model via class-level patching.
+        # Routes through the vision path, so pre_patch() must be applied here;
+        # otherwise the inner language_model never receives Unsloth fast kernels.
         elif "paligemma" in model_types_all:
-            os.environ["UNSLOTH_HIGH_PRECISION_LAYERNORM"] = "1"
-            if "gemma2" in model_types_all:
+            is_paligemma2 = "gemma2" in model_types_all
+            if not is_paligemma2 and is_peft and peft_config is not None:
+                # why: PEFT auto_mapping can resolve only "paligemma" without exposing
+                # text_config.model_type, so we must read the base model's config
+                # to discriminate v1 (gemma) from v2 (gemma2) before pre-patching.
+                try:
+                    _base_config = AutoConfig.from_pretrained(
+                        peft_config.base_model_name_or_path,
+                        token = token,
+                        revision = revision,
+                        trust_remote_code = trust_remote_code,
+                        local_files_only = local_files_only,
+                    )
+                    _text_cfg = getattr(_base_config, "text_config", None)
+                    _text_model_type = str(getattr(_text_cfg, "model_type", "") or "").lower()
+                    is_paligemma2 = _text_model_type == "gemma2"
+                except Exception:
+                    pass
+            if is_paligemma2:
                 # PaliGemma 2 — language_model is Gemma2ForCausalLM
                 if transformers_version < Version("4.42.3"):
                     raise RuntimeError(
@@ -1198,6 +1215,7 @@ class FastModel(FastBaseModel):
                         'Try `pip install --upgrade "transformers>=4.42.3"`\n'
                         "to obtain the latest transformers build, then restart this session."
                     )
+                os.environ["UNSLOTH_HIGH_PRECISION_LAYERNORM"] = "1"
                 FastGemma2Model.pre_patch()
             else:
                 # PaliGemma 1 — language_model is GemmaForCausalLM
@@ -1207,6 +1225,7 @@ class FastModel(FastBaseModel):
                         'Try `pip install --upgrade "transformers>=4.38"`\n'
                         "to obtain the latest transformers build, then restart this session."
                     )
+                os.environ["UNSLOTH_HIGH_PRECISION_LAYERNORM"] = "1"
                 FastGemmaModel.pre_patch()
         # Cohere
         elif "cohere2" in model_types_all and transformers_version < Version(
