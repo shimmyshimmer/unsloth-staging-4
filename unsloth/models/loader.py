@@ -1213,29 +1213,27 @@ class FastModel(FastBaseModel):
             if is_rdna():
                 os.environ["UNSLOTH_COMPILE_DISABLE"] = "partial"
         # PaliGemma (v1: Gemma backbone, v2: Gemma2 backbone)
-        # Routes through the vision path, so pre_patch() must be applied here;
-        # otherwise the inner language_model never receives Unsloth fast kernels.
+        # Validate transformers version and enable high-precision layernorm;
+        # downstream unsloth_compile_transformers handles the inner language
+        # backbone, so do not call FastGemma{,2}Model.pre_patch() here (those
+        # install class-level fast forwards designed for FastLanguageModel,
+        # not for VLMs whose outer model passes a per-layer mask mapping).
         elif "paligemma" in model_types_all:
             if "gemma2" in model_types_all:
-                # PaliGemma 2 — language_model is Gemma2ForCausalLM
                 if transformers_version < Version("4.42.3"):
                     raise RuntimeError(
                         "Unsloth: PaliGemma 2 requires transformers >= 4.42.3.\n"
                         'Try `pip install --upgrade "transformers>=4.42.3"`\n'
                         "to obtain the latest transformers build, then restart this session."
                     )
-                os.environ["UNSLOTH_HIGH_PRECISION_LAYERNORM"] = "1"
-                FastGemma2Model.pre_patch()
             else:
-                # PaliGemma 1 — language_model is GemmaForCausalLM
                 if not SUPPORTS_GEMMA:
                     raise RuntimeError(
                         "Unsloth: PaliGemma requires transformers >= 4.38.\n"
                         'Try `pip install --upgrade "transformers>=4.38"`\n'
                         "to obtain the latest transformers build, then restart this session."
                     )
-                os.environ["UNSLOTH_HIGH_PRECISION_LAYERNORM"] = "1"
-                FastGemmaModel.pre_patch()
+            os.environ["UNSLOTH_HIGH_PRECISION_LAYERNORM"] = "1"
         # Cohere
         elif "cohere2" in model_types_all and transformers_version < Version(
             "4.50.0.dev0"
