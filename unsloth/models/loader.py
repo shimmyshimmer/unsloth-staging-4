@@ -1115,6 +1115,33 @@ class FastModel(FastBaseModel):
             peft_config if peft_config is not None else model_config,
             trust_remote_code = trust_remote_code,
         )
+        # why: PEFT auto_mapping can resolve to ["paligemma"] without exposing
+        # the inner gemma/gemma2 backbone, which downstream compile/load need.
+        if (
+            is_peft
+            and peft_config is not None
+            and "paligemma" in model_types
+            and not any(t in ("gemma", "gemma2") for t in model_types)
+        ):
+            try:
+                _base_config = AutoConfig.from_pretrained(
+                    peft_config.base_model_name_or_path,
+                    token = token,
+                    trust_remote_code = trust_remote_code,
+                    local_files_only = local_files_only,
+                )
+                _base_model_types = get_transformers_model_type(
+                    _base_config,
+                    trust_remote_code = trust_remote_code,
+                )
+                model_types = sorted(set(model_types) | set(_base_model_types))
+            except Exception as _e:
+                logger.warning_once(
+                    "Unsloth: Could not inspect base model config for PaliGemma "
+                    f"adapter ({type(_e).__name__}: {_e}). "
+                    "Defaulting to PaliGemma 1 (Gemma backbone). If this is a "
+                    "PaliGemma 2 adapter, ensure the base model is accessible."
+                )
         model_types_all = ",".join(model_types) + ","
 
         # Save model types and loading method
@@ -1189,25 +1216,7 @@ class FastModel(FastBaseModel):
         # Routes through the vision path, so pre_patch() must be applied here;
         # otherwise the inner language_model never receives Unsloth fast kernels.
         elif "paligemma" in model_types_all:
-            is_paligemma2 = "gemma2" in model_types_all
-            if not is_paligemma2 and is_peft and peft_config is not None:
-                # why: PEFT auto_mapping can resolve only "paligemma" without exposing
-                # text_config.model_type, so we must read the base model's config
-                # to discriminate v1 (gemma) from v2 (gemma2) before pre-patching.
-                try:
-                    _base_config = AutoConfig.from_pretrained(
-                        peft_config.base_model_name_or_path,
-                        token = token,
-                        revision = revision,
-                        trust_remote_code = trust_remote_code,
-                        local_files_only = local_files_only,
-                    )
-                    _text_cfg = getattr(_base_config, "text_config", None)
-                    _text_model_type = str(getattr(_text_cfg, "model_type", "") or "").lower()
-                    is_paligemma2 = _text_model_type == "gemma2"
-                except Exception:
-                    pass
-            if is_paligemma2:
+            if "gemma2" in model_types_all:
                 # PaliGemma 2 — language_model is Gemma2ForCausalLM
                 if transformers_version < Version("4.42.3"):
                     raise RuntimeError(
