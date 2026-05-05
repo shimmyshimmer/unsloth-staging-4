@@ -1551,8 +1551,19 @@ function Assert-StudioOwnedOrAbsent {
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$Label
     )
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return }
-    if ($StudioHomeIsCustom -and -not (Test-Path -LiteralPath (Join-Path $Path $StudioOwnedMarker) -PathType Leaf)) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Any)) { return }
+    if (-not $StudioHomeIsCustom) { return }
+    # why: a regular file or symlink at the protected path is not Studio-owned
+    # either; reject it instead of letting Remove-Item -Recurse -Force wipe it.
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        Write-Host "[ERROR] $Path already exists and is not a Studio-owned $Label directory." -ForegroundColor Red
+        Write-Host "        Move it aside or choose an empty UNSLOTH_STUDIO_HOME before re-running." -ForegroundColor Yellow
+        exit 1
+    }
+    if (
+        -not (Test-Path -LiteralPath (Join-Path $Path $StudioOwnedMarker) -PathType Leaf) -and
+        -not (Test-Path -LiteralPath (Join-Path $StudioHome "share\studio.conf") -PathType Leaf)
+    ) {
         Write-Host "[ERROR] $Path already exists and is not marked as a Studio-owned $Label." -ForegroundColor Red
         Write-Host "        Move it aside or choose an empty UNSLOTH_STUDIO_HOME before re-running." -ForegroundColor Yellow
         exit 1
@@ -1631,11 +1642,13 @@ if ((Test-Path -LiteralPath $VenvDir -PathType Container) -and -not $NoTorchMode
         # why: mirror install.ps1 env-mode guard so an update against a custom
         # UNSLOTH_STUDIO_HOME never wipes an unrelated unsloth_studio venv;
         # -PathType Leaf rejects a directory masquerading as the sentinel.
+        # $StudioHome\bin\unsloth.exe is intentionally NOT a sentinel here; an
+        # unrelated project root with a local 'bin\unsloth.exe' shim was
+        # non-uniquely matching.
         if (
             $StudioHomeIsCustom -and
             -not (Test-Path -LiteralPath (Join-Path $VenvDir $StudioOwnedMarker) -PathType Leaf) -and
-            -not (Test-Path -LiteralPath (Join-Path $StudioHome "share\studio.conf") -PathType Leaf) -and
-            -not (Test-Path -LiteralPath (Join-Path $StudioHome "bin\unsloth.exe") -PathType Leaf)
+            -not (Test-Path -LiteralPath (Join-Path $StudioHome "share\studio.conf") -PathType Leaf)
         ) {
             Write-Host "[ERROR] $VenvDir already exists but does not look like an Unsloth Studio install." -ForegroundColor Red
             Write-Host "        Move it aside or choose an empty UNSLOTH_STUDIO_HOME before re-running." -ForegroundColor Yellow
@@ -1657,6 +1670,17 @@ if (-not (Test-Path -LiteralPath $VenvDir)) {
     Write-Host "        irm https://unsloth.ai/install.ps1 | iex" -ForegroundColor Yellow
     exit 1
 } else {
+    # why: refuse to dot-source an unrelated unsloth_studio\Scripts\Activate.ps1
+    # when the user-chosen StudioHome is a custom workspace lacking sentinels.
+    if (
+        $StudioHomeIsCustom -and
+        -not (Test-Path -LiteralPath (Join-Path $VenvDir $StudioOwnedMarker) -PathType Leaf) -and
+        -not (Test-Path -LiteralPath (Join-Path $StudioHome "share\studio.conf") -PathType Leaf)
+    ) {
+        Write-Host "[ERROR] $VenvDir is not marked as a Studio-owned environment." -ForegroundColor Red
+        Write-Host "        Move it aside or choose an empty UNSLOTH_STUDIO_HOME before re-running." -ForegroundColor Yellow
+        exit 1
+    }
     substep "reusing existing virtual environment at $VenvDir"
 }
 

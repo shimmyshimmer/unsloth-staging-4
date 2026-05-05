@@ -12,8 +12,11 @@ import tempfile
 
 def _infer_studio_home_from_venv() -> Path | None:
     """Return parent dir of sys.prefix as STUDIO_HOME if running from an
-    installer-managed unsloth_studio venv. Sentinel-gated (share/studio.conf
-    or bin shim) so a developer venv named unsloth_studio is not misidentified.
+    installer-managed unsloth_studio venv. Sentinel-gated (per-venv ownership
+    marker or share/studio.conf) so a developer venv named unsloth_studio is
+    not misidentified. ``bin/unsloth`` was previously accepted but a project
+    root with a local 'unsloth' shim was non-uniquely matching, so it has
+    been removed; the per-venv marker is the canonical proof.
     """
     try:
         prefix = Path(sys.prefix).resolve()
@@ -22,16 +25,29 @@ def _infer_studio_home_from_venv() -> Path | None:
     if prefix.name != "unsloth_studio":
         return None
     candidate = prefix.parent
-    shim_name = "unsloth.exe" if os.name == "nt" else "unsloth"
     try:
-        has_sentinel = (candidate / "share" / "studio.conf").is_file() or (
-            candidate / "bin" / shim_name
+        has_sentinel = (prefix / ".unsloth-studio-owned").is_file() or (
+            candidate / "share" / "studio.conf"
         ).is_file()
     except OSError:
         return None
     if has_sentinel:
         return candidate
     return None
+
+
+def _resolve_override_path(override: str) -> Path:
+    raw = Path(override)
+    try:
+        expanded = raw.expanduser()
+    except RuntimeError:
+        # ``~missing_user/...`` raises RuntimeError when getpwnam fails;
+        # keep the unresolved override so callers see the user's exact input.
+        return raw
+    try:
+        return expanded.resolve()
+    except (OSError, ValueError):
+        return expanded
 
 
 def studio_root() -> Path:
@@ -45,10 +61,7 @@ def studio_root() -> Path:
     if not override:
         override = (os.environ.get("STUDIO_HOME") or "").strip()
     if override:
-        try:
-            return Path(override).expanduser().resolve()
-        except (OSError, ValueError):
-            return Path(override).expanduser()
+        return _resolve_override_path(override)
     inferred = _infer_studio_home_from_venv()
     if inferred is not None:
         return inferred

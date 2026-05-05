@@ -26,13 +26,15 @@ studio_app = typer.Typer(help = "Unsloth Studio commands.")
 # the installer's env var has expired), then legacy ~/.unsloth/studio.
 # UNSLOTH_STUDIO_HOME wins when both env vars are set.
 def _looks_like_installer_managed_studio_home(candidate: Path) -> bool:
-    """Sentinel check (studio.conf or bin shim) so a dev venv named
-    unsloth_studio is not misidentified as a custom Studio root.
+    """Sentinel check so a dev venv named unsloth_studio is not misidentified
+    as a custom Studio root. Accepts the per-venv ownership marker or the
+    installer-written share/studio.conf; ``bin/unsloth`` was previously a
+    third sentinel but a project root with a local 'unsloth' shim was
+    non-uniquely matching, so it has been removed.
     """
-    shim_name = "unsloth.exe" if platform.system() == "Windows" else "unsloth"
-    return (candidate / "share" / "studio.conf").is_file() or (
-        candidate / "bin" / shim_name
-    ).is_file()
+    return (
+        candidate / "unsloth_studio" / ".unsloth-studio-owned"
+    ).is_file() or (candidate / "share" / "studio.conf").is_file()
 
 
 def _resolve_studio_home() -> tuple[Path, bool]:
@@ -40,10 +42,15 @@ def _resolve_studio_home() -> tuple[Path, bool]:
     if not override:
         override = (os.environ.get("STUDIO_HOME") or "").strip()
     if override:
+        # why: catch RuntimeError so '~missing_user/...' does not crash CLI
+        # import; expanduser() raises RuntimeError on getpwnam failure.
         try:
             return Path(override).expanduser().resolve(), True
-        except (OSError, ValueError):
-            return Path(override).expanduser(), True
+        except (OSError, ValueError, RuntimeError):
+            try:
+                return Path(override).expanduser(), True
+            except RuntimeError:
+                return Path(override), True
     try:
         prefix = Path(sys.prefix).resolve()
         if prefix.name == "unsloth_studio":
@@ -921,8 +928,10 @@ _PID_FILE = STUDIO_HOME / "studio.pid"
 def stop():
     """Stop a running Unsloth Studio server.
 
-    Reads the PID from ~/.unsloth/studio/studio.pid and sends SIGTERM
-    (or TerminateProcess on Windows) to shut it down gracefully.
+    Reads the PID from the active Studio root's ``studio.pid`` file (resolved
+    from ``UNSLOTH_STUDIO_HOME`` / ``STUDIO_HOME`` if set, otherwise
+    ``~/.unsloth/studio``) and sends SIGTERM (or TerminateProcess on Windows)
+    to shut it down gracefully.
     """
     import signal as _signal
 

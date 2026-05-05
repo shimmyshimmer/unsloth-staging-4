@@ -102,9 +102,24 @@ _SWA_CACHE_LOCK = threading.Lock()
 
 
 def _swa_cache_path() -> Path:
-    home = os.environ.get("UNSLOTH_STUDIO_HOME") or os.environ.get("STUDIO_HOME")
-    base = Path(home) if home else Path.home() / ".unsloth" / "studio"
-    return base / "swa_cache.json"
+    # why: route through storage_roots so whitespace overrides and
+    # ~user expansion match studio_root() exactly; fall back to inline
+    # env-var handling when the resolver is not importable yet.
+    try:
+        from utils.paths.storage_roots import studio_root  # noqa: WPS433
+        return studio_root() / "swa_cache.json"
+    except Exception:
+        home = (os.environ.get("UNSLOTH_STUDIO_HOME") or "").strip()
+        if not home:
+            home = (os.environ.get("STUDIO_HOME") or "").strip()
+        if home:
+            try:
+                base = Path(home).expanduser()
+            except RuntimeError:
+                base = Path(home)
+        else:
+            base = Path.home() / ".unsloth" / "studio"
+        return base / "swa_cache.json"
 
 
 def _load_swa_cache() -> dict:

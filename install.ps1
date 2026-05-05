@@ -584,8 +584,17 @@ function Test-StudioHealth {
         `$resp = Invoke-RestMethod -Uri `$url -TimeoutSec 1 -Method Get
         if (-not (`$resp -and `$resp.status -eq 'healthy' -and `$resp.service -eq 'Unsloth UI Backend')) { return `$false }
         # why: verify the backend belongs to THIS install via the install-time
-        # hex digest; raw path is not leaked over /api/health.
-        if (`$_ExpectedStudioRootId -and `$resp.studio_root_id -ne `$_ExpectedStudioRootId) { return `$false }
+        # hex digest; raw path is not leaked over /api/health. In default-mode
+        # (`$portFile is `$null) accept legacy responses that pre-date the field,
+        # so an upgrade does not duplicate-launch on top of a healthy server.
+        if (`$_ExpectedStudioRootId) {
+            `$hasRootId = `$resp.PSObject.Properties.Name -contains 'studio_root_id'
+            if (`$hasRootId) {
+                if (`$resp.studio_root_id -ne `$_ExpectedStudioRootId) { return `$false }
+            } elseif (`$portFile) {
+                return `$false
+            }
+        }
         return `$true
     } catch {
         return `$false
@@ -1085,11 +1094,12 @@ shell.Run cmd, 0, False
         # existing $StudioHome\unsloth_studio that lacks Studio sentinels.
         # -PathType Leaf rejects a directory at the sentinel path. Accept the
         # in-VENV ownership marker so partial-install retries are not blocked.
+        # why: $StudioHome\bin\unsloth.exe dropped from sentinel set; an unrelated
+        # project root with a local 'bin\unsloth.exe' shim was non-uniquely matching.
         if (
             $StudioRedirectMode -eq 'env' -and
             -not (Test-Path -LiteralPath (Join-Path $VenvDir ".unsloth-studio-owned") -PathType Leaf) -and
-            -not (Test-Path -LiteralPath (Join-Path $StudioHome "share\studio.conf") -PathType Leaf) -and
-            -not (Test-Path -LiteralPath (Join-Path $StudioHome "bin\unsloth.exe") -PathType Leaf)
+            -not (Test-Path -LiteralPath (Join-Path $StudioHome "share\studio.conf") -PathType Leaf)
         ) {
             Write-Host "[ERROR] $VenvDir already exists but does not look like an Unsloth Studio install." -ForegroundColor Red
             Write-Host "        Move it aside or choose an empty UNSLOTH_STUDIO_HOME." -ForegroundColor Yellow

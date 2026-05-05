@@ -75,16 +75,16 @@ fi
 # Custom Studio roots are not supported with --tauri (desktop app still
 # resolves ~/.unsloth/studio). Pass through if the override == legacy default.
 if [ "$TAURI_MODE" = true ]; then
+    # why: trim BEFORE selecting winner so whitespace-only UNSLOTH_STUDIO_HOME
+    # does not suppress a real STUDIO_HOME (matches Python .strip() priority).
     _tauri_override_var=""
-    _tauri_override="${UNSLOTH_STUDIO_HOME:-}"
+    _tauri_override=$(printf '%s' "${UNSLOTH_STUDIO_HOME:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     if [ -n "$_tauri_override" ]; then
         _tauri_override_var="UNSLOTH_STUDIO_HOME"
     else
-        _tauri_override="${STUDIO_HOME:-}"
+        _tauri_override=$(printf '%s' "${STUDIO_HOME:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
         [ -n "$_tauri_override" ] && _tauri_override_var="STUDIO_HOME"
     fi
-    # Strip whitespace so " " is treated as unset (matches Python .strip()).
-    _tauri_override=$(printf '%s' "$_tauri_override" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     if [ -n "$_tauri_override" ]; then
         case "$_tauri_override" in
             "~") _tauri_override="$HOME" ;;
@@ -280,17 +280,16 @@ PYTHON_VERSION=""  # resolved after platform detection
 # via getent/dscl), or default. Env-var priority: UNSLOTH_STUDIO_HOME wins
 # over STUDIO_HOME (the more specific signal beats the generic alias).
 _resolve_studio_destinations() {
+    # why: trim BEFORE selecting winner so whitespace-only UNSLOTH_STUDIO_HOME
+    # does not suppress a real STUDIO_HOME (matches Python .strip() priority).
     _override_var=""
-    _override="${UNSLOTH_STUDIO_HOME:-}"
+    _override=$(printf '%s' "${UNSLOTH_STUDIO_HOME:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     if [ -n "$_override" ]; then
         _override_var="UNSLOTH_STUDIO_HOME"
     else
-        _override="${STUDIO_HOME:-}"
+        _override=$(printf '%s' "${STUDIO_HOME:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
         [ -n "$_override" ] && _override_var="STUDIO_HOME"
     fi
-    # Strip surrounding whitespace so " " is treated as unset (matches the
-    # Python resolvers' .strip()), preventing install/runtime layout drift.
-    _override=$(printf '%s' "$_override" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     # Tilde expansion: env vars are not subject to it when quoted on assignment.
     case "$_override" in
         "~") _override="$HOME" ;;
@@ -601,11 +600,14 @@ _check_health() {
     esac
     # why: verify the backend belongs to THIS install. Baked hex digest avoids
     # JSON-escape mismatches on paths with `\`/`"` and avoids leaking the raw
-    # install path to unauthenticated callers.
+    # install path to unauthenticated callers. In default-install mode an
+    # already-running pre-PR backend has no studio_root_id field; accept it so
+    # upgrades do not duplicate-launch on top of a healthy legacy server.
     if [ -n "$_EXPECTED_STUDIO_ROOT_ID" ]; then
         case "$_resp" in
             *"\"studio_root_id\":\"$_EXPECTED_STUDIO_ROOT_ID\""*|*"\"studio_root_id\": \"$_EXPECTED_STUDIO_ROOT_ID\""*) return 0 ;;
-            *) return 1 ;;
+            *'"studio_root_id"'*) return 1 ;;
+            *) [ "$_INSTALLED_IS_ENV_MODE" = "true" ] && return 1; return 0 ;;
         esac
     fi
     return 0
@@ -1341,10 +1343,11 @@ if [ -x "$VENV_DIR/bin/python" ]; then
     # not blocked. Sentinels must be regular files: -f follows symlinks
     # to files (the legitimate ln -s shim shape) but rejects directories
     # and broken/dir-targeted symlinks.
+    # why: $STUDIO_HOME/bin/unsloth dropped from sentinel set; an unrelated
+    # project root with a local 'bin/unsloth' shim was non-uniquely matching.
     if [ "$_STUDIO_HOME_REDIRECT" = "env" ] \
        && [ ! -f "$VENV_DIR/.unsloth-studio-owned" ] \
-       && [ ! -f "$STUDIO_HOME/share/studio.conf" ] \
-       && [ ! -f "$STUDIO_HOME/bin/unsloth" ]; then
+       && [ ! -f "$STUDIO_HOME/share/studio.conf" ]; then
         echo "ERROR: $VENV_DIR already exists but does not look like an Unsloth Studio install." >&2
         echo "       Move it aside or choose an empty UNSLOTH_STUDIO_HOME." >&2
         exit 1
