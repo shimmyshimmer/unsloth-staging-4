@@ -5,17 +5,69 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 import tempfile
 
 
+def _infer_studio_home_from_venv() -> Path | None:
+    """Return parent dir of sys.prefix as STUDIO_HOME when running from an
+    installer-managed unsloth_studio venv. Sentinel-gated on the per-venv
+    ownership marker or share/studio.conf; a project-local bin/unsloth shim
+    is intentionally NOT a sentinel (not unique enough).
+    """
+    try:
+        prefix = Path(sys.prefix).resolve()
+    except (OSError, ValueError):
+        return None
+    if prefix.name != "unsloth_studio":
+        return None
+    candidate = prefix.parent
+    try:
+        has_sentinel = (prefix / ".unsloth-studio-owned").is_file() or (
+            candidate / "share" / "studio.conf"
+        ).is_file()
+    except OSError:
+        return None
+    if has_sentinel:
+        return candidate
+    return None
+
+
+def _resolve_override_path(override: str) -> Path:
+    raw = Path(override)
+    try:
+        expanded = raw.expanduser()
+    except RuntimeError:
+        # `~missing_user/...` raises RuntimeError on getpwnam failure.
+        return raw
+    try:
+        return expanded.resolve()
+    except (OSError, ValueError):
+        return expanded
+
+
 def studio_root() -> Path:
+    """Studio install root.
+
+    Priority: UNSLOTH_STUDIO_HOME, then STUDIO_HOME alias, then sys.prefix
+    inference, then legacy ~/.unsloth/studio. UNSLOTH_STUDIO_HOME wins when
+    both are set (the more specific signal beats the generic alias).
+    """
+    override = (os.environ.get("UNSLOTH_STUDIO_HOME") or "").strip()
+    if not override:
+        override = (os.environ.get("STUDIO_HOME") or "").strip()
+    if override:
+        return _resolve_override_path(override)
+    inferred = _infer_studio_home_from_venv()
+    if inferred is not None:
+        return inferred
     return Path.home() / ".unsloth" / "studio"
 
 
 def cache_root() -> Path:
     """Central cache directory for all studio downloads (models, datasets, etc.)."""
-    return Path.home() / ".unsloth" / "studio" / "cache"
+    return studio_root() / "cache"
 
 
 def assets_root() -> Path:
