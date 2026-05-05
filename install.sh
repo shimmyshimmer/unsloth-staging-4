@@ -75,8 +75,7 @@ fi
 # Custom Studio roots are not supported with --tauri (desktop app still
 # resolves ~/.unsloth/studio). Pass through if the override == legacy default.
 if [ "$TAURI_MODE" = true ]; then
-    # why: trim BEFORE selecting winner so whitespace-only UNSLOTH_STUDIO_HOME
-    # does not suppress a real STUDIO_HOME (matches Python .strip() priority).
+    # Trim before selecting winner, matching Python .strip() priority.
     _tauri_override_var=""
     _tauri_override=$(printf '%s' "${UNSLOTH_STUDIO_HOME:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     if [ -n "$_tauri_override" ]; then
@@ -280,8 +279,7 @@ PYTHON_VERSION=""  # resolved after platform detection
 # via getent/dscl), or default. Env-var priority: UNSLOTH_STUDIO_HOME wins
 # over STUDIO_HOME (the more specific signal beats the generic alias).
 _resolve_studio_destinations() {
-    # why: trim BEFORE selecting winner so whitespace-only UNSLOTH_STUDIO_HOME
-    # does not suppress a real STUDIO_HOME (matches Python .strip() priority).
+    # Trim before selecting winner, matching Python .strip() priority.
     _override_var=""
     _override=$(printf '%s' "${UNSLOTH_STUDIO_HOME:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     if [ -n "$_override" ]; then
@@ -598,11 +596,8 @@ _check_health() {
         *'"service"'*'"Unsloth UI Backend"'*'"status"'*'"healthy"'*) ;;
         *) return 1 ;;
     esac
-    # why: verify the backend belongs to THIS install. Baked hex digest avoids
-    # JSON-escape mismatches on paths with `\`/`"` and avoids leaking the raw
-    # install path to unauthenticated callers. In default-install mode an
-    # already-running pre-PR backend has no studio_root_id field; accept it so
-    # upgrades do not duplicate-launch on top of a healthy legacy server.
+    # Match against baked hex digest. Default-install mode accepts pre-PR
+    # backends without studio_root_id so upgrades do not duplicate-launch.
     if [ -n "$_EXPECTED_STUDIO_ROOT_ID" ]; then
         case "$_resp" in
             *"\"studio_root_id\":\"$_EXPECTED_STUDIO_ROOT_ID\""*|*"\"studio_root_id\": \"$_EXPECTED_STUDIO_ROOT_ID\""*) return 0 ;;
@@ -1343,8 +1338,8 @@ if [ -x "$VENV_DIR/bin/python" ]; then
     # not blocked. Sentinels must be regular files: -f follows symlinks
     # to files (the legitimate ln -s shim shape) but rejects directories
     # and broken/dir-targeted symlinks.
-    # why: $STUDIO_HOME/bin/unsloth dropped from sentinel set; an unrelated
-    # project root with a local 'bin/unsloth' shim was non-uniquely matching.
+    # bin/unsloth is intentionally NOT a sentinel: a project-local shim is
+    # not unique enough to prove Studio ownership.
     if [ "$_STUDIO_HOME_REDIRECT" = "env" ] \
        && [ ! -f "$VENV_DIR/.unsloth-studio-owned" ] \
        && [ ! -f "$STUDIO_HOME/share/studio.conf" ]; then

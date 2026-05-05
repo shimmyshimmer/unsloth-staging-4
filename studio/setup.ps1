@@ -1553,8 +1553,8 @@ function Assert-StudioOwnedOrAbsent {
     )
     if (-not (Test-Path -LiteralPath $Path -PathType Any)) { return }
     if (-not $StudioHomeIsCustom) { return }
-    # why: a regular file or symlink at the protected path is not Studio-owned
-    # either; reject it instead of letting Remove-Item -Recurse -Force wipe it.
+    # Reject files / symlinks at the protected path so a later Remove-Item
+    # -Recurse -Force cannot wipe non-Studio data.
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         Write-Host "[ERROR] $Path already exists and is not a Studio-owned $Label directory." -ForegroundColor Red
         Write-Host "        Move it aside or choose an empty UNSLOTH_STUDIO_HOME before re-running." -ForegroundColor Yellow
@@ -1639,12 +1639,9 @@ if ((Test-Path -LiteralPath $VenvDir -PathType Container) -and -not $NoTorchMode
             exit 1
         }
         substep "Stale venv detected ($reason) -- rebuilding..." "Yellow"
-        # why: mirror install.ps1 env-mode guard so an update against a custom
-        # UNSLOTH_STUDIO_HOME never wipes an unrelated unsloth_studio venv;
-        # -PathType Leaf rejects a directory masquerading as the sentinel.
-        # $StudioHome\bin\unsloth.exe is intentionally NOT a sentinel here; an
-        # unrelated project root with a local 'bin\unsloth.exe' shim was
-        # non-uniquely matching.
+        # Mirror install.ps1: refuse to wipe an unrelated unsloth_studio venv
+        # under custom UNSLOTH_STUDIO_HOME without a Studio sentinel.
+        # bin\unsloth.exe is intentionally NOT a sentinel.
         if (
             $StudioHomeIsCustom -and
             -not (Test-Path -LiteralPath (Join-Path $VenvDir $StudioOwnedMarker) -PathType Leaf) -and
@@ -1670,8 +1667,7 @@ if (-not (Test-Path -LiteralPath $VenvDir)) {
     Write-Host "        irm https://unsloth.ai/install.ps1 | iex" -ForegroundColor Yellow
     exit 1
 } else {
-    # why: refuse to dot-source an unrelated unsloth_studio\Scripts\Activate.ps1
-    # when the user-chosen StudioHome is a custom workspace lacking sentinels.
+    # Refuse to dot-source an unrelated venv under custom StudioHome.
     if (
         $StudioHomeIsCustom -and
         -not (Test-Path -LiteralPath (Join-Path $VenvDir $StudioOwnedMarker) -PathType Leaf) -and

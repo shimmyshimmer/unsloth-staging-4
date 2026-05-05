@@ -27,10 +27,8 @@ studio_app = typer.Typer(help = "Unsloth Studio commands.")
 # UNSLOTH_STUDIO_HOME wins when both env vars are set.
 def _looks_like_installer_managed_studio_home(candidate: Path) -> bool:
     """Sentinel check so a dev venv named unsloth_studio is not misidentified
-    as a custom Studio root. Accepts the per-venv ownership marker or the
-    installer-written share/studio.conf; ``bin/unsloth`` was previously a
-    third sentinel but a project root with a local 'unsloth' shim was
-    non-uniquely matching, so it has been removed.
+    as a custom Studio root. Accepts the per-venv ownership marker or
+    share/studio.conf; bin/unsloth is intentionally NOT a sentinel.
     """
     return (
         candidate / "unsloth_studio" / ".unsloth-studio-owned"
@@ -42,8 +40,7 @@ def _resolve_studio_home() -> tuple[Path, bool]:
     if not override:
         override = (os.environ.get("STUDIO_HOME") or "").strip()
     if override:
-        # why: catch RuntimeError so '~missing_user/...' does not crash CLI
-        # import; expanduser() raises RuntimeError on getpwnam failure.
+        # `~missing_user/...` raises RuntimeError on getpwnam failure.
         try:
             return Path(override).expanduser().resolve(), True
         except (OSError, ValueError, RuntimeError):

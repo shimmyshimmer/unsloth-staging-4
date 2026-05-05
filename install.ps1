@@ -583,10 +583,9 @@ function Test-StudioHealth {
         `$url = "http://127.0.0.1:`$Port/api/health"
         `$resp = Invoke-RestMethod -Uri `$url -TimeoutSec 1 -Method Get
         if (-not (`$resp -and `$resp.status -eq 'healthy' -and `$resp.service -eq 'Unsloth UI Backend')) { return `$false }
-        # why: verify the backend belongs to THIS install via the install-time
-        # hex digest; raw path is not leaked over /api/health. In default-mode
-        # (`$portFile is `$null) accept legacy responses that pre-date the field,
-        # so an upgrade does not duplicate-launch on top of a healthy server.
+        # Match against baked hex digest. Default-mode (\$portFile is \$null)
+        # accepts pre-PR backends without studio_root_id so upgrades do not
+        # duplicate-launch on top of a healthy legacy server.
         if (`$_ExpectedStudioRootId) {
             `$hasRootId = `$resp.PSObject.Properties.Name -contains 'studio_root_id'
             if (`$hasRootId) {
@@ -1089,13 +1088,10 @@ shell.Run cmd, 0, False
     }
 
     if (Test-Path -LiteralPath $VenvPython) {
-        # why: matching guard to the .venv branch below -- in env-mode
-        # $StudioHome is a user-chosen workspace, so refuse to nuke an
-        # existing $StudioHome\unsloth_studio that lacks Studio sentinels.
-        # -PathType Leaf rejects a directory at the sentinel path. Accept the
-        # in-VENV ownership marker so partial-install retries are not blocked.
-        # why: $StudioHome\bin\unsloth.exe dropped from sentinel set; an unrelated
-        # project root with a local 'bin\unsloth.exe' shim was non-uniquely matching.
+        # In env-mode refuse to nuke $StudioHome\unsloth_studio without a
+        # Studio sentinel. -PathType Leaf rejects a directory masquerading as
+        # the sentinel. bin\unsloth.exe is intentionally NOT a sentinel: a
+        # project-local shim is not unique enough to prove Studio ownership.
         if (
             $StudioRedirectMode -eq 'env' -and
             -not (Test-Path -LiteralPath (Join-Path $VenvDir ".unsloth-studio-owned") -PathType Leaf) -and

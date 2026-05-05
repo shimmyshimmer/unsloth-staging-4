@@ -11,12 +11,10 @@ import tempfile
 
 
 def _infer_studio_home_from_venv() -> Path | None:
-    """Return parent dir of sys.prefix as STUDIO_HOME if running from an
-    installer-managed unsloth_studio venv. Sentinel-gated (per-venv ownership
-    marker or share/studio.conf) so a developer venv named unsloth_studio is
-    not misidentified. ``bin/unsloth`` was previously accepted but a project
-    root with a local 'unsloth' shim was non-uniquely matching, so it has
-    been removed; the per-venv marker is the canonical proof.
+    """Return parent dir of sys.prefix as STUDIO_HOME when running from an
+    installer-managed unsloth_studio venv. Sentinel-gated on the per-venv
+    ownership marker or share/studio.conf; a project-local bin/unsloth shim
+    is intentionally NOT a sentinel (not unique enough).
     """
     try:
         prefix = Path(sys.prefix).resolve()
@@ -41,8 +39,7 @@ def _resolve_override_path(override: str) -> Path:
     try:
         expanded = raw.expanduser()
     except RuntimeError:
-        # ``~missing_user/...`` raises RuntimeError when getpwnam fails;
-        # keep the unresolved override so callers see the user's exact input.
+        # `~missing_user/...` raises RuntimeError on getpwnam failure.
         return raw
     try:
         return expanded.resolve()

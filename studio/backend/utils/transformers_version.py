@@ -547,9 +547,8 @@ def _ensure_venv_dir(venv_dir: str, packages: tuple[str, ...], label: str) -> bo
     logger.warning(
         "%s not found or incomplete at %s -- installing at runtime", label, venv_dir
     )
-    # why: refuse to wipe a non-empty directory under a custom UNSLOTH_STUDIO_HOME
-    # unless the Studio install root is sentinel-marked or the dir itself carries
-    # the per-venv ownership marker. Mirrors the install.sh / setup.sh guard.
+    # Refuse to wipe a non-empty dir under custom UNSLOTH_STUDIO_HOME without
+    # a Studio sentinel; mirrors the install.sh / setup.sh guard.
     venv_path = Path(venv_dir)
     if venv_path.exists() and any(venv_path.iterdir()):
         try:

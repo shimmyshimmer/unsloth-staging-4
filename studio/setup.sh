@@ -417,10 +417,8 @@ if [ -d "$SCRIPT_DIR/backend/core/data_recipe/oxc-validator" ] && command -v npm
 fi
 
 # ── Python venv + deps ──
-# UNSLOTH_STUDIO_HOME (or STUDIO_HOME alias) overrides the install root
-# (mirrors install.sh). UNSLOTH_STUDIO_HOME wins when both are set.
-# why: trim BEFORE selecting winner so whitespace-only UNSLOTH_STUDIO_HOME
-# does not suppress a real STUDIO_HOME (matches Python .strip() priority).
+# UNSLOTH_STUDIO_HOME (or STUDIO_HOME alias) overrides the install root.
+# Trim before selecting winner, matching Python .strip() priority.
 _studio_override_var=""
 _studio_override=$(printf '%s' "${UNSLOTH_STUDIO_HOME:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 if [ -n "$_studio_override" ]; then
@@ -451,9 +449,8 @@ VENV_DIR="$STUDIO_HOME/unsloth_studio"
 VENV_T5_530_DIR="$STUDIO_HOME/.venv_t5_530"
 VENV_T5_550_DIR="$STUDIO_HOME/.venv_t5_550"
 
-# why: hoisted ownership-mode discriminator so the venv-activation guard and
-# the repo-cleanup helper below can both consult _STUDIO_HOME_IS_CUSTOM
-# before any destructive action.
+# Canonicalized custom-root state, consumed by the venv-activation guard
+# and the repo-cleanup helper below.
 _STUDIO_OWNED_MARKER=".unsloth-studio-owned"
 _LEGACY_STUDIO_HOME="$HOME/.unsloth/studio"
 _studio_home_canon="$STUDIO_HOME"
@@ -470,9 +467,8 @@ if [ "$_studio_home_canon" != "$_LEGACY_STUDIO_HOME" ]; then
     _STUDIO_HOME_IS_CUSTOM=true
 fi
 
-# why: skip cleanup when the legacy repo path equals or sits inside the
-# user-chosen STUDIO_HOME (UNSLOTH_STUDIO_HOME=$REPO_ROOT/.venv would
-# otherwise wipe the install root before any setup runs).
+# Skip cleanup when the legacy repo path sits inside the chosen STUDIO_HOME;
+# otherwise UNSLOTH_STUDIO_HOME=$REPO_ROOT/.venv would self-delete.
 _remove_repo_legacy_venv() {
     _rrlv_target="$1"
     [ -d "$_rrlv_target" ] || return 0
@@ -518,8 +514,7 @@ if [ ! -x "$VENV_DIR/bin/python" ]; then
         exit 1
     fi
 else
-    # why: refuse to source an unrelated unsloth_studio/bin/activate when the
-    # user-chosen STUDIO_HOME is a custom workspace lacking Studio sentinels.
+    # Refuse to source an unrelated unsloth_studio venv under custom STUDIO_HOME.
     if [ "$_STUDIO_HOME_IS_CUSTOM" = true ] \
        && [ ! -f "$VENV_DIR/$_STUDIO_OWNED_MARKER" ] \
        && [ ! -f "$STUDIO_HOME/share/studio.conf" ]; then
@@ -611,12 +606,9 @@ fi
 #
 # Runs outside the _SKIP_PYTHON_DEPS gate so that upgrades from legacy
 # single .venv_t5 are always migrated to the tiered layout.
-# why: in env-override mode $STUDIO_HOME is user-chosen; require the ownership
-# marker before rm -rf so unrelated dirs survive. Files / symlinks at a target
-# path are not Studio-owned either, so reject them too instead of letting a
-# subsequent rm -rf wipe them. _STUDIO_OWNED_MARKER, _LEGACY_STUDIO_HOME,
-# _studio_home_canon, and _STUDIO_HOME_IS_CUSTOM are defined above (alongside
-# the venv-activation guard) so both blocks share one canonicalization pass.
+# why: in custom-root mode the marker (or share/studio.conf) is required;
+# files / symlinks at the target are also rejected so a later rm -rf cannot
+# wipe them. Canonicalized state (_STUDIO_HOME_IS_CUSTOM etc.) is defined above.
 _assert_studio_owned_or_absent() {
     _aso_dir="$1"
     _aso_label="$2"

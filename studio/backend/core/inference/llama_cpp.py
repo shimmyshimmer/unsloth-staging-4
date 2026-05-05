@@ -102,9 +102,8 @@ _SWA_CACHE_LOCK = threading.Lock()
 
 
 def _swa_cache_path() -> Path:
-    # why: route through storage_roots so whitespace overrides and
-    # ~user expansion match studio_root() exactly; fall back to inline
-    # env-var handling when the resolver is not importable yet.
+    # Route through storage_roots so whitespace overrides and ~user expansion
+    # match studio_root(); inline fallback covers pre-resolver-import paths.
     try:
         from utils.paths.storage_roots import studio_root  # noqa: WPS433
         return studio_root() / "swa_cache.json"
