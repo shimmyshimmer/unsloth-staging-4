@@ -95,9 +95,11 @@ TRANSFORMERS_DEFAULT_VERSION = "4.57.6"
 # Consumers should prefer TRANSFORMERS_530_VERSION / TRANSFORMERS_550_VERSION.
 TRANSFORMERS_5_VERSION = TRANSFORMERS_550_VERSION
 
-# Pre-installed directories — created by setup.sh / setup.ps1
-_VENV_T5_530_DIR = str(Path.home() / ".unsloth" / "studio" / ".venv_t5_530")
-_VENV_T5_550_DIR = str(Path.home() / ".unsloth" / "studio" / ".venv_t5_550")
+# Pre-installed directories — created by setup.sh / setup.ps1.
+from utils.paths.storage_roots import studio_root as _studio_root  # noqa: E402
+
+_VENV_T5_530_DIR = str(_studio_root() / ".venv_t5_530")
+_VENV_T5_550_DIR = str(_studio_root() / ".venv_t5_550")
 # Backwards-compat alias
 _VENV_T5_DIR = _VENV_T5_550_DIR
 
@@ -545,8 +547,35 @@ def _ensure_venv_dir(venv_dir: str, packages: tuple[str, ...], label: str) -> bo
     logger.warning(
         "%s not found or incomplete at %s -- installing at runtime", label, venv_dir
     )
+    # why: refuse to wipe a non-empty directory under a custom UNSLOTH_STUDIO_HOME
+    # unless the Studio install root is sentinel-marked or the dir itself carries
+    # the per-venv ownership marker. Mirrors the install.sh / setup.sh guard.
+    venv_path = Path(venv_dir)
+    if venv_path.exists() and any(venv_path.iterdir()):
+        try:
+            studio_home = _studio_root().resolve()
+        except (OSError, ValueError, RuntimeError):
+            studio_home = _studio_root()
+        try:
+            legacy_home = (Path.home() / ".unsloth" / "studio").resolve()
+        except (OSError, ValueError, RuntimeError):
+            legacy_home = Path.home() / ".unsloth" / "studio"
+        if studio_home != legacy_home and not (
+            (venv_path / ".unsloth-studio-owned").is_file()
+            or (studio_home / "share" / "studio.conf").is_file()
+        ):
+            logger.error(
+                "%s exists but is not Studio-owned; refusing to delete (UNSLOTH_STUDIO_HOME=%s)",
+                venv_dir,
+                studio_home,
+            )
+            return False
     shutil.rmtree(venv_dir, ignore_errors = True)
     os.makedirs(venv_dir, exist_ok = True)
+    try:
+        (venv_path / ".unsloth-studio-owned").write_text("")
+    except OSError:
+        pass
     for pkg in packages:
         if not _install_to_dir(pkg, venv_dir):
             return False
