@@ -152,3 +152,168 @@ def test_search_roots_default_mode_uses_legacy_only(tmp_path):
     )
     # Default mode: only legacy_llama.
     assert roots == [home / ".unsloth" / "llama.cpp"]
+
+
+# ── STUDIO_HOME / UNSLOTH_STUDIO_HOME resolution ──
+# Whitespace handling, ~missing_user safety, sentinel set, SWA cache alignment.
+
+CLI_STUDIO = REPO_ROOT / "unsloth_cli" / "commands" / "studio.py"
+
+
+def _fresh_storage_roots(suffix: str):
+    name = f"sr_env_{suffix}"
+    sys.modules.pop(name, None)
+    return _load(name, STORAGE_ROOTS)
+
+
+def test_studio_root_whitespace_unsloth_home_falls_through_to_alias(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "alias_root"
+    target.mkdir()
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", "   ")
+    monkeypatch.setenv("STUDIO_HOME", str(target))
+    mod = _fresh_storage_roots("ws_alias")
+    assert mod.studio_root() == target.resolve()
+
+
+def test_studio_root_whitespace_alone_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", "   ")
+    monkeypatch.setenv("STUDIO_HOME", "\t\t")
+    mod = _fresh_storage_roots("ws_default")
+    assert mod.studio_root() == Path.home() / ".unsloth" / "studio"
+
+
+def test_studio_root_handles_missing_user_tilde(monkeypatch):
+    monkeypatch.setenv(
+        "UNSLOTH_STUDIO_HOME", "~definitely_no_such_user_zxqwer123/studio"
+    )
+    monkeypatch.delenv("STUDIO_HOME", raising = False)
+    mod = _fresh_storage_roots("ws_missing_user")
+    result = mod.studio_root()
+    assert isinstance(result, Path)
+    assert "definitely_no_such_user_zxqwer123" in str(result)
+
+
+def test_infer_studio_home_rejects_bare_bin_unsloth_shim(tmp_path, monkeypatch):
+    venv = tmp_path / "unsloth_studio"
+    venv.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    shim = bin_dir / "unsloth"
+    shim.write_text("#!/bin/sh\nexit 0\n")
+    shim.chmod(0o755)
+    monkeypatch.delenv("UNSLOTH_STUDIO_HOME", raising = False)
+    monkeypatch.delenv("STUDIO_HOME", raising = False)
+    monkeypatch.setattr(sys, "prefix", str(venv))
+    mod = _fresh_storage_roots("infer_bin_shim")
+    assert mod._infer_studio_home_from_venv() is None
+
+
+def test_infer_studio_home_accepts_per_venv_marker(tmp_path, monkeypatch):
+    venv = tmp_path / "unsloth_studio"
+    venv.mkdir()
+    (venv / ".unsloth-studio-owned").write_text("")
+    monkeypatch.delenv("UNSLOTH_STUDIO_HOME", raising = False)
+    monkeypatch.delenv("STUDIO_HOME", raising = False)
+    monkeypatch.setattr(sys, "prefix", str(venv))
+    mod = _fresh_storage_roots("infer_marker")
+    assert mod._infer_studio_home_from_venv() == tmp_path
+
+
+def test_infer_studio_home_accepts_share_studio_conf(tmp_path, monkeypatch):
+    venv = tmp_path / "unsloth_studio"
+    venv.mkdir()
+    (tmp_path / "share").mkdir()
+    (tmp_path / "share" / "studio.conf").write_text("")
+    monkeypatch.delenv("UNSLOTH_STUDIO_HOME", raising = False)
+    monkeypatch.delenv("STUDIO_HOME", raising = False)
+    monkeypatch.setattr(sys, "prefix", str(venv))
+    mod = _fresh_storage_roots("infer_conf")
+    assert mod._infer_studio_home_from_venv() == tmp_path
+
+
+def test_swa_cache_path_matches_studio_root_with_whitespace(tmp_path, monkeypatch):
+    import os as _os
+
+    target = tmp_path / "swa_root"
+    target.mkdir()
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", "   ")
+    monkeypatch.setenv("STUDIO_HOME", str(target))
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "studio" / "backend"))
+    for cached in ("utils", "utils.paths", "utils.paths.storage_roots"):
+        sys.modules.pop(cached, None)
+    src = LLAMA_CPP.read_text()
+    m = re.search(
+        r"def _swa_cache_path\(\) -> Path:.*?(?=\n\ndef |\nclass |\Z)", src, re.DOTALL
+    )
+    assert m, "_swa_cache_path source not found"
+    ns = {"__name__": "test_swa", "Path": Path, "os": _os}
+    exec(m.group(0), ns)
+    result = ns["_swa_cache_path"]()
+    assert result == target.resolve() / "swa_cache.json"
+
+
+def _exec_cli_resolve_studio_home():
+    src = CLI_STUDIO.read_text()
+    m = re.search(
+        r"def _resolve_studio_home\(\) -> tuple\[Path, bool\]:.*?(?=\n\nSTUDIO_HOME, _STUDIO_HOME_IS_CUSTOM)",
+        src,
+        re.DOTALL,
+    )
+    assert m, "_resolve_studio_home source not found"
+    import os as _os
+
+    ns = {"__name__": "test_cli", "Path": Path, "os": _os, "sys": sys}
+    exec(m.group(0), ns)
+    return ns["_resolve_studio_home"]
+
+
+def test_cli_resolve_studio_home_whitespace_falls_through(tmp_path, monkeypatch):
+    target = tmp_path / "cli_alias_root"
+    target.mkdir()
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", "   ")
+    monkeypatch.setenv("STUDIO_HOME", str(target))
+    home, is_custom = _exec_cli_resolve_studio_home()()
+    assert home == target.resolve()
+    assert is_custom is True
+
+
+def test_cli_resolve_studio_home_handles_missing_user_tilde(monkeypatch):
+    monkeypatch.setenv(
+        "UNSLOTH_STUDIO_HOME", "~definitely_no_such_user_zxqwer123/studio"
+    )
+    monkeypatch.delenv("STUDIO_HOME", raising = False)
+    home, is_custom = _exec_cli_resolve_studio_home()()
+    assert isinstance(home, Path)
+    assert is_custom is True
+    assert "definitely_no_such_user_zxqwer123" in str(home)
+
+
+def _exec_cli_looks_like_helper():
+    src = CLI_STUDIO.read_text()
+    m = re.search(
+        r"def _looks_like_installer_managed_studio_home\(candidate: Path\) -> bool:.*?(?=\n\ndef )",
+        src,
+        re.DOTALL,
+    )
+    assert m, "_looks_like_installer_managed_studio_home source not found"
+    ns = {"__name__": "test_cli_helper", "Path": Path}
+    exec(m.group(0), ns)
+    return ns["_looks_like_installer_managed_studio_home"]
+
+
+def test_cli_looks_like_installer_managed_rejects_bin_shim(tmp_path):
+    venv = tmp_path / "unsloth_studio"
+    venv.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "unsloth").write_text("#!/bin/sh\n")
+    assert _exec_cli_looks_like_helper()(tmp_path) is False
+
+
+def test_cli_looks_like_installer_managed_accepts_marker(tmp_path):
+    venv = tmp_path / "unsloth_studio"
+    venv.mkdir()
+    (venv / ".unsloth-studio-owned").write_text("")
+    assert _exec_cli_looks_like_helper()(tmp_path) is True

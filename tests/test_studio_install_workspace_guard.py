@@ -113,11 +113,16 @@ def test_env_mode_passes_when_share_studio_conf_present(tmp_path):
     assert not (studio_home / "unsloth_studio").exists()
 
 
-def test_env_mode_passes_when_bin_unsloth_shim_present(tmp_path):
+def test_env_mode_blocks_when_only_bin_unsloth_shim_present(tmp_path):
+    """$STUDIO_HOME/bin/unsloth alone is not unique enough to prove Studio
+    ownership; the in-VENV marker or share/studio.conf is required."""
     studio_home = tmp_path / "ws"
     res = _run_install_guard(studio_home, redirect = "env", create_bin_shim = True)
-    assert res.returncode == 0, res.stderr
-    assert not (studio_home / "unsloth_studio").exists()
+    assert res.returncode != 0, (
+        "bare bin/unsloth shim must NOT satisfy the env-mode sentinel; "
+        f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    )
+    assert (studio_home / "unsloth_studio").exists()
 
 
 def test_default_mode_skips_sentinel_check(tmp_path):
@@ -139,8 +144,8 @@ def test_install_ps1_has_matching_env_mode_guard():
         "share\\studio.conf" in block
     ), "install.ps1 guard must check share\\studio.conf sentinel"
     assert (
-        "bin\\unsloth.exe" in block
-    ), "install.ps1 guard must check bin\\unsloth.exe sentinel"
+        ".unsloth-studio-owned" in block
+    ), "install.ps1 guard must check the in-VENV ownership marker"
     assert "Refusing to delete non-Studio venv" in block
 
 
@@ -183,15 +188,17 @@ def test_env_mode_blocks_when_bin_unsloth_is_a_directory(tmp_path):
     assert (venv / "important.txt").is_file(), "unrelated workspace data must survive"
 
 
-def test_env_mode_passes_when_bin_unsloth_is_a_symlink(tmp_path):
-    """A symlink at $STUDIO_HOME/bin/unsloth (real installer artefact)
-    must still satisfy the sentinel after the leaf-only tightening."""
+def test_env_mode_blocks_when_only_bin_unsloth_symlink_present(tmp_path):
+    """A symlink at $STUDIO_HOME/bin/unsloth alone (no in-VENV marker, no
+    share/studio.conf) is not unique enough to prove Studio ownership; the
+    guard must refuse to wipe an unrelated unsloth_studio venv."""
     studio_home = tmp_path / "ws"
     venv = studio_home / "unsloth_studio"
     (venv / "bin").mkdir(parents = True)
     py = venv / "bin" / "python"
     py.write_text("#!/bin/sh\nexit 0\n")
     py.chmod(0o755)
+    (venv / "important.txt").write_text("keep me")
     (studio_home / "bin").mkdir(parents = True)
     target = studio_home / "bin" / "unsloth-real"
     target.write_text("#!/bin/sh\nexit 0\n")
@@ -204,9 +211,11 @@ def test_env_mode_passes_when_bin_unsloth_is_a_symlink(tmp_path):
         text = True,
         capture_output = True,
     )
-    assert res.returncode == 0, res.stderr
-    assert "RESULT=ok" in res.stdout
-    assert not venv.exists()
+    assert res.returncode != 0, (
+        "bin/unsloth symlink alone must NOT satisfy the Studio sentinel; "
+        f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    )
+    assert (venv / "important.txt").is_file()
 
 
 def test_install_ps1_sentinel_uses_pathtype_leaf():
@@ -219,15 +228,14 @@ def test_install_ps1_sentinel_uses_pathtype_leaf():
         'share\\studio.conf") -PathType Leaf' in block
     ), "install.ps1 share\\studio.conf check must use -PathType Leaf"
     assert (
-        'bin\\unsloth.exe") -PathType Leaf' in block
-    ), "install.ps1 bin\\unsloth.exe check must use -PathType Leaf"
+        '.unsloth-studio-owned") -PathType Leaf' in block
+    ), "install.ps1 in-VENV marker check must use -PathType Leaf"
 
 
 def test_setup_ps1_stale_venv_has_env_mode_guard():
     """studio/setup.ps1 stale-venv rebuild branch must mirror install.ps1:
     refuse to Remove-Item $VenvDir under custom-root mode unless the root
-    carries a Studio sentinel (in-VENV marker, share\\studio.conf, or
-    bin\\unsloth.exe leaf)."""
+    carries a Studio sentinel (in-VENV marker or share\\studio.conf)."""
     src = SETUP_PS1.read_text()
     idx = src.index("Stale venv detected")
     block = src[idx : idx + 1500]
@@ -238,8 +246,8 @@ def test_setup_ps1_stale_venv_has_env_mode_guard():
         'share\\studio.conf") -PathType Leaf' in block
     ), "setup.ps1 stale-venv guard must check share\\studio.conf with -PathType Leaf"
     assert (
-        'bin\\unsloth.exe") -PathType Leaf' in block
-    ), "setup.ps1 stale-venv guard must check bin\\unsloth.exe with -PathType Leaf"
+        "$StudioOwnedMarker) -PathType Leaf" in block
+    ), "setup.ps1 stale-venv guard must check the in-VENV marker with -PathType Leaf"
     # The guard must fire BEFORE the destructive call.
     guard_idx = block.index("$StudioHomeIsCustom")
     rm_idx = block.index("Remove-Item -LiteralPath $VenvDir")
@@ -398,7 +406,7 @@ def test_setup_helpers_gate_on_canonical_custom_root():
     sidecar venvs or llama.cpp dirs."""
     sh_src = SETUP_SH.read_text()
     sh_idx = sh_src.index("_assert_studio_owned_or_absent() {")
-    sh_func = sh_src[sh_idx : sh_idx + 600]
+    sh_func = sh_src[sh_idx : sh_idx + 800]
     assert (
         '"$_STUDIO_HOME_IS_CUSTOM" = true' in sh_func
     ), "setup.sh _assert_studio_owned_or_absent must gate on _STUDIO_HOME_IS_CUSTOM"
@@ -410,9 +418,9 @@ def test_setup_helpers_gate_on_canonical_custom_root():
 
     ps_src = SETUP_PS1.read_text()
     ps_idx = ps_src.index("function Assert-StudioOwnedOrAbsent")
-    ps_func = ps_src[ps_idx : ps_idx + 800]
+    ps_func = ps_src[ps_idx : ps_idx + 1000]
     assert (
-        "$StudioHomeIsCustom -and" in ps_func
+        "$StudioHomeIsCustom" in ps_func
     ), "setup.ps1 Assert-StudioOwnedOrAbsent must gate on $StudioHomeIsCustom"
     assert (
         "$StudioOwnedMarker) -PathType Leaf" in ps_func
@@ -507,15 +515,59 @@ def test_check_health_rejects_mismatched_studio_root_id():
     assert rc != 0, "mismatched studio_root_id must reject attach (workspace isolation)"
 
 
-def test_check_health_rejects_missing_studio_root_id_field():
-    """A backend that omits studio_root_id (older or non-conforming) must
-    not be attached to when an expected id is baked into the launcher."""
+def test_check_health_rejects_missing_studio_root_id_in_env_mode():
+    """An env-mode launcher MUST reject a backend whose response omits
+    studio_root_id (the field is mandatory under env-mode isolation)."""
     expected_id = "a" * 64
-    rc = _run_check_health(
-        expected_id,
-        '{"status":"healthy","service":"Unsloth UI Backend"}',
+    fn = _extract_check_health_function()
+    script = (
+        f"_EXPECTED_STUDIO_ROOT_ID={expected_id!r}\n"
+        '_INSTALLED_IS_ENV_MODE="true"\n'
+        "_http_get() { printf '%s' \"$1\"; }\n"
+        + fn.replace(
+            '_resp=$(_http_get "http://127.0.0.1:$_port/api/health") || return 1',
+            "_resp='{\"status\":\"healthy\",\"service\":\"Unsloth UI Backend\"}'",
+        )
+        + "\n_check_health 8888\n"
+        "echo rc=$?\n"
     )
-    assert rc != 0, "missing studio_root_id field must reject attach"
+    res = subprocess.run(
+        ["bash", "-c", script],
+        env = {"PATH": "/usr/bin:/bin"},
+        text = True,
+        capture_output = True,
+    )
+    rc_lines = [l for l in res.stdout.splitlines() if l.startswith("rc=")]
+    rc = int(rc_lines[0].split("=")[1]) if rc_lines else res.returncode
+    assert rc != 0, "env-mode launcher must reject responses missing studio_root_id"
+
+
+def test_check_health_accepts_missing_studio_root_id_in_default_mode():
+    """A default-install launcher MUST accept a healthy pre-PR backend that
+    omits studio_root_id, so an upgrade does not duplicate-launch on top of
+    a still-healthy legacy server."""
+    expected_id = "a" * 64
+    fn = _extract_check_health_function()
+    script = (
+        f"_EXPECTED_STUDIO_ROOT_ID={expected_id!r}\n"
+        '_INSTALLED_IS_ENV_MODE=""\n'
+        "_http_get() { printf '%s' \"$1\"; }\n"
+        + fn.replace(
+            '_resp=$(_http_get "http://127.0.0.1:$_port/api/health") || return 1',
+            "_resp='{\"status\":\"healthy\",\"service\":\"Unsloth UI Backend\"}'",
+        )
+        + "\n_check_health 8888\n"
+        "echo rc=$?\n"
+    )
+    res = subprocess.run(
+        ["bash", "-c", script],
+        env = {"PATH": "/usr/bin:/bin"},
+        text = True,
+        capture_output = True,
+    )
+    rc_lines = [l for l in res.stdout.splitlines() if l.startswith("rc=")]
+    rc = int(rc_lines[0].split("=")[1]) if rc_lines else res.returncode
+    assert rc == 0, "default-mode launcher must accept legacy backend without root id"
 
 
 def test_check_health_no_baked_id_accepts_any_healthy_backend():
@@ -962,3 +1014,147 @@ def test_install_ps1_canonicalizes_studio_home_before_root_id_hash():
     assert (
         "GetBytes($_studioRootForId)" in context
     ), "install.ps1 must hash the canonicalized $_studioRootForId, not the raw $StudioHome"
+
+
+# ── studio/setup.sh custom-root safety ──
+# _remove_repo_legacy_venv must skip when target sits inside STUDIO_HOME;
+# _assert_studio_owned_or_absent must reject regular files / symlinks under
+# custom-root mode so a later rm -rf does not wipe non-Studio data.
+
+def _extract_block(src: str, start_pat: str, end_pat: str) -> str:
+    m = re.search(start_pat + r".*?(?=" + end_pat + ")", src, re.DOTALL)
+    assert m, f"pattern not found: {start_pat}"
+    return m.group(0)
+
+
+def test_remove_repo_legacy_venv_skips_when_target_is_studio_home(tmp_path):
+    studio_home = tmp_path / "myproject" / ".venv"
+    studio_home.mkdir(parents = True)
+    (studio_home / "important.txt").write_text("user data")
+    helper = _extract_block(
+        SETUP_SH.read_text(),
+        r"_remove_repo_legacy_venv\(\) \{",
+        r"\n_remove_repo_legacy_venv \"\$REPO_ROOT/\.venv\"",
+    )
+    script = (
+        f'STUDIO_HOME="{studio_home}"\n'
+        f'_studio_home_canon="{studio_home.resolve()}"\n'
+        f'REPO_ROOT="{tmp_path / "myproject"}"\n'
+        f"{helper}\n"
+        '_remove_repo_legacy_venv "$REPO_ROOT/.venv"\n'
+    )
+    res = subprocess.run(
+        ["bash", "-c", script], env = {"PATH": "/usr/bin:/bin"},
+        text = True, capture_output = True,
+    )
+    assert res.returncode == 0, res.stderr
+    assert (studio_home / "important.txt").exists()
+
+
+def test_remove_repo_legacy_venv_deletes_when_target_outside_studio_home(tmp_path):
+    studio_home = tmp_path / "elsewhere"
+    studio_home.mkdir()
+    repo_root = tmp_path / "myproject"
+    repo_root.mkdir()
+    legacy = repo_root / ".venv"
+    legacy.mkdir()
+    (legacy / "stale.txt").write_text("stale")
+    helper = _extract_block(
+        SETUP_SH.read_text(),
+        r"_remove_repo_legacy_venv\(\) \{",
+        r"\n_remove_repo_legacy_venv \"\$REPO_ROOT/\.venv\"",
+    )
+    script = (
+        f'STUDIO_HOME="{studio_home}"\n'
+        f'_studio_home_canon="{studio_home.resolve()}"\n'
+        f'REPO_ROOT="{repo_root}"\n'
+        f"{helper}\n"
+        '_remove_repo_legacy_venv "$REPO_ROOT/.venv"\n'
+    )
+    res = subprocess.run(
+        ["bash", "-c", script], env = {"PATH": "/usr/bin:/bin"},
+        text = True, capture_output = True,
+    )
+    assert res.returncode == 0, res.stderr
+    assert not legacy.exists()
+
+
+def test_assert_studio_owned_or_absent_rejects_regular_file(tmp_path):
+    studio_home = tmp_path / "custom_studio"
+    studio_home.mkdir()
+    target = studio_home / "llama.cpp"
+    target.write_text("not a directory")
+    helper = _extract_block(
+        SETUP_SH.read_text(),
+        r"_assert_studio_owned_or_absent\(\) \{",
+        r"\n_NEED_T5_INSTALL=",
+    )
+    script = (
+        f'STUDIO_HOME="{studio_home}"\n'
+        '_STUDIO_HOME_IS_CUSTOM=true\n'
+        '_STUDIO_OWNED_MARKER=".unsloth-studio-owned"\n'
+        f"{helper}\n"
+        f'_assert_studio_owned_or_absent "{target}" "llama.cpp install"\n'
+        'echo "ALLOWED"\n'
+    )
+    res = subprocess.run(
+        ["bash", "-c", script], env = {"PATH": "/usr/bin:/bin"},
+        text = True, capture_output = True,
+    )
+    assert res.returncode == 1
+    assert "not a Studio-owned" in res.stderr
+    assert target.is_file()
+    assert target.read_text() == "not a directory"
+
+
+def test_assert_studio_owned_or_absent_allows_default_root(tmp_path):
+    studio_home = tmp_path / "custom_studio"
+    studio_home.mkdir()
+    target = studio_home / "llama.cpp"
+    target.write_text("not a directory")
+    helper = _extract_block(
+        SETUP_SH.read_text(),
+        r"_assert_studio_owned_or_absent\(\) \{",
+        r"\n_NEED_T5_INSTALL=",
+    )
+    script = (
+        f'STUDIO_HOME="{studio_home}"\n'
+        '_STUDIO_HOME_IS_CUSTOM=false\n'
+        '_STUDIO_OWNED_MARKER=".unsloth-studio-owned"\n'
+        f"{helper}\n"
+        f'_assert_studio_owned_or_absent "{target}" "llama.cpp install"\n'
+        'echo "ALLOWED"\n'
+    )
+    res = subprocess.run(
+        ["bash", "-c", script], env = {"PATH": "/usr/bin:/bin"},
+        text = True, capture_output = True,
+    )
+    assert res.returncode == 0
+    assert "ALLOWED" in res.stdout
+
+
+def test_assert_studio_owned_or_absent_allows_marked_directory(tmp_path):
+    studio_home = tmp_path / "custom_studio"
+    studio_home.mkdir()
+    target = studio_home / "llama.cpp"
+    target.mkdir()
+    (target / ".unsloth-studio-owned").write_text("")
+    helper = _extract_block(
+        SETUP_SH.read_text(),
+        r"_assert_studio_owned_or_absent\(\) \{",
+        r"\n_NEED_T5_INSTALL=",
+    )
+    script = (
+        f'STUDIO_HOME="{studio_home}"\n'
+        '_STUDIO_HOME_IS_CUSTOM=true\n'
+        '_STUDIO_OWNED_MARKER=".unsloth-studio-owned"\n'
+        f"{helper}\n"
+        f'_assert_studio_owned_or_absent "{target}" "llama.cpp install"\n'
+        'echo "ALLOWED"\n'
+    )
+    res = subprocess.run(
+        ["bash", "-c", script], env = {"PATH": "/usr/bin:/bin"},
+        text = True, capture_output = True,
+    )
+    assert res.returncode == 0
+    assert "ALLOWED" in res.stdout

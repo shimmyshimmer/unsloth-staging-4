@@ -44,7 +44,7 @@ class _RaisingTransformer:
         raise RuntimeError("simulated init failure")
 
 
-def _build_driver(transformer_class):
+def _install_fake_modules(transformer_class):
     transformers_mod = types.ModuleType("transformers")
     transformers_mod.AutoModel = _FakeAuto("AutoModel")
     transformers_mod.AutoProcessor = _FakeAuto("AutoProcessor")
@@ -56,10 +56,67 @@ def _build_driver(transformer_class):
     st_models.Transformer = transformer_class
     sys.modules["sentence_transformers"] = st_root
     sys.modules["sentence_transformers.models"] = st_models
+    return transformers_mod
 
+
+def _model_with_forward(*sig_kwargs: str):
+    class _M:
+        config = types.SimpleNamespace(max_position_embeddings = 128)
+
+        def forward(self, **kwargs):
+            return None
+
+    if sig_kwargs:
+        params = ", ".join("{}=None".format(k) for k in sig_kwargs)
+        ns: dict = {}
+        exec(
+            "def forward(self, {params}): return None".format(params = params),
+            ns,
+        )
+        _M.forward = ns["forward"]
+    return _M()
+
+
+def _fake_tokenizer():
+    return types.SimpleNamespace(
+        do_lower_case = False,
+        model_max_length = 128,
+        __class__ = type("FakeTok", (), {}),
+    )
+
+
+def _build_driver(transformer_class):
+    """Drive FastSentenceTransformer._create_transformer_module against the
+    fake transformers/sentence_transformers modules. Falls back to a local
+    inline driver only if FastSentenceTransformer cannot be imported (e.g.
+    bare Python test env without unsloth installed); production regressions
+    in the constructor-redirect block must fail the production-import branch.
+    """
+    transformers_mod = _install_fake_modules(transformer_class)
     captured = {"calls": None}
 
+    try:
+        from unsloth.models.sentence_transformer import FastSentenceTransformer
+    except Exception:
+        FastSentenceTransformer = None
+
     def driver(model_name, model, tokenizer):
+        if FastSentenceTransformer is not None:
+            try:
+                t = FastSentenceTransformer._create_transformer_module(
+                    model_name,
+                    model = model,
+                    tokenizer = tokenizer,
+                    max_seq_length = None,
+                    trust_remote_code = False,
+                )
+            except (RuntimeError, AttributeError, TypeError):
+                # _create_transformer_module post-redirect logic uses
+                # inspect.signature(model.forward) and assigns to the
+                # transformer module; rethrow only for the caller to assert.
+                raise
+            captured["calls"] = getattr(type(t), "last_calls", None)
+            return t
         from transformers import AutoModel, AutoProcessor, AutoTokenizer
         from sentence_transformers.models import Transformer
 
