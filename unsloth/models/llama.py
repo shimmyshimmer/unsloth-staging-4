@@ -2478,6 +2478,16 @@ class FastLlamaModel:
                     and not _head.weight.is_floating_point()
                 ):
                     _head.to(dtype)
+            # Guardrail: warn before dispatch hooks if quantization was silently dropped.
+            from unsloth.models.vision import _warn_if_quantization_silently_dropped
+
+            _warn_if_quantization_silently_dropped(
+                model,
+                load_in_4bit = load_in_4bit,
+                load_in_8bit = kwargs.get("load_in_8bit", False),
+                full_finetuning = kwargs.get("full_finetuning", False),
+                quantization_config = kwargs.get("quantization_config"),
+            )
             # Attach dispatch hooks for bnb multi-device loads.
             from unsloth.models.vision import _attach_bnb_multidevice_hooks
 
@@ -2510,7 +2520,8 @@ class FastLlamaModel:
                 model,
                 load_in_4bit = load_in_4bit,
                 load_in_8bit = kwargs.get("load_in_8bit", False),
-                full_finetuning = full_finetuning,
+                full_finetuning = kwargs.get("full_finetuning", False),
+                quantization_config = kwargs.get("quantization_config"),
             )
             _attach_bnb_multidevice_hooks(
                 model,
