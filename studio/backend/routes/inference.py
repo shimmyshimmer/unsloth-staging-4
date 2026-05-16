@@ -454,7 +454,7 @@ def _request_matches_loaded_settings(
     # running server's stored extras may contain shadow flags (e.g.
     # ``-c 4096``) that would last-wins-override one of the request's
     # first-class fields; if so, fall through to a real reload so the
-    # reload path can strip them (#5401).
+    # reload path can strip them.
     backend_extra = list(llama_backend.extra_args) if llama_backend.extra_args else []
     if request.llama_extra_args is None:
         if backend_extra and strip_shadowing_flags(backend_extra) != backend_extra:
@@ -524,7 +524,7 @@ async def load_model(
         # but the inheritance path below needs to distinguish "caller
         # omitted, inherit prior load" from "caller explicitly cleared
         # to []". Re-narrow to None when the original request omitted
-        # the field so the duplicate-load guard isn't defeated (#5401).
+        # the field so the duplicate-load guard isn't defeated.
         extra_llama_args: Optional[list[str]] = (
             None if request.llama_extra_args is None else extra_llama_args
         )
@@ -713,14 +713,13 @@ async def load_model(
                     # why: cross-model load must not pick up the prior
                     # model's pass-through flags; ``None`` would inherit
                     # via the backend's "no opinion" semantics, so make
-                    # the clear explicit (#5401).
+                    # the clear explicit.
                     extra_llama_args = []
                 else:
                     # why: only strip groups whose corresponding
                     # first-class field was actually set by the caller,
                     # so an inherited ``--chat-template-file`` survives
-                    # an Apply that didn't supply chat_template_override
-                    # (#5401).
+                    # an Apply that didn't supply chat_template_override.
                     fields_set = getattr(request, "model_fields_set", set())
                     stripped = strip_shadowing_flags(
                         llama_backend.extra_args,

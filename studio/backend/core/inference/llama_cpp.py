@@ -2694,7 +2694,7 @@ class LlamaCppBackend:
                     self._extra_args = list(extra_args)
                     # why: store the caller's hf_variant (None for local
                     # GGUF files) so the route's same_source check stays
-                    # symmetric across HF and direct-file loads (#5401).
+                    # symmetric across HF and direct-file loads.
                     self._extra_args_source = (
                         model_identifier,
                         hf_variant,
@@ -2748,7 +2748,7 @@ class LlamaCppBackend:
         # why: local-mode load_model receives hf_variant=None while the
         # backend's self._hf_variant was extracted from the filename, so
         # compare the on-disk path instead of the asymmetric variant
-        # label for direct-file loads (#5401).
+        # label for direct-file loads.
         if gguf_path is not None and self._gguf_path:
             try:
                 if Path(self._gguf_path).resolve() != Path(gguf_path).resolve():
