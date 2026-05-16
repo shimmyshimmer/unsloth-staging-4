@@ -121,14 +121,10 @@ def is_managed_flag(flag: str) -> bool:
 
 
 # Pass-through flags that shadow first-class ``LoadRequest`` fields
-# (``max_seq_length``, ``cache_type_kv``, ``speculative_type``,
-# ``chat_template_override``). When the route inherits a previous
-# load's extra_args because the current request omitted the field, the
-# current request is still supplying these first-class values, so any
-# inherited token that would otherwise win llama.cpp's last-wins parse
-# is stripped here. Without this, ``unsloth run -c 4096`` followed by a
-# UI Apply with ``max_seq_length=8192`` would silently stay at 4096
-# (#5401).
+# (max_seq_length, cache_type_kv, speculative_type,
+# chat_template_override). Stripped from inherited extras so they
+# can't last-wins-override an Apply that re-sets the same first-class
+# field (#5401).
 _CONTEXT_FLAGS: frozenset[str] = frozenset({"-c", "--ctx-size"})
 _CACHE_FLAGS: frozenset[str] = frozenset(
     {"-ctk", "--cache-type-k", "-ctv", "--cache-type-v"}

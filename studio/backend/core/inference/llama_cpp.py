@@ -2684,21 +2684,14 @@ class LlamaCppBackend:
 
                 self._healthy = True
 
-                # Commit caller intent (extra_args + requested n_ctx)
-                # only after the server is healthy so a failed startup
-                # does not poison subsequent inheritance / comparator
-                # checks. ``extra_args``: None keeps prior, [] clears,
-                # list sets. Source records (model, variant) so the
-                # route can refuse cross-model inheritance (#5401).
+                # Commit caller intent only after _healthy=True so a
+                # failed startup can't poison the next inheritance check.
+                # None keeps prior, [] clears, list sets. Source records
+                # the caller's hf_variant (None for local files) so the
+                # route's same_source check stays symmetric (#5401).
                 if extra_args is not None:
                     self._extra_args = list(extra_args)
-                    # why: store the caller's hf_variant (None for local
-                    # GGUF files) so the route's same_source check stays
-                    # symmetric across HF and direct-file loads (#5401).
-                    self._extra_args_source = (
-                        model_identifier,
-                        hf_variant,
-                    )
+                    self._extra_args_source = (model_identifier, hf_variant)
                 self._requested_n_ctx = int(n_ctx)
 
                 # Catch silent CPU fallback when GPU was intended (#5106).
@@ -2745,10 +2738,9 @@ class LlamaCppBackend:
             return False
         if (self._model_identifier or "").lower() != (model_identifier or "").lower():
             return False
-        # why: local-mode load_model receives hf_variant=None while the
-        # backend's self._hf_variant was extracted from the filename, so
-        # compare the on-disk path instead of the asymmetric variant
-        # label for direct-file loads (#5401).
+        # Direct-file loads pass hf_variant=None while the backend
+        # stores an extracted filename label; compare paths instead
+        # to keep the guard symmetric (#5401).
         if gguf_path is not None and self._gguf_path:
             try:
                 if Path(self._gguf_path).resolve() != Path(gguf_path).resolve():
@@ -2771,9 +2763,10 @@ class LlamaCppBackend:
         if _norm(self._cache_type_kv) != _norm(cache_type_kv):
             return False
 
-        # Vision GGUFs silently drop speculative decoding (see line
-        # 2338); treat the request's value as "off" so a vision load
-        # with speculative_type="default" still matches.
+        # Vision GGUFs silently drop speculative decoding in
+        # load_model (the spec gate is "not is_vision"); treat the
+        # request's value as "off" so a vision load with
+        # speculative_type="default" still matches.
         if self._is_vision or is_vision:
             req_spec = "off"
         else:

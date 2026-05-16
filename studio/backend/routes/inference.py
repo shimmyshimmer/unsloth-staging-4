@@ -450,11 +450,9 @@ def _request_matches_loaded_settings(
     ):
         return False
     # llama_extra_args=None means "inherit"; only an explicit list that
-    # differs from what's loaded forces a reload. When inheriting, the
-    # running server's stored extras may contain shadow flags (e.g.
-    # ``-c 4096``) that would last-wins-override one of the request's
-    # first-class fields; if so, fall through to a real reload so the
-    # reload path can strip them (#5401).
+    # differs forces a reload. On the inherit path, refuse to match if
+    # stored extras contain any shadow flag, so the reload path can
+    # strip them instead of leaving a stale override in effect (#5401).
     backend_extra = list(llama_backend.extra_args) if llama_backend.extra_args else []
     if request.llama_extra_args is None:
         if backend_extra and strip_shadowing_flags(backend_extra) != backend_extra:
@@ -520,11 +518,9 @@ async def load_model(
             extra_llama_args = validate_extra_args(request.llama_extra_args)
         except ValueError as exc:
             raise HTTPException(status_code = 400, detail = str(exc))
-        # why: validate_extra_args(None) returns [] (same as []-input),
-        # but the inheritance path below needs to distinguish "caller
-        # omitted, inherit prior load" from "caller explicitly cleared
-        # to []". Re-narrow to None when the original request omitted
-        # the field so the duplicate-load guard isn't defeated (#5401).
+        # Re-narrow []-from-None back to None so the inheritance path
+        # below can tell "caller omitted" from "caller explicit []"
+        # (#5401).
         extra_llama_args: Optional[list[str]] = (
             None if request.llama_extra_args is None else extra_llama_args
         )
@@ -684,16 +680,13 @@ async def load_model(
                 unsloth_backend.unload_model(unsloth_backend.active_model_name)
 
             # Inherit llama_extra_args from the previous load when the
-            # request omits the field; the chat-settings Apply path does
-            # not round-trip them. Explicit [] still clears (#5401).
-            #
-            # Inheritance is gated on the stored args having come from
-            # the same (model_identifier, hf_variant) so a switch to a
-            # different model cannot pick up the previous model's pass-
-            # through flags. Tokens that would shadow first-class
-            # request fields (``-c`` / ``--cache-type-*`` / ``--spec-*``
-            # / ``--chat-template*``) are stripped so the inherited
-            # override cannot silently win llama.cpp's last-wins parse.
+            # request omits the field (the chat-settings Apply path
+            # does not round-trip them; explicit [] still clears).
+            # Inheritance is gated on (model_identifier, hf_variant)
+            # to refuse cross-model pickup, and shadowing flags are
+            # stripped so an inherited override can't win the last-wins
+            # CLI parse against a freshly-supplied first-class field
+            # (#5401).
             if request.llama_extra_args is None and llama_backend.extra_args:
                 source = llama_backend.extra_args_source
                 same_source = bool(
@@ -710,17 +703,14 @@ async def load_model(
                         source,
                         (model_identifier, request.gguf_variant),
                     )
-                    # why: cross-model load must not pick up the prior
-                    # model's pass-through flags; ``None`` would inherit
-                    # via the backend's "no opinion" semantics, so make
-                    # the clear explicit (#5401).
+                    # Cross-model: clear explicitly so the backend
+                    # doesn't inherit via "no opinion" semantics.
                     extra_llama_args = []
                 else:
-                    # why: only strip groups whose corresponding
-                    # first-class field was actually set by the caller,
-                    # so an inherited ``--chat-template-file`` survives
-                    # an Apply that didn't supply chat_template_override
-                    # (#5401).
+                    # Strip only the groups whose first-class field
+                    # was actually set by the caller, so an inherited
+                    # --chat-template-file survives an Apply that omits
+                    # chat_template_override (#5401).
                     fields_set = getattr(request, "model_fields_set", set())
                     stripped = strip_shadowing_flags(
                         llama_backend.extra_args,
