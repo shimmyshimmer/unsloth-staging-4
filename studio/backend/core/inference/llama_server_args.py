@@ -124,7 +124,7 @@ def is_managed_flag(flag: str) -> bool:
 # (max_seq_length, cache_type_kv, speculative_type,
 # chat_template_override). Stripped from inherited extras so they
 # can't last-wins-override an Apply that re-sets the same first-class
-# field (#5401).
+# field.
 _CONTEXT_FLAGS: frozenset[str] = frozenset({"-c", "--ctx-size"})
 _CACHE_FLAGS: frozenset[str] = frozenset(
     {"-ctk", "--cache-type-k", "-ctv", "--cache-type-v"}
@@ -155,7 +155,7 @@ _SHADOWING_FLAGS: frozenset[str] = (
 
 # Boolean flags inside _SHADOWING_FLAGS that take no value. The
 # value-consuming heuristic in strip_shadowing_flags must skip just the
-# flag for these, never the following token (#5401).
+# flag for these, never the following token.
 _BOOLEAN_SHADOWING_FLAGS: frozenset[str] = frozenset(
     {"--spec-default", "--jinja", "--no-jinja"}
 )
@@ -178,7 +178,7 @@ def strip_shadowing_flags(
     group; the route only strips groups whose corresponding first-class
     field was actually supplied by the caller, so an inherited
     ``--chat-template-file`` survives an Apply that omits both
-    ``llama_extra_args`` and ``chat_template_override`` (#5401).
+    ``llama_extra_args`` and ``chat_template_override``.
     """
     shadowing: set[str] = set()
     if strip_context:

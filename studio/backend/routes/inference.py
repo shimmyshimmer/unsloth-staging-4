@@ -452,7 +452,7 @@ def _request_matches_loaded_settings(
     # llama_extra_args=None means "inherit"; only an explicit list that
     # differs forces a reload. On the inherit path, refuse to match if
     # stored extras contain any shadow flag, so the reload path can
-    # strip them instead of leaving a stale override in effect (#5401).
+    # strip them instead of leaving a stale override in effect.
     backend_extra = list(llama_backend.extra_args) if llama_backend.extra_args else []
     if request.llama_extra_args is None:
         if backend_extra and strip_shadowing_flags(backend_extra) != backend_extra:
@@ -519,8 +519,7 @@ async def load_model(
         except ValueError as exc:
             raise HTTPException(status_code = 400, detail = str(exc))
         # Re-narrow []-from-None back to None so the inheritance path
-        # below can tell "caller omitted" from "caller explicit []"
-        # (#5401).
+        # below can tell "caller omitted" from "caller explicit []".
         extra_llama_args: Optional[list[str]] = (
             None if request.llama_extra_args is None else extra_llama_args
         )
@@ -685,8 +684,7 @@ async def load_model(
             # Inheritance is gated on (model_identifier, hf_variant)
             # to refuse cross-model pickup, and shadowing flags are
             # stripped so an inherited override can't win the last-wins
-            # CLI parse against a freshly-supplied first-class field
-            # (#5401).
+            # CLI parse against a freshly-supplied first-class field.
             if request.llama_extra_args is None and llama_backend.extra_args:
                 source = llama_backend.extra_args_source
                 same_source = bool(
@@ -710,7 +708,7 @@ async def load_model(
                     # Strip only the groups whose first-class field
                     # was actually set by the caller, so an inherited
                     # --chat-template-file survives an Apply that omits
-                    # chat_template_override (#5401).
+                    # chat_template_override.
                     fields_set = getattr(request, "model_fields_set", set())
                     stripped = strip_shadowing_flags(
                         llama_backend.extra_args,

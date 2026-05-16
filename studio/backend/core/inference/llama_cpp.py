@@ -2688,7 +2688,7 @@ class LlamaCppBackend:
                 # failed startup can't poison the next inheritance check.
                 # None keeps prior, [] clears, list sets. Source records
                 # the caller's hf_variant (None for local files) so the
-                # route's same_source check stays symmetric (#5401).
+                # route's same_source check stays symmetric.
                 if extra_args is not None:
                     self._extra_args = list(extra_args)
                     self._extra_args_source = (model_identifier, hf_variant)
@@ -2740,7 +2740,7 @@ class LlamaCppBackend:
             return False
         # Direct-file loads pass hf_variant=None while the backend
         # stores an extracted filename label; compare paths instead
-        # to keep the guard symmetric (#5401).
+        # to keep the guard symmetric.
         if gguf_path is not None and self._gguf_path:
             try:
                 if Path(self._gguf_path).resolve() != Path(gguf_path).resolve():
