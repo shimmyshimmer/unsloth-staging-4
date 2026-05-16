@@ -2021,6 +2021,7 @@ class LlamaCppBackend:
             # (the first one hadn't published _healthy=True yet). If the
             # live server already satisfies this request, do nothing.
             if self._already_in_target_state(
+                gguf_path = gguf_path,
                 model_identifier = model_identifier,
                 hf_variant = hf_variant,
                 n_ctx = n_ctx,
@@ -2691,9 +2692,12 @@ class LlamaCppBackend:
                 # route can refuse cross-model inheritance (#5401).
                 if extra_args is not None:
                     self._extra_args = list(extra_args)
+                    # why: store the caller's hf_variant (None for local
+                    # GGUF files) so the route's same_source check stays
+                    # symmetric across HF and direct-file loads (#5401).
                     self._extra_args_source = (
                         model_identifier,
-                        self._hf_variant,
+                        hf_variant,
                     )
                 self._requested_n_ctx = int(n_ctx)
 
@@ -2729,6 +2733,7 @@ class LlamaCppBackend:
         chat_template_override: Optional[str],
         extra_args: Optional[List[str]],
         is_vision: bool,
+        gguf_path: Optional[str] = None,
     ) -> bool:
         """True iff the live server already satisfies these load kwargs.
 
@@ -2740,7 +2745,17 @@ class LlamaCppBackend:
             return False
         if (self._model_identifier or "").lower() != (model_identifier or "").lower():
             return False
-        if (self._hf_variant or "").lower() != (hf_variant or "").lower():
+        # why: local-mode load_model receives hf_variant=None while the
+        # backend's self._hf_variant was extracted from the filename, so
+        # compare the on-disk path instead of the asymmetric variant
+        # label for direct-file loads (#5401).
+        if gguf_path is not None and self._gguf_path:
+            try:
+                if Path(self._gguf_path).resolve() != Path(gguf_path).resolve():
+                    return False
+            except OSError:
+                return False
+        elif (self._hf_variant or "").lower() != (hf_variant or "").lower():
             return False
         if self._requested_n_ctx != int(n_ctx):
             return False

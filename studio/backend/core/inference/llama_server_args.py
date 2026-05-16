@@ -129,24 +129,22 @@ def is_managed_flag(flag: str) -> bool:
 # is stripped here. Without this, ``unsloth run -c 4096`` followed by a
 # UI Apply with ``max_seq_length=8192`` would silently stay at 4096
 # (#5401).
-_SHADOWING_FLAGS: frozenset[str] = frozenset(
+_CONTEXT_FLAGS: frozenset[str] = frozenset({"-c", "--ctx-size"})
+_CACHE_FLAGS: frozenset[str] = frozenset(
+    {"-ctk", "--cache-type-k", "-ctv", "--cache-type-v"}
+)
+_SPEC_FLAGS: frozenset[str] = frozenset(
     {
-        # max_seq_length -> -c / --ctx-size
-        "-c",
-        "--ctx-size",
-        # cache_type_kv -> --cache-type-k / --cache-type-v
-        "-ctk",
-        "--cache-type-k",
-        "-ctv",
-        "--cache-type-v",
-        # speculative_type -> --spec-* + Studio's draft tuning
         "--spec-default",
         "--spec-type",
         "--spec-ngram-size-n",
         "--spec-ngram-size",
         "--draft-min",
         "--draft-max",
-        # chat_template_override -> --chat-template* + jinja toggles
+    }
+)
+_TEMPLATE_FLAGS: frozenset[str] = frozenset(
+    {
         "--chat-template",
         "--chat-template-file",
         "--chat-template-kwargs",
@@ -155,28 +153,63 @@ _SHADOWING_FLAGS: frozenset[str] = frozenset(
     }
 )
 
+_SHADOWING_FLAGS: frozenset[str] = (
+    _CONTEXT_FLAGS | _CACHE_FLAGS | _SPEC_FLAGS | _TEMPLATE_FLAGS
+)
 
-def strip_shadowing_flags(args: Iterable[str]) -> list[str]:
+# Boolean flags inside _SHADOWING_FLAGS that take no value. The
+# value-consuming heuristic in strip_shadowing_flags must skip just the
+# flag for these, never the following token (#5401).
+_BOOLEAN_SHADOWING_FLAGS: frozenset[str] = frozenset(
+    {"--spec-default", "--jinja", "--no-jinja"}
+)
+
+
+def strip_shadowing_flags(
+    args: Iterable[str],
+    *,
+    strip_context: bool = True,
+    strip_cache: bool = True,
+    strip_spec: bool = True,
+    strip_template: bool = True,
+) -> list[str]:
     """Strip flags that shadow first-class Studio settings.
 
     Used when the route inherits a previous load's ``llama_extra_args``
     so that an inherited ``-c 4096`` cannot override the current
     request's ``max_seq_length`` (and equivalents for cache /
-    speculative / chat template). See ``_SHADOWING_FLAGS`` (#5401).
+    speculative / chat template). Each ``strip_*`` flag controls one
+    group; the route only strips groups whose corresponding first-class
+    field was actually supplied by the caller, so an inherited
+    ``--chat-template-file`` survives an Apply that omits both
+    ``llama_extra_args`` and ``chat_template_override`` (#5401).
     """
+    shadowing: set[str] = set()
+    if strip_context:
+        shadowing |= _CONTEXT_FLAGS
+    if strip_cache:
+        shadowing |= _CACHE_FLAGS
+    if strip_spec:
+        shadowing |= _SPEC_FLAGS
+    if strip_template:
+        shadowing |= _TEMPLATE_FLAGS
+
     tokens = [str(a) for a in (args or [])]
     out: list[str] = []
     i, n = 0, len(tokens)
     while i < n:
         tok = tokens[i]
         flag = _flag_name(tok)
-        if flag is None or flag not in _SHADOWING_FLAGS:
+        if flag is None or flag not in shadowing:
             out.append(tok)
             i += 1
             continue
-        # Drop this token. If it doesn't already pack ``=value`` and
-        # the next token isn't a flag, drop that as the flag's value.
-        if "=" not in tok and i + 1 < n and _flag_name(tokens[i + 1]) is None:
+        # Drop this token. Boolean shadowing flags never carry a value;
+        # other shadowing flags consume the next token when it isn't a
+        # flag and the value isn't already packed as ``--key=value``.
+        if flag in _BOOLEAN_SHADOWING_FLAGS or "=" in tok:
+            i += 1
+        elif i + 1 < n and _flag_name(tokens[i + 1]) is None:
             i += 2
         else:
             i += 1

@@ -450,11 +450,18 @@ def _request_matches_loaded_settings(
     ):
         return False
     # llama_extra_args=None means "inherit"; only an explicit list that
-    # differs from what's loaded forces a reload.
-    req_extra = list(request.llama_extra_args) if request.llama_extra_args else []
+    # differs from what's loaded forces a reload. When inheriting, the
+    # running server's stored extras may contain shadow flags (e.g.
+    # ``-c 4096``) that would last-wins-override one of the request's
+    # first-class fields; if so, fall through to a real reload so the
+    # reload path can strip them (#5401).
     backend_extra = list(llama_backend.extra_args) if llama_backend.extra_args else []
-    if request.llama_extra_args is not None and req_extra != backend_extra:
-        return False
+    if request.llama_extra_args is None:
+        if backend_extra and strip_shadowing_flags(backend_extra) != backend_extra:
+            return False
+    else:
+        if list(request.llama_extra_args) != backend_extra:
+            return False
     return True
 
 
@@ -513,6 +520,14 @@ async def load_model(
             extra_llama_args = validate_extra_args(request.llama_extra_args)
         except ValueError as exc:
             raise HTTPException(status_code = 400, detail = str(exc))
+        # why: validate_extra_args(None) returns [] (same as []-input),
+        # but the inheritance path below needs to distinguish "caller
+        # omitted, inherit prior load" from "caller explicitly cleared
+        # to []". Re-narrow to None when the original request omitted
+        # the field so the duplicate-load guard isn't defeated (#5401).
+        extra_llama_args: Optional[list[str]] = (
+            None if request.llama_extra_args is None else extra_llama_args
+        )
 
         model_identifier, model_log_label, native_grant_backed = (
             _resolve_model_identifier_for_request(request, operation = "load-model")
@@ -695,8 +710,25 @@ async def load_model(
                         source,
                         (model_identifier, request.gguf_variant),
                     )
+                    # why: cross-model load must not pick up the prior
+                    # model's pass-through flags; ``None`` would inherit
+                    # via the backend's "no opinion" semantics, so make
+                    # the clear explicit (#5401).
+                    extra_llama_args = []
                 else:
-                    stripped = strip_shadowing_flags(llama_backend.extra_args)
+                    # why: only strip groups whose corresponding
+                    # first-class field was actually set by the caller,
+                    # so an inherited ``--chat-template-file`` survives
+                    # an Apply that didn't supply chat_template_override
+                    # (#5401).
+                    fields_set = getattr(request, "model_fields_set", set())
+                    stripped = strip_shadowing_flags(
+                        llama_backend.extra_args,
+                        strip_context = "max_seq_length" in fields_set,
+                        strip_cache = "cache_type_kv" in fields_set,
+                        strip_spec = "speculative_type" in fields_set,
+                        strip_template = "chat_template_override" in fields_set,
+                    )
                     try:
                         extra_llama_args = validate_extra_args(stripped)
                     except ValueError:
