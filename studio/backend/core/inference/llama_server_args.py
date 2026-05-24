@@ -14,7 +14,7 @@ User-supplied args are appended to ``cmd`` after Studio's auto-set
 flags, so llama.cpp's last-wins CLI parsing makes the user's value
 override the auto-set one. That covers tunable knobs the user might
 reasonably want to override -- ``-c``/``--ctx-size``,
-``-np``/``--parallel``, ``-fa``/``--flash-attn``,
+``-fa``/``--flash-attn``,
 ``-ngl``/``--gpu-layers``, ``-t``/``--threads``, ``-fit``/``--fit*``,
 ``--cache-type-k/v``, ``--chat-template-file/-kwargs``,
 ``--spec-*``, ``--jinja``/``--no-jinja``,
@@ -32,11 +32,19 @@ from typing import Iterable, Optional
 # adds a new alias for an existing denied flag, extend the relevant
 # group.
 #
-# Flags NOT in this list (e.g. -c, --parallel, --flash-attn, -ngl,
+# Flags NOT in this list (e.g. -c, --flash-attn, -ngl,
 # -t/--threads, --jinja, --no-context-shift, --fit*, --cache-type-*,
 # --chat-template-*, --spec-*) pass through and override Studio's
 # auto-set version via llama.cpp's last-wins CLI parsing.
 _DENYLIST_GROUPS: tuple[frozenset[str], ...] = (
+    # Parallel slot count -- Studio's KV-cache fitting + app.state.
+    # llama_parallel_slots come from the typer --parallel value (in
+    # unsloth_cli/commands/studio.py). A pass-through --parallel would
+    # last-win-override the running llama-server slot count while
+    # Studio's accounting stays at the typer value, so the resource
+    # plan and the running process disagree. Reject so the only path
+    # is the first-class typer flag with its 1..64 range guard.
+    frozenset({"-np", "--parallel", "--n-parallel"}),
     # Model identity -- Studio resolves the model from LoadRequest and
     # passes -m / mmproj after downloading from HF if needed. A second
     # -m would point at a different model than the one Studio thinks
@@ -93,12 +101,17 @@ def _flag_name(token: str) -> Optional[str]:
     Peels ``--key=value`` to the bare ``--key``. Plain numeric values
     like ``-1`` or ``-0.5`` (e.g. ``--seed -1``) are values, not flags;
     llama-server short-form flags always start with a letter.
+    Also normalises the attached short-option form ``-np<N>`` to
+    ``-np`` so the denylist catches both ``-np 8`` and ``-np8``.
     """
     if not token.startswith("-") or token in {"-", "--"}:
         return None
     if len(token) >= 2 and (token[1].isdigit() or token[1] == "."):
         return None
-    return token.split("=", 1)[0]
+    name = token.split("=", 1)[0]
+    if len(name) > 3 and name.startswith("-np") and name[3:].isdigit():
+        return "-np"
+    return name
 
 
 def validate_extra_args(args: Optional[Iterable[str]]) -> list[str]:
