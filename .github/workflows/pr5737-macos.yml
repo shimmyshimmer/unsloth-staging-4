@@ -34,7 +34,7 @@ jobs:
       - name: Install minimal test deps (no torch, no MLX)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install typer pytest pytest-asyncio pytest-timeout
+          python -m pip install typer pytest pytest-asyncio pytest-timeout pyyaml pydantic
       - name: Show env
         run: |
           python --version
