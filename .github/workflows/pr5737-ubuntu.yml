@@ -1,4 +1,4 @@
-name: PR #5737 ubuntu-latest
+name: "PR-5737 ubuntu-latest"
 on:
   push:
     branches: [pr5737-cross-os]

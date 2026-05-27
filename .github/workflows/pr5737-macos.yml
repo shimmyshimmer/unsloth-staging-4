@@ -1,4 +1,4 @@
-name: PR #5737 macos-14
+name: "PR-5737 macos-14"
 on:
   push:
     branches: [pr5737-cross-os]
