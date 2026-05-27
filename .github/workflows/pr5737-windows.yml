@@ -1,0 +1,54 @@
+name: PR #5737 windows-latest
+on:
+  push:
+    branches: [pr5737-cross-os]
+    paths:
+      - 'unsloth_cli/**'
+      - 'studio/backend/core/inference/llama_server_args.py'
+      - 'studio/backend/tests/test_llama_server_args.py'
+      - 'studio/backend/run.py'
+      - '.github/workflows/pr5737-windows.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'unsloth_cli/**'
+      - 'studio/backend/core/inference/llama_server_args.py'
+      - 'studio/backend/tests/test_llama_server_args.py'
+      - 'studio/backend/run.py'
+      - '.github/workflows/pr5737-windows.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  pytest:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: 'pip' }
+      - name: Install minimal test deps (no torch, no CUDA)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install typer pytest pytest-asyncio pytest-timeout
+      - name: Show env
+        shell: bash
+        run: |
+          python --version
+          pip list | head -30
+          systeminfo | head -10 || true
+      - name: CLI tests
+        shell: bash
+        run: |
+          python -m pytest unsloth_cli/tests/ -q -v
+      - name: Backend boundary-validator tests
+        shell: bash
+        env:
+          PYTHONPATH: studio/backend
+        run: |
+          python -m pytest studio/backend/tests/test_llama_server_args.py -q -v
