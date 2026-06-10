@@ -1,0 +1,212 @@
+# Throwaway experiment for upstream PR 6138: on the exact runner hardware
+# where the json-images smoke answers city=France at temp 0, measure which
+# hard-assert strategy is robust:
+#   job A: UD-IQ2_XXS quant, temp 0 determinism check + 5 seeds at 0.7 / 1.0
+#   job B: UD-Q4_K_XL quant, same sweep (candidate quant bump, temp 0 focus)
+# Data-collection runs: jobs print a result table and only fail on transport
+# or JSON-shape errors, never on the city value.
+name: "json-smoke seed sweep ubuntu-latest"
+
+on:
+  push:
+    branches: [json-smoke-seeds-experiment]
+    paths:
+      - '.github/workflows/json-smoke-seed-sweep.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    name: "sweep ${{ matrix.variant }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: UD-IQ2_XXS
+            gguf_file: Qwen3-VL-2B-Instruct-UD-IQ2_XXS.gguf
+          - variant: UD-Q4_K_XL
+            gguf_file: Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf
+    env:
+      GGUF_REPO: unsloth/Qwen3-VL-2B-Instruct-GGUF
+      GGUF_VARIANT: ${{ matrix.variant }}
+      GGUF_FILE: ${{ matrix.gguf_file }}
+      MMPROJ_FILE: mmproj-F16.gguf
+      STUDIO_PORT: '18890'
+      HF_HOME: ${{ github.workspace }}/hf-cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Linux deps for llama.cpp prebuilt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev libssl-dev jq
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Restore HF_HOME
+        id: cache-hf
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: hf-cache
+          key: ${{ runner.os }}-hf-${{ env.GGUF_REPO }}-${{ env.GGUF_VARIANT }}-${{ env.MMPROJ_FILE }}-v1
+
+      - name: Prime HF_HOME with the GGUF + mmproj
+        id: prime-hf
+        if: steps.cache-hf.outputs.cache-hit != 'true' || steps.cache-hf.outcome != 'success'
+        run: |
+          python -m pip install --upgrade huggingface_hub
+          mkdir -p hf-cache
+          bash .github/scripts/hf-download-with-retry.sh "$GGUF_REPO" "$GGUF_FILE"
+          bash .github/scripts/hf-download-with-retry.sh "$GGUF_REPO" "$MMPROJ_FILE"
+
+      - name: Save HF_HOME
+        if: always() && steps.prime-hf.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: hf-cache
+          key: ${{ runner.os }}-hf-${{ env.GGUF_REPO }}-${{ env.GGUF_VARIANT }}-${{ env.MMPROJ_FILE }}-v1
+
+      - name: Install Studio (--local, --no-torch)
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          bash install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Reset auth + boot Studio (API-only)
+        run: |
+          unsloth studio reset-password
+          mkdir -p logs
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" \
+            > logs/studio.log 2>&1 &
+
+      - name: Wait for /api/health
+        run: |
+          for i in $(seq 1 180); do
+            if curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > /tmp/health.json; then
+              jq -e '.status == "healthy"' /tmp/health.json
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Studio did not become healthy in 180s"
+          tail -200 logs/studio.log
+          exit 1
+
+      - name: Login with bootstrap password
+        run: |
+          PW=$(cat ~/.unsloth/studio/auth/.bootstrap_password)
+          echo "::add-mask::$PW"
+          TOKEN=$(curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
+            -H 'content-type: application/json' \
+            -d "{\"username\":\"unsloth\",\"password\":\"$PW\"}" | jq -r .access_token)
+          [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "login failed"; exit 1; }
+          echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: Load the GGUF
+        run: |
+          curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/inference/load" \
+            -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+            --max-time 600 \
+            -d "{\"model_path\":\"$GGUF_REPO\",\"gguf_variant\":\"$GGUF_VARIANT\",\"is_lora\":false,\"max_seq_length\":2048}" \
+            | jq '{status, display_name, is_gguf}'
+
+      - name: Seed and temperature sweep
+        env:
+          BASE_URL: http://127.0.0.1:18890
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          BASE = os.environ["BASE_URL"]
+          KEY  = os.environ["TOKEN"]
+          VARIANT = os.environ["GGUF_VARIANT"]
+
+          def post(path, body, *, timeout = 600):
+              req = urllib.request.Request(
+                  f"{BASE}{path}",
+                  data    = json.dumps(body).encode(),
+                  method  = "POST",
+                  headers = {
+                      "Authorization": f"Bearer {KEY}",
+                      "Content-Type":  "application/json",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout = timeout) as resp:
+                  return resp.status, json.loads(resp.read().decode())
+
+          def ask(temperature, seed):
+              status, data = post("/v1/chat/completions", {
+                  "model":         "default",
+                  "messages":      [
+                      {"role": "system", "content": 'Reply with a single JSON object of the form {"city": "...", "country": "..."}. Output ONLY the JSON, nothing else.'},
+                      {"role": "user",   "content": "What is the capital of France?"},
+                  ],
+                  "temperature":     temperature,
+                  "max_tokens":      200,
+                  "seed":            seed,
+                  "stream":          False,
+                  "enable_thinking": False,
+                  "response_format": {"type": "json_object"},
+              })
+              assert status == 200, f"status {status}: {data}"
+              content = (data["choices"][0]["message"].get("content") or "").strip()
+              if content.startswith("```"):
+                  content = content.split("```", 2)[1]
+                  if content.startswith("json"):
+                      content = content[4:]
+                  content = content.strip("`\n ")
+              parsed = json.loads(content)
+              assert isinstance(parsed, dict), f"non-object: {parsed!r}"
+              return parsed
+
+          CONFIGS = [
+              ("temp0.0 x3 (CI baseline, greedy)", 0.0, [3407, 3407, 3407]),
+              ("temp0.7 5 seeds",                  0.7, [3407, 1, 2, 42, 123]),
+              ("temp1.0 5 seeds",                  1.0, [3407, 1, 2, 42, 123]),
+          ]
+          print(f"=== {VARIANT} ===")
+          summary = []
+          for label, temp, seeds in CONFIGS:
+              hits = 0
+              for seed in seeds:
+                  parsed = ask(temp, seed)
+                  city = str(parsed.get("city", ""))
+                  ok = "paris" in city.lower()
+                  hits += ok
+                  print(f"[{VARIANT}] {label} seed={seed}: city={city!r} country={parsed.get('country')!r} paris={ok}")
+              summary.append((label, hits, len(seeds)))
+          print(f"--- summary {VARIANT} ---")
+          for label, hits, n in summary:
+              print(f"::notice::{VARIANT} | {label}: {hits}/{n} Paris")
+          PY
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "sweep-log-${{ matrix.variant }}"
+          path: |
+            logs/studio.log
+            logs/install.log
+          retention-days: 3
