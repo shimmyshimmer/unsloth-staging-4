@@ -111,13 +111,23 @@ jobs:
           tail -200 logs/studio.log
           exit 1
 
-      - name: Login with bootstrap password
+      # Rotate the bootstrap password first: tokens minted while a password
+      # change is still pending are rejected on /v1/* (403).
+      - name: Rotate password and login
         run: |
-          PW=$(cat ~/.unsloth/studio/auth/.bootstrap_password)
-          echo "::add-mask::$PW"
+          OLD=$(cat ~/.unsloth/studio/auth/.bootstrap_password)
+          NEW="CISweep-$(python -c 'import secrets; print(secrets.token_urlsafe(12))')"
+          echo "::add-mask::$OLD"
+          echo "::add-mask::$NEW"
+          OLD_TOKEN=$(curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
+            -H 'content-type: application/json' \
+            -d "{\"username\":\"unsloth\",\"password\":\"$OLD\"}" | jq -r .access_token)
+          curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/change-password" \
+            -H "Authorization: Bearer $OLD_TOKEN" -H 'content-type: application/json' \
+            -d "{\"current_password\":\"$OLD\",\"new_password\":\"$NEW\"}" > /dev/null
           TOKEN=$(curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
             -H 'content-type: application/json' \
-            -d "{\"username\":\"unsloth\",\"password\":\"$PW\"}" | jq -r .access_token)
+            -d "{\"username\":\"unsloth\",\"password\":\"$NEW\"}" | jq -r .access_token)
           [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "login failed"; exit 1; }
           echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
