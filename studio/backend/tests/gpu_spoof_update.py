@@ -58,6 +58,17 @@ ilp.detect_torch_cuda_runtime_preference = lambda host: ilp.CudaRuntimePreferenc
     runtime_line=None, selection_log=[]
 )
 
+# Linux CUDA selection (linux_cuda_choice_from_release) probes the CUDA runtime
+# libraries physically present on the machine and only offers a cuda line the
+# host can actually run. A GPU-less CI runner has none, so it returns None. We
+# are spoofing an NVIDIA host, which by definition has the CUDA runtime, so spoof
+# the probe to expose both lines; driver + SM bounds then decide cuda13 vs cuda12.
+# (Windows selection keys off the driver version only, so it needs no spoof.)
+ilp.detected_linux_runtime_lines = lambda: (
+    ["cuda13", "cuda12"],
+    {"cuda13": ["<spoofed-runtime>"], "cuda12": ["<spoofed-runtime>"]},
+)
+
 
 def host(**kw):
     base = dict(
@@ -85,33 +96,6 @@ def select(h, repo):
         )
     return attempts[0].name if attempts else None
 
-
-# ---- one-shot diagnostic: what does the fetched bundle actually contain? ----
-def _diag():
-    h = host(system="Linux", machine="x86_64", is_linux=True, is_x86_64=True,
-             nvidia_smi="x", driver_cuda_version=(13, 1), compute_caps=["10.0"],
-             has_physical_nvidia=True, has_usable_nvidia=True)
-    res = next(iter(ilp.iter_resolved_published_releases(TAG, U, TAG)))
-    b = res.bundle
-    assets = getattr(b, "assets", {})
-    cuda = sorted(n for n in assets if "cuda" in n.lower())
-    print(f"   bundle.upstream_tag={getattr(b,'upstream_tag',None)} n_assets={len(assets)}", flush=True)
-    print(f"   cuda assets in bundle: {cuda}", flush=True)
-    tp = ilp.detect_torch_cuda_runtime_preference(h)
-    print(f"   torch_preference.runtime_line={tp.runtime_line}", flush=True)
-    try:
-        sel = ilp.linux_cuda_choice_from_release(
-            h, b, preferred_runtime_line=tp.runtime_line, selection_preamble=tp.selection_log)
-        print(f"   linux_cuda_choice_from_release -> {None if sel is None else [a.name for a in sel.attempts]}", flush=True)
-    except Exception as exc:  # noqa: BLE001
-        print(f"   linux_cuda_choice_from_release RAISED: {type(exc).__name__}: {exc}", flush=True)
-
-print("=== DIAG: fetched bundle contents (Linux NVIDIA host) ===", flush=True)
-try:
-    _diag()
-except Exception as exc:  # noqa: BLE001
-    print(f"   DIAG error: {type(exc).__name__}: {exc}", flush=True)
-print(flush=True)
 
 # ============ A. spoofed-host asset selection (real manifest) ============
 print(f"=== A. spoofed NVIDIA/AMD host -> real {TAG} asset selection ===", flush=True)
