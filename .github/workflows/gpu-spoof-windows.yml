@@ -1,0 +1,35 @@
+name: gpu-spoof windows-latest
+on:
+  push:
+    branches: [llama-update-win-gpu]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/gpu-spoof-windows.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/gpu-spoof-windows.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  gpu-spoof:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install backend freshness dep
+        run: python -m pip install "structlog>=24.1.0"
+      - name: Spoofed NVIDIA/AMD update path
+        run: python studio/backend/tests/gpu_spoof_update.py
