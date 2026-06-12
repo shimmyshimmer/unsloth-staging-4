@@ -1,0 +1,33 @@
+name: "PR-6218 ubuntu-latest"
+on:
+  push:
+    branches: [pr6218-cross-os]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Environment
+        run: |
+          python -c "import sys, locale, platform; print(platform.platform()); print('preferred =', locale.getpreferredencoding(False)); print('stdout    =', sys.stdout.encoding); print('utf8_mode =', sys.flags.utf8_mode)"
+      - name: Install pytest
+        run: python -m pip install -U pytest
+      - name: PR #6218 regression test (AST drift + behavioural)
+        run: python -m pytest tests/saving/test_save_subprocess_utf8_encoding.py -v
+      - name: Native bug/fix reproduction (OS-default decoding)
+        run: python tests/cross_os/cross_os_native.py
