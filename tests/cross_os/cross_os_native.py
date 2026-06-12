@@ -72,11 +72,20 @@ def main():
     fails = []
     for sname, fn in SHAPES.items():
         # BEFORE = pre-PR behaviour: text mode, no encoding -> OS locale default, strict.
+        # On a non-UTF-8 host this breaks in one of two ways:
+        #   * hard crash: UnicodeDecodeError raised in the caller (streaming/Popen path)
+        #   * silent loss/corruption: on Windows, subprocess.run reads via a reader
+        #     THREAD; a decode error there is printed but not raised, so run() returns
+        #     with the output lost/garbled (the "silently corrupts" failure mode).
         try:
             before = fn(None, None)
-            bstate, bdetail = "clean", ""
+            if before == EXPECTED:
+                bstate, bdetail = "clean", ""
+            else:
+                bstate = "BROKEN_silent_corruption_or_loss"
+                bdetail = f"captured len={len(before) if before is not None else None}, expected {len(EXPECTED)}"
         except UnicodeDecodeError as e:
-            bstate, bdetail = "CRASH_UnicodeDecodeError", str(e).splitlines()[0]
+            bstate, bdetail = "BROKEN_UnicodeDecodeError_raised", str(e).splitlines()[0]
 
         # AFTER = the PR fix.
         try:
@@ -86,7 +95,7 @@ def main():
             after, acrash = None, f"{type(e).__name__}: {e}"
         acorrect = after == EXPECTED
 
-        print(f"[{sname:12s}] BEFORE (OS default decode): {bstate}" + (f"  ({bdetail[:48]})" if bstate != "clean" else ""))
+        print(f"[{sname:12s}] BEFORE (OS default decode): {bstate}" + (f"  ({bdetail[:60]})" if bstate != "clean" else ""))
         print(f"[{sname:12s}] AFTER  (utf-8 + replace)  : {'clean, decoded correctly' if (acrash is None and acorrect) else ('CRASH ' + str(acrash)) if acrash else 'clean but WRONG decode'}")
 
         if acrash is not None:
@@ -98,8 +107,8 @@ def main():
             if bstate != "clean":
                 fails.append(f"{sname}: expected BEFORE clean on UTF-8 host, got {bstate}")
         else:
-            if not bstate.startswith("CRASH"):
-                fails.append(f"{sname}: expected BEFORE to crash on non-UTF-8 host (bug not reproduced!), got {bstate}")
+            if bstate == "clean":
+                fails.append(f"{sname}: expected BEFORE to be broken on non-UTF-8 host (bug not reproduced!), got clean")
 
     print("-" * 74)
     if is_utf8:
