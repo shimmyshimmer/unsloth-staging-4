@@ -1,0 +1,157 @@
+# Staging-only validation for PR #6326 (remove the Windows VBS launcher).
+# Runs the PR's actual install.ps1 on a real windows-latest runner, then
+# launches BOTH the Desktop and the Start Menu "Unsloth Studio.lnk"
+# independently and asserts each one brings the backend up at /api/health.
+# Proves the shortcuts still function after the VBS -> hidden-PowerShell change.
+# Throwaway workflow on a staging fork; never ported upstream as-is.
+
+# Literal hyphen in the name (not "PR #6326 ...") so YAML does not treat the
+# "#6326 ..." tail as a comment and collapse every run to the same name.
+name: PR-6326 windows shortcuts
+
+on:
+  push:
+    branches: [pr6326-windows-shortcuts]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  shortcuts:
+    name: Desktop + Start Menu shortcuts
+    runs-on: windows-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Pre-install Windows tweaks (npm 11 + Defender exclusions)
+        shell: pwsh
+        # setup.ps1 needs npm >=11 to skip a ~35s winget Node reinstall, and
+        # Defender's real-time scan otherwise dominates the frontend / uv steps.
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          npm install -g 'npm@^11' 2>&1 | Out-Host
+          Write-Host "npm version: $(npm -v)"
+          foreach ($p in @(
+            "$env:USERPROFILE\.unsloth",
+            "$env:USERPROFILE\AppData\Local\uv",
+            "$env:GITHUB_WORKSPACE\studio\frontend\node_modules",
+            "$env:GITHUB_WORKSPACE\studio\frontend\dist"
+          )) {
+            try { Add-MpPreference -ExclusionPath $p -ErrorAction Stop; Write-Host "Defender exclusion: $p" }
+            catch { Write-Host "Defender exclusion skipped: $p" }
+          }
+
+      - name: Seed a legacy launch-studio.vbs (upgrade-cleanup check)
+        # Simulate a pre-hardening install so we can prove install.ps1 DELETES
+        # the exact Kaspersky-flagged file, not merely stops generating it.
+        shell: pwsh
+        run: |
+          $appDir = Join-Path $env:LOCALAPPDATA 'Unsloth Studio'
+          New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+          Set-Content -LiteralPath (Join-Path $appDir 'launch-studio.vbs') -Value 'WScript.Echo "legacy"' -Encoding Unicode
+          Write-Host "seeded legacy launch-studio.vbs at $appDir"
+
+      - name: Install Studio via install.ps1 (--local --no-torch)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          $ProgressPreference = 'SilentlyContinue'
+          & ./install.ps1 --local --no-torch *>&1 | Tee-Object -FilePath logs/install.log
+
+      - name: Assert no VBS and both shortcuts target hidden PowerShell
+        shell: pwsh
+        run: |
+          $appDir = Join-Path $env:LOCALAPPDATA 'Unsloth Studio'
+          if (Test-Path -LiteralPath (Join-Path $appDir 'launch-studio.vbs')) {
+            throw "regression: launch-studio.vbs still exists (the Kaspersky VBS-FP shape)"
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $appDir 'launch-studio.ps1'))) {
+            throw "missing launch-studio.ps1 in $appDir"
+          }
+          $desktop   = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Unsloth Studio.lnk'
+          $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Unsloth Studio.lnk'
+          $wsh = New-Object -ComObject WScript.Shell
+          foreach ($entry in @(@{ Path = $desktop; Label = 'Desktop' }, @{ Path = $startMenu; Label = 'Start Menu' })) {
+            $p = $entry.Path; $label = $entry.Label
+            if (-not (Test-Path -LiteralPath $p)) { throw "[$label] shortcut missing at $p" }
+            $sc = $wsh.CreateShortcut($p)
+            Write-Host "[$label] target: $($sc.TargetPath)"
+            Write-Host "[$label] args:   $($sc.Arguments)"
+            if ($sc.TargetPath -match 'wscript\.exe$') { throw "[$label] still targets wscript.exe (VBS host)" }
+            if ($sc.TargetPath -notmatch 'powershell\.exe$') { throw "[$label] unexpected target: $($sc.TargetPath)" }
+            if ($sc.Arguments -notmatch '-WindowStyle Hidden') { throw "[$label] not windowless (-WindowStyle Hidden)" }
+            if ($sc.Arguments -notmatch 'launch-studio\.ps1') { throw "[$label] does not run launch-studio.ps1" }
+            Write-Host "[$label] OK: hidden powershell over launch-studio.ps1, no VBS"
+          }
+
+      - name: Launch BOTH shortcuts and assert each reaches /api/health
+        shell: pwsh
+        # Run the exact command each .lnk stores, one at a time, and confirm each
+        # independently brings the Studio backend up. Tear the server down between
+        # the two launches so the second is a clean cold start, not an attach.
+        run: |
+          function Invoke-Shortcut([string]$lnkPath, [string]$label) {
+            $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnkPath)
+            Write-Host "[$label] launching: $($sc.TargetPath) $($sc.Arguments)"
+            Start-Process -FilePath $sc.TargetPath -ArgumentList $sc.Arguments -WorkingDirectory $sc.WorkingDirectory
+            $foundPort = 0
+            foreach ($i in 1..180) {
+              foreach ($port in 8888..8908) {
+                try {
+                  $r = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/health" -TimeoutSec 1
+                  if ($r.status -eq 'healthy' -and $r.service -eq 'Unsloth UI Backend') { $foundPort = $port; break }
+                } catch {}
+              }
+              if ($foundPort) { break }
+              Start-Sleep -Seconds 1
+            }
+            if ($foundPort) {
+              try {
+                $owner = (Get-NetTCPConnection -LocalPort $foundPort -State Listen -ErrorAction Stop | Select-Object -First 1).OwningProcess
+                if ($owner) { taskkill /PID $owner /T /F | Out-Null }
+              } catch {}
+            }
+            if (-not $foundPort) { throw "[$label] Studio did not become healthy when launched via the shortcut" }
+            Write-Host "[$label] Studio healthy on port $foundPort (launched via the shortcut)"
+            Start-Sleep -Seconds 5
+          }
+
+          $desktop   = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Unsloth Studio.lnk'
+          $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Unsloth Studio.lnk'
+          Invoke-Shortcut $desktop   'Desktop'
+          Invoke-Shortcut $startMenu 'Start Menu'
+          Write-Host "BOTH shortcuts launched Studio to healthy."
+
+      - name: Upload install log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr6326-windows-shortcuts-logs
+          path: logs/install.log
+          retention-days: 7
