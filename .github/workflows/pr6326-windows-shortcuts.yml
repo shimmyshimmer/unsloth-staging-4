@@ -27,7 +27,7 @@ jobs:
   shortcuts:
     name: Desktop + Start Menu shortcuts
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 55
     defaults:
       run:
         shell: bash
@@ -63,6 +63,36 @@ jobs:
           )) {
             try { Add-MpPreference -ExclusionPath $p -ErrorAction Stop; Write-Host "Defender exclusion: $p" }
             catch { Write-Host "Defender exclusion skipped: $p" }
+          }
+
+      - name: Ensure VS C++ Build Tools (winget-independent)
+        shell: pwsh
+        # setup.ps1 unconditionally requires a C++ toolchain (cl.exe) and, when
+        # absent, installs it via `winget install ...BuildTools`. This runner's
+        # winget source is broken (0x8a15000f: "Data required by the source is
+        # missing"), which kills that path. Pre-install the VCTools workload via
+        # Chocolatey (always present on GitHub Windows runners, no winget) so
+        # setup.ps1's Find-VsBuildTools resolves cl.exe immediately and never
+        # touches winget. This is a runner-environment fix, not a change to the
+        # installer under test.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Skip if a C++ compiler is already present (some images ship it).
+          $existing = Get-ChildItem -Path @(
+            "$env:ProgramFiles\Microsoft Visual Studio\2022",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022"
+          ) -Filter cl.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($existing) {
+            Write-Host "cl.exe already present: $($existing.FullName) -- skipping install"
+          } else {
+            Write-Host "Installing VS 2022 VCTools workload via Chocolatey..."
+            choco install visualstudio2022-workload-vctools -y --no-progress --execution-timeout=2700 2>&1 | Out-Host
+            $cl = Get-ChildItem -Path @(
+              "$env:ProgramFiles\Microsoft Visual Studio\2022",
+              "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022"
+            ) -Filter cl.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $cl) { throw "VCTools install did not produce cl.exe" }
+            Write-Host "cl.exe installed: $($cl.FullName)"
           }
 
       - name: Seed a legacy launch-studio.vbs (upgrade-cleanup check)
