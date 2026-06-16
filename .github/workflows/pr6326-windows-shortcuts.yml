@@ -1,0 +1,263 @@
+# Staging-only validation for PR #6326 (remove the Windows VBS launcher).
+# Runs the PR's actual install.ps1 on a real windows-latest runner, then proves
+# end to end:
+#   A. Both the Desktop and Start Menu "Unsloth Studio.lnk" launch Studio when
+#      the .lnk is resolved by the Windows shell itself (Start-Process <lnk>) --
+#      the strongest automated proxy for a double-click.
+#   B. `unsloth studio` works from a FRESH terminal (PATH read from the registry,
+#      exactly as a newly opened cmd/powershell sees it after install).
+#   C. Studio actually runs and is reachable + usable in a real browser
+#      (Chromium navigates, completes account setup, the app shell renders).
+# Throwaway workflow on a staging fork; never ported upstream as-is.
+
+# Literal hyphen in the name (not "PR #6326 ...") so YAML does not treat the
+# "#6326 ..." tail as a comment and collapse every run to the same name.
+name: PR-6326 windows shortcuts
+
+on:
+  push:
+    branches: [pr6326-windows-shortcuts]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  shortcuts:
+    name: Desktop + Start Menu shortcuts
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Pre-install Windows tweaks (npm 11 + Defender exclusions)
+        shell: pwsh
+        # setup.ps1 needs npm >=11 to skip a ~35s winget Node reinstall, and
+        # Defender's real-time scan otherwise dominates the frontend / uv steps.
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          npm install -g 'npm@^11' 2>&1 | Out-Host
+          Write-Host "npm version: $(npm -v)"
+          foreach ($p in @(
+            "$env:USERPROFILE\.unsloth",
+            "$env:USERPROFILE\AppData\Local\uv",
+            "$env:GITHUB_WORKSPACE\studio\frontend\node_modules",
+            "$env:GITHUB_WORKSPACE\studio\frontend\dist"
+          )) {
+            try { Add-MpPreference -ExclusionPath $p -ErrorAction Stop; Write-Host "Defender exclusion: $p" }
+            catch { Write-Host "Defender exclusion skipped: $p" }
+          }
+
+      - name: Ensure VS C++ Build Tools (winget-independent)
+        shell: pwsh
+        # setup.ps1 unconditionally requires a C++ toolchain (cl.exe) and, when
+        # absent, installs it via `winget install ...BuildTools`. This runner's
+        # winget source is broken (0x8a15000f: "Data required by the source is
+        # missing"), which kills that path. Pre-install the VCTools workload via
+        # Chocolatey (always present on GitHub Windows runners, no winget) so
+        # setup.ps1's Find-VsBuildTools resolves cl.exe immediately and never
+        # touches winget. Runner-environment fix, not a change to the installer.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $existing = Get-ChildItem -Path @(
+            "$env:ProgramFiles\Microsoft Visual Studio\2022",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022"
+          ) -Filter cl.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($existing) {
+            Write-Host "cl.exe already present: $($existing.FullName) -- skipping install"
+          } else {
+            Write-Host "Installing VS 2022 VCTools workload via Chocolatey..."
+            choco install visualstudio2022-workload-vctools -y --no-progress --execution-timeout=2700 2>&1 | Out-Host
+            $cl = Get-ChildItem -Path @(
+              "$env:ProgramFiles\Microsoft Visual Studio\2022",
+              "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022"
+            ) -Filter cl.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $cl) { throw "VCTools install did not produce cl.exe" }
+            Write-Host "cl.exe installed: $($cl.FullName)"
+          }
+
+      - name: Seed a legacy launch-studio.vbs (upgrade-cleanup check)
+        shell: pwsh
+        run: |
+          $appDir = Join-Path $env:LOCALAPPDATA 'Unsloth Studio'
+          New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+          Set-Content -LiteralPath (Join-Path $appDir 'launch-studio.vbs') -Value 'WScript.Echo "legacy"' -Encoding Unicode
+          Write-Host "seeded legacy launch-studio.vbs at $appDir"
+
+      - name: Install Studio via install.ps1 (--local --no-torch)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          $ProgressPreference = 'SilentlyContinue'
+          & ./install.ps1 --local --no-torch *>&1 | Tee-Object -FilePath logs/install.log
+
+      - name: Assert no VBS and both shortcuts target hidden PowerShell
+        shell: pwsh
+        run: |
+          $appDir = Join-Path $env:LOCALAPPDATA 'Unsloth Studio'
+          if (Test-Path -LiteralPath (Join-Path $appDir 'launch-studio.vbs')) {
+            throw "regression: launch-studio.vbs still exists (the Kaspersky VBS-FP shape)"
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $appDir 'launch-studio.ps1'))) {
+            throw "missing launch-studio.ps1 in $appDir"
+          }
+          $desktop   = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Unsloth Studio.lnk'
+          $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Unsloth Studio.lnk'
+          $wsh = New-Object -ComObject WScript.Shell
+          foreach ($entry in @(@{ Path = $desktop; Label = 'Desktop' }, @{ Path = $startMenu; Label = 'Start Menu' })) {
+            $p = $entry.Path; $label = $entry.Label
+            if (-not (Test-Path -LiteralPath $p)) { throw "[$label] shortcut missing at $p" }
+            $sc = $wsh.CreateShortcut($p)
+            Write-Host "[$label] target: $($sc.TargetPath)"
+            Write-Host "[$label] args:   $($sc.Arguments)"
+            if ($sc.TargetPath -match 'wscript\.exe$') { throw "[$label] still targets wscript.exe (VBS host)" }
+            if ($sc.TargetPath -notmatch 'powershell\.exe$') { throw "[$label] unexpected target: $($sc.TargetPath)" }
+            if ($sc.Arguments -notmatch '-WindowStyle Hidden') { throw "[$label] not windowless (-WindowStyle Hidden)" }
+            if ($sc.Arguments -notmatch 'launch-studio\.ps1') { throw "[$label] does not run launch-studio.ps1" }
+            Write-Host "[$label] OK: hidden powershell over launch-studio.ps1, no VBS"
+          }
+
+      - name: A. Double-click BOTH shortcuts (shell resolves the .lnk) -> health
+        shell: pwsh
+        # Hand the .lnk file itself to the Windows shell (Start-Process <lnk>),
+        # which resolves and launches it exactly as an Explorer double-click
+        # does -- honoring the stored target, args, working dir and WindowStyle.
+        # This is the strongest automated proxy for a real click. Run each
+        # shortcut on its own, tearing the backend down between so the second is
+        # a clean cold start.
+        run: |
+          function Invoke-Lnk([string]$lnkPath, [string]$label) {
+            if (-not (Test-Path -LiteralPath $lnkPath)) { throw "[$label] .lnk missing: $lnkPath" }
+            Write-Host "[$label] double-clicking (shell-resolving) $lnkPath"
+            Start-Process -FilePath $lnkPath
+            $foundPort = 0
+            foreach ($i in 1..180) {
+              foreach ($port in 8888..8908) {
+                try {
+                  $r = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/health" -TimeoutSec 1
+                  if ($r.status -eq 'healthy' -and $r.service -eq 'Unsloth UI Backend') { $foundPort = $port; break }
+                } catch {}
+              }
+              if ($foundPort) { break }
+              Start-Sleep -Seconds 1
+            }
+            if ($foundPort) {
+              try {
+                $owner = (Get-NetTCPConnection -LocalPort $foundPort -State Listen -ErrorAction Stop | Select-Object -First 1).OwningProcess
+                if ($owner) { taskkill /PID $owner /T /F | Out-Null }
+              } catch {}
+            }
+            Get-Process -Name unsloth -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            if (-not $foundPort) { throw "[$label] Studio did not become healthy after double-clicking the shortcut" }
+            Write-Host "[$label] Studio healthy on port $foundPort (via shell-resolved .lnk click)"
+            Start-Sleep -Seconds 6
+          }
+
+          $desktop   = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Unsloth Studio.lnk'
+          $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Unsloth Studio.lnk'
+          Invoke-Lnk $desktop   'Desktop'
+          Invoke-Lnk $startMenu 'Start Menu'
+          Write-Host "BOTH shortcuts launched Studio to healthy via a shell-resolved .lnk click."
+
+      - name: B. Run `unsloth studio` from a FRESH terminal (registry PATH)
+        shell: pwsh
+        # A newly opened terminal loads PATH from the registry (Machine + User),
+        # which is what install.ps1 updated. The running job's PATH does NOT see
+        # that update, so reconstruct it the way a fresh cmd/powershell would,
+        # then confirm the `unsloth` command resolves and boots Studio.
+        run: |
+          $machine = [Environment]::GetEnvironmentVariable('Path','Machine')
+          $user    = [Environment]::GetEnvironmentVariable('Path','User')
+          $env:Path = "$machine;$user"
+          $cmd = Get-Command unsloth -ErrorAction SilentlyContinue
+          if (-not $cmd) { throw "'unsloth' is not on PATH in a fresh terminal after install" }
+          Write-Host "fresh terminal resolves: $($cmd.Source)"
+          try { unsloth --help        2>&1 | Out-Host } catch { Write-Host "note: unsloth --help -> $_" }
+          try { unsloth studio --help 2>&1 | Out-Host } catch { Write-Host "note: unsloth studio --help -> $_" }
+          $port = 8891
+          $proc = Start-Process -FilePath 'unsloth' -ArgumentList @('studio','-H','127.0.0.1','-p',"$port") -PassThru -WindowStyle Hidden
+          $healthy = $false
+          foreach ($i in 1..180) {
+            try {
+              $r = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/health" -TimeoutSec 1
+              if ($r.status -eq 'healthy' -and $r.service -eq 'Unsloth UI Backend') { $healthy = $true; break }
+            } catch {}
+            Start-Sleep -Seconds 1
+          }
+          try { taskkill /PID $proc.Id /T /F | Out-Null } catch {}
+          Get-Process -Name unsloth -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          if (-not $healthy) { throw "'unsloth studio' (CLI) did not reach /api/health" }
+          Write-Host "CLI: 'unsloth studio' ran from a fresh terminal and served /api/health on port $port"
+
+      - name: Add Studio shim dir to PATH (for the browser boot below)
+        run: |
+          SHIM_DIR=~/.unsloth/studio/bin
+          if [ ! -f "$SHIM_DIR/unsloth.exe" ]; then
+            echo "::error::unsloth.exe shim not found at $SHIM_DIR"; ls -la ~/.unsloth/studio/ || true; exit 1
+          fi
+          cygpath -w "$SHIM_DIR" >> "$GITHUB_PATH"
+          echo "Added Studio shim dir to PATH: $(cygpath -w "$SHIM_DIR")"
+
+      - name: Install Playwright + Chromium
+        run: |
+          python -m pip install 'playwright>=1.45'
+          python -m playwright install chromium
+
+      - name: C. Boot Studio and access it in a real browser
+        env:
+          BASE_URL: http://127.0.0.1:18896
+          PW_ART_DIR: logs/playwright_browser
+          STUDIO_NEW_PW: BrowserCheck-Aa1!7Xy
+        run: |
+          mkdir -p logs logs/playwright_browser
+          unsloth studio -H 127.0.0.1 -p 18896 > logs/studio_browser.log 2>&1 &
+          echo "STUDIO_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 180); do
+            if curl -fs "http://127.0.0.1:18896/api/health" > /tmp/h.json; then
+              if grep -q '"healthy"' /tmp/h.json; then echo "backend healthy"; break; fi
+            fi
+            sleep 1
+          done
+          grep -q '"healthy"' /tmp/h.json || { echo "::error::backend never became healthy"; cat logs/studio_browser.log | tail -50; exit 1; }
+          python ci/staging_browser_access.py
+
+      - name: Stop Studio
+        if: always()
+        run: |
+          kill "${STUDIO_PID}" 2>/dev/null || true
+          sleep 2
+
+      - name: Upload logs + browser screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr6326-windows-shortcuts-evidence
+          path: |
+            logs/install.log
+            logs/studio_browser.log
+            logs/playwright_browser
+          retention-days: 7
