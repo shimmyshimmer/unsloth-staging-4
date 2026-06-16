@@ -52,9 +52,18 @@ def main():
         page.screenshot(path=str(ART / "10-landing.png"), full_page=True)
 
         # 2. First-run account setup, then wait for the app shell.
+        # The form is React-rendered after hydration, so WAIT for #new-password
+        # rather than checking count() immediately (which races the mount and
+        # returns 0 -- the bug in the first attempt).
         try:
             page.goto(f"{BASE}/change-password", wait_until="domcontentloaded", timeout=60_000)
-            if page.locator("#new-password").count() > 0:
+            has_form = False
+            try:
+                page.wait_for_selector("#new-password", state="visible", timeout=25_000)
+                has_form = True
+            except Exception:  # noqa: BLE001
+                log("no #new-password after waiting -- account may already be set up")
+            if has_form:
                 page.fill("#new-password", NEWPW, timeout=30_000)
                 page.fill("#confirm-password", NEWPW, timeout=30_000)
                 page.screenshot(path=str(ART / "11-setup-filled.png"), full_page=True)
@@ -63,8 +72,6 @@ def main():
                 ):
                     page.locator('button[type="submit"]').click()
                 log("submitted first-run account setup")
-            else:
-                log("no #new-password field (already set up?) -- continuing to app shell")
         except Exception as e:  # noqa: BLE001
             log(f"setup step note: {e}")
 
