@@ -168,7 +168,7 @@ jobs:
             if ($foundPort) {
               try {
                 $owner = (Get-NetTCPConnection -LocalPort $foundPort -State Listen -ErrorAction Stop | Select-Object -First 1).OwningProcess
-                if ($owner) { taskkill /PID $owner /T /F | Out-Null }
+                if ($owner) { Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue }
               } catch {}
             }
             Get-Process -Name unsloth -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -182,6 +182,9 @@ jobs:
           Invoke-Lnk $desktop   'Desktop'
           Invoke-Lnk $startMenu 'Start Menu'
           Write-Host "BOTH shortcuts launched Studio to healthy via a shell-resolved .lnk click."
+          # Only reached on success (failures throw above). Guard against a
+          # trailing non-zero $LASTEXITCODE from any native call leaking out.
+          exit 0
 
       - name: B. Run `unsloth studio` from a FRESH terminal (registry PATH)
         shell: pwsh
@@ -208,10 +211,18 @@ jobs:
             } catch {}
             Start-Sleep -Seconds 1
           }
-          try { taskkill /PID $proc.Id /T /F | Out-Null } catch {}
+          # Tear down by the port owner (the real server), not the launcher PID,
+          # which may already have exited. Use cmdlets only -- native taskkill on
+          # a dead PID returns exit 1 and leaks into the step's exit code.
+          try {
+            $owner = (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Stop | Select-Object -First 1).OwningProcess
+            if ($owner) { Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue }
+          } catch {}
+          if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
           Get-Process -Name unsloth -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           if (-not $healthy) { throw "'unsloth studio' (CLI) did not reach /api/health" }
           Write-Host "CLI: 'unsloth studio' ran from a fresh terminal and served /api/health on port $port"
+          exit 0
 
       - name: Add Studio shim dir to PATH (for the browser boot below)
         run: |
