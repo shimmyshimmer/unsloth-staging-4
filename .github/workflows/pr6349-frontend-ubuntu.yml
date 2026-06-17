@@ -1,0 +1,28 @@
+name: PR6349-frontend ubuntu-latest
+on:
+  push:
+    branches: [pr6349-frontend-xos]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install, typecheck, build
+        shell: bash
+        working-directory: studio/frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm run build
