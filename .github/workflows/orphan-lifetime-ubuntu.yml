@@ -1,0 +1,35 @@
+# Staging-only CI: sanity-run the process-lifetime tests on Linux (real
+# PR_SET_PDEATHSIG path). Throwaway; not for upstream. Needs only pytest.
+name: "orphan-lifetime ubuntu-latest"
+on:
+  push:
+    branches: [orphan-windows-ci]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/orphan-lifetime-ubuntu.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/orphan-lifetime-ubuntu.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip pytest
+      - name: Process-lifetime tests (incl. real PR_SET_PDEATHSIG)
+        working-directory: studio/backend
+        run: python -m pytest tests/test_process_lifetime.py -q -v
