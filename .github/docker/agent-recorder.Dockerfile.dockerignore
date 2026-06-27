@@ -1,0 +1,25 @@
+# BuildKit reads this sibling file for the agent-recorder image. Trim the 1.1G
+# repo to the ~140M the no-torch CLI actually needs: drop the 927M Tauri frontend,
+# git history, and assorted build/output artifacts.
+.git
+# Bind-mounted at run time, so keep it out of the image context -- editing it must
+# not bust the install.sh layer.
+.github/scripts/record-interactive.sh
+studio/frontend
+studio/src-tauri
+images
+recordings-assets
+recordings-assets-interactive
+unsloth_compiled_cache
+async_task_outputs
+outputs
+logs
+temp
+plans
+tests
+**/__pycache__
+**/*.pyc
+**/node_modules
+**/*.gguf
+**/*.safetensors
+**/*.bin

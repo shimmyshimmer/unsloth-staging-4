@@ -1,0 +1,167 @@
+# Records the INTERACTIVE TUI (not the -p/exec/run one-shot path) of every
+# coding-agent harness driving `unsloth start <agent>` through the "create
+# hello.py, then run it" flow against a real `unsloth run --disable-tools` server
+# loaded with unsloth/gemma-4-E4B-it-GGUF (UD-Q4_K_XL). Each agent's terminal
+# session is driven via tmux + asciinema, rendered to a GIF, and screenshotted.
+# Throwaway staging branch (PR 6613 validation) -- never merged. The GPU-less
+# runner cannot finish the heavy agents in the budget, so the authoritative
+# all-six success run is the local GPU run; this job is for reproducibility.
+name: PR-6613 interactive recordings (gemma-4-E4B)
+on:
+  push:
+    branches: [pr6613-interactive-recordings]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+env:
+  UNSLOTH_SEED: '3407'
+  # A 4B model on a GPU-less runner is slow; give each interactive turn room.
+  AGENT_INVOKE_TIMEOUT: '420'
+  START_TIMEOUT: '240'
+jobs:
+  interactive:
+    name: interactive (${{ matrix.agent }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    continue-on-error: ${{ matrix.best_effort || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: [claude, codex, hermes, openclaw, opencode, pi]
+        include:
+          - agent: openclaw
+            node: '24'
+            best_effort: true
+          - agent: hermes
+            best_effort: true
+    env:
+      GGUF_REPO: unsloth/gemma-4-E4B-it-GGUF
+      GGUF_FILE: gemma-4-E4B-it-UD-Q4_K_XL.gguf
+      STUDIO_PORT: '18902'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Linux deps (recording + pty tools)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev libssl-dev jq imagemagick tmux
+          python3 -m pip install --user asciinema pillow
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "$HOME/.local/bin/agg" \
+            https://github.com/asciinema/agg/releases/latest/download/agg-x86_64-unknown-linux-gnu
+          chmod +x "$HOME/.local/bin/agg"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ matrix.node || '22' }}
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Restore GGUF model file
+        id: cache-gguf
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        continue-on-error: true
+        with:
+          path: gguf-cache
+          key: ${{ runner.os }}-gguf-${{ env.GGUF_REPO }}-${{ env.GGUF_FILE }}-v1
+
+      - name: Download GGUF if cache miss
+        id: download-gguf
+        if: steps.cache-gguf.outputs.cache-hit != 'true' || steps.cache-gguf.outcome != 'success'
+        run: |
+          python -m pip install --upgrade huggingface_hub
+          mkdir -p gguf-cache
+          bash .github/scripts/hf-download-with-retry.sh "$GGUF_REPO" "$GGUF_FILE" gguf-cache
+
+      - name: Save GGUF model file
+        if: always() && steps.download-gguf.outcome == 'success'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: gguf-cache
+          key: ${{ runner.os }}-gguf-${{ env.GGUF_REPO }}-${{ env.GGUF_FILE }}-v1
+
+      - name: Install Studio (--local, --no-torch)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          bash install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Serve unsloth run --disable-tools (gemma-4-E4B)
+        run: |
+          unsloth studio reset-password
+          bash .github/scripts/serve-unsloth-run.sh \
+            --gguf-file "$GITHUB_WORKSPACE/gguf-cache/${GGUF_FILE}" \
+            --port "$STUDIO_PORT" --log-dir logs \
+            --extra "--seed $UNSLOTH_SEED --temp 0" \
+            --health-timeout 900
+
+      - name: Preflight the agent's API dialect
+        env:
+          AGENT: ${{ matrix.agent }}
+        run: |
+          set -uo pipefail
+          B="$UNSLOTH_BASE_URL"; K="$UNSLOTH_API_KEY"
+          code=$(curl -s -o /tmp/pf.json -w '%{http_code}' "$B/v1/models" \
+            -H "Authorization: Bearer $K") || true
+          [ "$code" = "200" ] || { echo "::error::/v1/models HTTP $code"; exit 1; }
+          echo "preflight OK for $AGENT"
+
+      - name: Install agent CLI
+        env:
+          AGENT: ${{ matrix.agent }}
+        run: bash .github/scripts/agent-guides-install.sh "$AGENT"
+
+      - name: Record interactive session (create hello.py, then run it)
+        continue-on-error: ${{ matrix.best_effort || false }}
+        env:
+          AGENT: ${{ matrix.agent }}
+        run: |
+          set -uo pipefail
+          mkdir -p recordings
+          # record-interactive.sh discovers the host server via UNSLOTH_STUDIO_URL,
+          # drives the real TUI via tmux + asciinema, and renders the GIF + PNGs
+          # (with the API key redacted) into OUT_DIR.
+          export UNSLOTH_STUDIO_URL="$UNSLOTH_BASE_URL"
+          export OUT_DIR="$GITHUB_WORKSPACE/recordings"
+          bash .github/scripts/record-interactive.sh "$AGENT"
+
+      - name: Collect + redact server logs
+        if: always()
+        run: |
+          mkdir -p logs/studio-logs
+          cp -r "$HOME/.unsloth/studio/logs/." logs/studio-logs/ 2>/dev/null || true
+          if [ -n "${UNSLOTH_API_KEY:-}" ]; then
+            grep -rlF "$UNSLOTH_API_KEY" logs recordings 2>/dev/null | while IFS= read -r f; do
+              sed -i "s#${UNSLOTH_API_KEY}#<REDACTED>#g" "$f" 2>/dev/null || true
+            done
+          fi
+
+      - name: Stop Studio
+        if: always()
+        run: |
+          if [ -n "${UNSLOTH_SERVER_PID:-}" ] && [ "${UNSLOTH_SERVER_PID}" != "0" ]; then
+            kill "${UNSLOTH_SERVER_PID}" 2>/dev/null || true
+          fi
+
+      - name: Upload recordings + logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: interactive-${{ matrix.agent }}
+          path: |
+            recordings/
+            logs/
+          retention-days: 7
