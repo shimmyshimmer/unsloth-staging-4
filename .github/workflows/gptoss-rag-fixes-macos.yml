@@ -1,0 +1,49 @@
+name: "gptoss-rag-fixes-cross-os macos-14"
+on:
+  push:
+    branches: [gptoss-rag-fixes-cross-os]
+    paths:
+      - 'unsloth/models/vision.py'
+      - 'tests/test_generate_kwarg_gate.py'
+      - 'tests/test_offload_embedding_hooks.py'
+      - 'studio/backend/core/rag/**'
+      - 'studio/backend/tests/test_rag_loopback_trust_env.py'
+      - '.github/workflows/gptoss-rag-fixes-macos.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  tests:
+    name: gptoss-rag-fixes macos-14
+    runs-on: macos-14
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: gate test (stdlib only)
+        run: |
+          set -euo pipefail
+          python tests/test_generate_kwarg_gate.py
+      - name: RAG loopback trust_env test (stdlib only)
+        run: |
+          set -euo pipefail
+          python studio/backend/tests/test_rag_loopback_trust_env.py
+      - name: install CPU torch (arm64 PyPI)
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install torch
+      - name: offload embedding hooks test
+        run: |
+          set -euo pipefail
+          python tests/test_offload_embedding_hooks.py
