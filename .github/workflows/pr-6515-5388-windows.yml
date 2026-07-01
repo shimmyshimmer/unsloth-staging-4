@@ -1,0 +1,64 @@
+name: "PR-6515-5388 studio cross-os windows-latest"
+on:
+  push:
+    branches: [pr6515-5388-cross-os]
+    paths:
+      - 'studio/backend/**'
+      - 'unsloth_cli/**'
+      - 'tests/studio/**'
+      - '.github/workflows/pr-6515-5388-windows.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/**'
+      - 'unsloth_cli/**'
+      - 'tests/studio/**'
+      - '.github/workflows/pr-6515-5388-windows.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  studio-tests:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install studio backend deps
+        run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - name: Run touched tests (one process each)
+        run: |
+          set -u
+          TARGETS=(
+            "studio/backend|tests/test_cloudflare_tunnel.py"
+            "studio/backend|tests/test_secure_tunnel_gate.py"
+            "studio/backend|tests/test_model_update_robustness.py"
+            "studio/backend|tests/test_cached_gguf_routes.py"
+            "studio/backend|tests/test_hf_xet_fallback.py"
+            "studio/backend|hub/tests/test_model_services.py"
+            "unsloth_cli|tests/test_studio_cloudflare_flag.py"
+            ".|tests/studio/install/test_selection_logic.py"
+          )
+          fail=0
+          for t in "${TARGETS[@]}"; do
+            dir="${t%%|*}"; file="${t##*|}"
+            echo "::group::${dir} :: ${file}"
+            ( cd "$dir" && python -m pytest -p no:cacheprovider -q "$file" ) || { echo "FAILED_TARGET ${dir}/${file}"; fail=1; }
+            echo "::endgroup::"
+          done
+          if [ "$fail" -ne 0 ]; then echo "One or more test targets failed"; exit 1; fi
+          echo "All test targets passed"
