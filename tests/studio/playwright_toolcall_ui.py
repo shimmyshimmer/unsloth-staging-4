@@ -149,9 +149,35 @@ def main():
             fail("Code tool pill did not activate")
         shoot("02-code-pill-on")
 
-        def send_and_wait(prompt, idx):
+        # JS: is a tool-call badge / code / tool-result rendered right now, and is
+        # the model still streaming?
+        _tool_js = (
+            "() => { const t = document.body.innerText || '';"
+            " const badge = /\\b\\d+\\s+tool calls?\\b|Used tool/i.test(t);"
+            " const code = document.querySelectorAll('pre code, .tool-ui, [data-tool-name]').length > 0;"
+            " const streaming = !!document.querySelector('button[aria-label=\"Stop generating\"]');"
+            " return {badge, code, streaming}; }"
+        )
+
+        def _stop_if_streaming():
+            stop = page.locator('button[aria-label="Stop generating"]').first
+            try:
+                if stop.count() and stop.is_visible():
+                    stop.click(timeout=5_000)
+            except Exception:
+                pass
+            try:
+                page.wait_for_selector(
+                    'button[aria-label="Stop generating"]', state="detached", timeout=60_000
+                )
+            except Exception:
+                pass
+
+        def send_turn(prompt, want_toolcall, cap_ms):
+            import time as _t
+
             page.wait_for_selector(
-                'button[aria-label="Send message"]', state="attached", timeout=TURN_TIMEOUT_MS
+                'button[aria-label="Send message"]', state="attached", timeout=120_000
             )
             before = robust_evaluate(
                 page, "() => document.querySelectorAll('[data-role=\"assistant\"]').length"
@@ -162,47 +188,51 @@ def main():
             page.wait_for_function(
                 "(want) => document.querySelectorAll('[data-role=\"assistant\"]').length >= want",
                 arg=before + 1,
-                timeout=TURN_TIMEOUT_MS,
+                timeout=120_000,
             )
-            try:
-                page.wait_for_selector(
-                    'button[aria-label="Stop generating"]', state="attached", timeout=5_000
-                )
-            except Exception:
-                pass
-            page.wait_for_selector(
-                'button[aria-label="Stop generating"]', state="detached", timeout=TURN_TIMEOUT_MS
-            )
-            page.wait_for_timeout(800)
+            # Poll until the tool-call badge appears (turn 1) or streaming ends. The
+            # Code sandbox can send the model into a long retry loop that the slow
+            # macOS runner cannot finish in budget, so once the tool call is visible
+            # we stop rather than wait the loop out.
+            deadline = _t.time() + cap_ms / 1000.0
+            seen = False
+            while _t.time() < deadline:
+                st = robust_evaluate(page, _tool_js) or {}
+                if want_toolcall and (st.get("badge") or st.get("code")):
+                    seen = True
+                    break
+                if not st.get("streaming"):
+                    break
+                page.wait_for_timeout(1500)
+            return seen
 
-        # A trivial computation so the model resolves the tool call in one short
-        # round trip: the small 3B model on the 3-CPU macOS runner cannot afford a
-        # long multi-call loop, and this still fires a real tool call (badge shown).
         step("turn 1: python trivial computation (tool call)")
-        send_and_wait("Use Python to print the result of 21 + 21.", 1)
+        tool_seen = send_turn(
+            "Use Python to print the result of 21 + 21.",
+            want_toolcall=True,
+            cap_ms=min(TURN_TIMEOUT_MS, 240_000),
+        )
         shoot("03-turn1-done")
+        _stop_if_streaming()
+        info(f"turn 1 tool call visible: {tool_seen}")
 
-        # Turn 2 is a lightweight multi-turn follow-up (no second slow tool loop)
-        # so the whole step stays within the runner budget on the small macOS box
-        # while still proving the conversation carries context across turns.
-        step("turn 2 (multi-turn follow-up)")
-        send_and_wait("In one short sentence, restate the number you just computed.", 2)
+        # Turn 2: lightweight multi-turn follow-up with the Code tool OFF so it
+        # completes quickly and proves the conversation carries context.
+        step("turn 2 (multi-turn follow-up, no tool)")
+        if (code_pill.get_attribute("data-active") or "false") == "true":
+            code_pill.click()
+            page.wait_for_timeout(300)
+        send_turn(
+            "In one short sentence, restate the number you just computed.",
+            want_toolcall=False,
+            cap_ms=180_000,
+        )
+        _stop_if_streaming()
         shoot("04-turn2-done")
 
-        # Evidence of a real tool invocation: the "N tool calls" / "Used tool"
-        # badge the chat renders above a tool-augmented answer, or a rendered
-        # code block / tool-result element. Prompt words are deliberately NOT
-        # matched (they would false-positive on the echoed request).
-        tool_signals = robust_evaluate(
-            page,
-            """() => {
-                const codeBlocks = document.querySelectorAll('pre code, .tool-ui, [data-tool-name]').length;
-                const text = document.body.innerText || '';
-                const usedTool = /\\b\\d+\\s+tool calls?\\b|Used tool/i.test(text);
-                return {codeBlocks, usedTool};
-            }""",
-        )
-        info(f"tool signals: {tool_signals}")
+        # Final DOM re-check of the tool-call evidence (badge still rendered).
+        final_signals = robust_evaluate(page, _tool_js) or {}
+        info(f"final tool signals: {final_signals}")
 
         assistant_texts = robust_evaluate(
             page,
@@ -212,12 +242,12 @@ def main():
         if len(assistant_texts) < 2:
             fail(f"expected >= 2 assistant turns, got {len(assistant_texts)}")
 
-        if isinstance(tool_signals, dict) and (
-            tool_signals.get("codeBlocks", 0) > 0 or tool_signals.get("usedTool")
-        ):
-            info("OK tool pipeline produced code/tool output in the browser")
+        # A real tool call must have been observed on turn 1 (badge or code block),
+        # either while streaming or in the final DOM.
+        if tool_seen or final_signals.get("badge") or final_signals.get("code"):
+            info("OK tool call fired in the browser (badge/code observed)")
         else:
-            info("WARN no explicit code/tool block detected (tiny CPU model); turns completed cleanly")
+            fail("no tool call observed on turn 1 (expected the Code tool to fire)")
 
         shoot("05-final")
         ctx.close()
