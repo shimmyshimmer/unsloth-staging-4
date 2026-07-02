@@ -26,7 +26,7 @@ jobs:
   ui-smoke:
     name: Chat UI Tests
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 58
     # Default every step's shell to Git Bash. windows-latest's default
     # shell is pwsh; without this each curl / heredoc / `kill $PID`
     # step would need its own `shell: bash`. Steps that genuinely
@@ -383,6 +383,50 @@ jobs:
           kill "${STUDIO_EXTRA_PID}" 2>/dev/null || true
           sleep 2
 
+      # -- Tool-calling + multi-turn browser smoke -----------------
+      # Fresh Studio on its own port; a small tool-capable GGUF is loaded via
+      # the API, then the Code (Python sandbox) pill is toggled and two
+      # dependent turns are sent through the real chat UI.
+      - name: Reset auth + boot Studio for tool-calling test (port 18898)
+        run: |
+          unsloth studio reset-password
+          mkdir -p logs
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p 18898 \
+            > logs/studio_toolcall.log 2>&1 &
+          echo "STUDIO_TC_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for /api/health on 18898
+        run: |
+          for i in $(seq 1 180); do
+            if curl -fs "http://127.0.0.1:18898/api/health" | jq -e '.status == "healthy"'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Studio 18898 did not become healthy"; exit 1
+
+      - name: Pass bootstrap pw for tool-calling test
+        run: |
+          OLD=$(cat ~/.unsloth/studio/auth/.bootstrap_password)
+          echo "::add-mask::$OLD"
+          echo "STUDIO_TC_OLD_PW=$OLD" >> "$GITHUB_ENV"
+
+      - name: Drive tool-calling + multi-turn chat with Playwright
+        env:
+          BASE_URL: http://127.0.0.1:18898
+          STUDIO_OLD_PW: ${{ env.STUDIO_TC_OLD_PW }}
+          PW_ART_DIR: logs/playwright_toolcall
+          STUDIO_UI_TURN_TIMEOUT_MS: '300000'
+        run: |
+          mkdir -p logs/playwright_toolcall
+          python tests/studio/playwright_toolcall_ui.py
+
+      - name: Stop tool-calling Studio
+        if: always()
+        run: |
+          kill "${STUDIO_TC_PID}" 2>/dev/null || true
+          sleep 2
+
       - name: Upload Playwright artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -392,6 +436,8 @@ jobs:
             logs/studio.log
             logs/studio_extra.log
             logs/install.log
+            logs/studio_toolcall.log
+            logs/playwright_toolcall
             logs/playwright
             logs/playwright_extra
           retention-days: 7
