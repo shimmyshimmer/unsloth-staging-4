@@ -317,6 +317,7 @@ jobs:
 
       - name: Stop tool-calling Studio
         if: always()
+        continue-on-error: true
         run: |
           kill "${STUDIO_TC_PID}" 2>/dev/null || true
           sleep 2
