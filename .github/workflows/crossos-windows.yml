@@ -1,0 +1,56 @@
+# Cross-OS validation of the Studio tool-calling fixes (PR 5620) on Windows.
+# Staging-only; the PR is throwaway and never merged.
+name: "crossos-5620 windows-latest"
+
+on:
+  push:
+    branches: [pr5620-6783-crossos]
+    paths:
+      - 'studio/backend/**'
+      - 'tests/staging/**'
+      - '.github/workflows/crossos-windows.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  parser:
+    name: tool-call parser tests (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install pytest (parser modules are pure stdlib)
+        run: python -m pip install --upgrade pip pytest
+      - name: Run tool-call parser suites
+        run: |
+          cd studio/backend
+          python -m pytest -q tests/test_gemma_tool_parse_edge_cases.py tests/test_tool_call_parser_strict.py tests/test_tool_xml_strip.py
+
+  cpu-safetensors:
+    name: small safetensors on CPU + tool-call parse (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      CUDA_VISIBLE_DEVICES: ''
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install torch (CPU) + transformers
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install transformers
+      - name: Generate a tool call on CPU and parse it
+        run: python tests/staging/cpu_safetensors_toolcall.py

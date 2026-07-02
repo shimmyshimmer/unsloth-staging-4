@@ -1,0 +1,78 @@
+# Cross-OS validation on macOS Apple Silicon (macos-14): the tool-calling parser
+# fixes (PR 5620), the MLX quant load+generate path that reproduced the tester's
+# qwen3_5 / gemma4 QK-norm failure (installing the shipped mlx-lm!=0.31.3
+# exclusion), and a small safetensors model on CPU. Staging-only; never merged.
+name: "crossos-5620 macos-14"
+
+on:
+  push:
+    branches: [pr5620-6783-crossos]
+    paths:
+      - 'studio/backend/**'
+      - 'tests/staging/**'
+      - '.github/workflows/crossos-macos.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  parser:
+    name: tool-call parser tests (macOS)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install pytest (parser modules are pure stdlib)
+        run: python -m pip install --upgrade pip pytest
+      - name: Run tool-call parser suites
+        run: |
+          cd studio/backend
+          python -m pytest -q \
+            tests/test_gemma_tool_parse_edge_cases.py \
+            tests/test_tool_call_parser_strict.py \
+            tests/test_tool_xml_strip.py
+
+  mlx-quant:
+    name: MLX quant load + generate (shipped mlx-lm!=0.31.3)
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      HF_HUB_DISABLE_TELEMETRY: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install MLX stack with the shipped exclusion
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade mlx mlx-metal "mlx-lm!=0.31.3" mlx-vlm
+          python -c "import importlib.metadata as m; print('resolved mlx-lm', m.version('mlx-lm'))"
+      - name: Probe load + generate (qwen3_5 / gemma4 / llama control)
+        run: python tests/staging/mlx_load_probe.py
+
+  cpu-safetensors:
+    name: small safetensors on CPU + tool-call parse (macOS)
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      HF_HUB_DISABLE_TELEMETRY: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install torch (CPU) + transformers
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch transformers
+      - name: Generate a tool call on CPU and parse it
+        run: python tests/staging/cpu_safetensors_toolcall.py
