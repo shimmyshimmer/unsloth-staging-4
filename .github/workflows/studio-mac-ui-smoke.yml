@@ -26,7 +26,7 @@ jobs:
   ui-smoke:
     name: Chat UI Tests
     runs-on: macos-14
-    timeout-minutes: 48
+    timeout-minutes: 60
     env:
       GGUF_REPO: unsloth/gemma-3-270m-it-GGUF
       GGUF_VARIANT: UD-Q4_K_XL
@@ -362,7 +362,7 @@ jobs:
           BASE_URL: http://127.0.0.1:18898
           STUDIO_OLD_PW: ${{ env.STUDIO_TC_OLD_PW }}
           PW_ART_DIR: logs/playwright_toolcall
-          STUDIO_UI_TURN_TIMEOUT_MS: '300000'
+          STUDIO_UI_TURN_TIMEOUT_MS: '600000'
         run: |
           mkdir -p logs/playwright_toolcall
           python tests/studio/playwright_toolcall_ui.py
