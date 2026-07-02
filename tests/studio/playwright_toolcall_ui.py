@@ -175,8 +175,11 @@ def main():
             )
             page.wait_for_timeout(800)
 
-        step("turn 1: python sum of first 20 primes (tool call)")
-        send_and_wait("Use Python to compute the sum of the first 20 prime numbers. Show the number.", 1)
+        # A trivial computation so the model resolves the tool call in one short
+        # round trip: the small 3B model on the 3-CPU macOS runner cannot afford a
+        # long multi-call loop, and this still fires a real tool call (badge shown).
+        step("turn 1: python trivial computation (tool call)")
+        send_and_wait("Use Python to print the result of 21 + 21.", 1)
         shoot("03-turn1-done")
 
         # Turn 2 is a lightweight multi-turn follow-up (no second slow tool loop)
