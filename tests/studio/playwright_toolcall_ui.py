@@ -206,9 +206,13 @@ def main():
                 page.wait_for_timeout(1500)
             return seen
 
-        step("turn 1: python trivial computation (tool call)")
+        # A computation the model cannot shortcut from memory, so it must call the
+        # Python tool (a trivial sum is answered directly, skipping the tool). The
+        # badge renders as soon as the first call fires; the early-stop below bounds
+        # the runtime so the slow macOS runner never has to finish the retry loop.
+        step("turn 1: python sum of first 20 primes (tool call)")
         tool_seen = send_turn(
-            "Use Python to print the result of 21 + 21.",
+            "Use the Python tool to compute the sum of the first 20 prime numbers, then tell me the number.",
             want_toolcall=True,
             cap_ms=min(TURN_TIMEOUT_MS, 240_000),
         )
