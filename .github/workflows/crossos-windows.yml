@@ -28,8 +28,10 @@ jobs:
         with: { persist-credentials: false }
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
-      - name: Install pytest (parser modules are pure stdlib)
-        run: python -m pip install --upgrade pip pytest
+      - name: Install studio backend requirements + pytest
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
       - name: Run tool-call parser suites
         run: |
           cd studio/backend
@@ -47,9 +49,10 @@ jobs:
         with: { persist-credentials: false }
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
-      - name: Install torch (CPU) + transformers
+      - name: Install backend requirements + torch (CPU) + transformers
         run: |
           python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
           pip install --index-url https://download.pytorch.org/whl/cpu torch
           pip install transformers
       - name: Generate a tool call on CPU and parse it
