@@ -35,7 +35,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 BASE = os.environ["BASE_URL"]
 OLD = os.environ["STUDIO_OLD_PW"]
 NEW = os.environ.get("STUDIO_NEW_PW", "ToolCallCI-Xy9!")
-GGUF_REPO = os.environ.get("TOOLCALL_GGUF_REPO", "unsloth/Qwen2.5-Coder-1.5B-Instruct-GGUF")
+GGUF_REPO = os.environ.get("TOOLCALL_GGUF_REPO", "unsloth/Llama-3.2-3B-Instruct-GGUF")
 GGUF_VARIANT = os.environ.get("TOOLCALL_GGUF_VARIANT", "Q4_K_M")
 ART = Path(os.environ.get("PW_ART_DIR", "logs/playwright"))
 ART.mkdir(parents=True, exist_ok=True)
