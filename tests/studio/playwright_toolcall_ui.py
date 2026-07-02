@@ -36,7 +36,7 @@ BASE = os.environ["BASE_URL"]
 OLD = os.environ["STUDIO_OLD_PW"]
 NEW = os.environ.get("STUDIO_NEW_PW", "ToolCallCI-Xy9!")
 GGUF_REPO = os.environ.get("TOOLCALL_GGUF_REPO", "unsloth/Llama-3.2-3B-Instruct-GGUF")
-GGUF_VARIANT = os.environ.get("TOOLCALL_GGUF_VARIANT", "Q4_K_M")
+GGUF_VARIANT = os.environ.get("TOOLCALL_GGUF_VARIANT", "Q5_K_M")
 ART = Path(os.environ.get("PW_ART_DIR", "logs/playwright"))
 ART.mkdir(parents=True, exist_ok=True)
 TURN_TIMEOUT_MS = int(os.environ.get("STUDIO_UI_TURN_TIMEOUT_MS", "300000"))
@@ -102,7 +102,7 @@ def main():
             "model_path": GGUF_REPO,
             "gguf_variant": GGUF_VARIANT,
             "is_lora": False,
-            "max_seq_length": 4096,
+            "max_seq_length": 2048,
         },
         timeout=LOAD_TIMEOUT_S,
     )
