@@ -276,6 +276,11 @@ jobs:
       # Fresh Studio on its own port; a small tool-capable GGUF is loaded via
       # the API, then the Code (Python sandbox) pill is toggled and two
       # dependent turns are sent through the real chat UI.
+      - name: Prime tool-calling GGUF (Llama-3.2-1B Q4_K_M)
+        run: |
+          python -m pip install --upgrade huggingface_hub || true
+          bash .github/scripts/hf-download-with-retry.sh "unsloth/Llama-3.2-1B-Instruct-GGUF" "Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+
       - name: Reset auth + boot Studio for tool-calling test (port 18898)
         run: |
           unsloth studio reset-password
