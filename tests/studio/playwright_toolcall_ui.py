@@ -4,7 +4,9 @@
 """Browser tool-calling + multi-turn smoke for Studio chat.
 
 Boots against a running Studio (BASE_URL), authenticates over the API
-(login -> change-password -> token), loads a small tool-capable GGUF, then
+(login -> change-password -> token), loads a small tool-capable model (a GGUF
+via llama.cpp, or -- when TOOLCALL_GGUF_VARIANT is blank -- an MLX / safetensors
+repo routed onto the native backend), then
 drives the real chat UI through headless Chromium: enable the Code (Python
 sandbox) tool pill, send a computation prompt (turn 1), then a follow-up that
 depends on turn 1 (turn 2, multi-turn). Screenshots each step into PW_ART_DIR.
@@ -35,8 +37,16 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 BASE = os.environ["BASE_URL"]
 OLD = os.environ["STUDIO_OLD_PW"]
 NEW = os.environ.get("STUDIO_NEW_PW", "ToolCallCI-Xy9!")
-GGUF_REPO = os.environ.get("TOOLCALL_GGUF_REPO", "unsloth/Llama-3.2-3B-Instruct-GGUF")
-GGUF_VARIANT = os.environ.get("TOOLCALL_GGUF_VARIANT", "Q5_K_M")
+# Backend-agnostic model selection. TOOLCALL_MODEL_PATH takes precedence and works
+# for any backend; the legacy TOOLCALL_GGUF_REPO is the GGUF fallback. When
+# TOOLCALL_GGUF_VARIANT is left blank the load omits gguf_variant, which routes the
+# request off the llama.cpp path onto the MLX / safetensors backend (used on macOS,
+# where the native Metal MLX path generates coherent text the CPU GGUF path does not).
+MODEL_PATH = os.environ.get("TOOLCALL_MODEL_PATH") or os.environ.get(
+    "TOOLCALL_GGUF_REPO", "unsloth/Llama-3.2-3B-Instruct-GGUF"
+)
+GGUF_VARIANT = os.environ.get("TOOLCALL_GGUF_VARIANT", "Q5_K_M").strip()
+MAX_SEQ_LEN = int(os.environ.get("TOOLCALL_MAX_SEQ_LEN", "2048"))
 ART = Path(os.environ.get("PW_ART_DIR", "logs/playwright"))
 ART.mkdir(parents=True, exist_ok=True)
 TURN_TIMEOUT_MS = int(os.environ.get("STUDIO_UI_TURN_TIMEOUT_MS", "300000"))
@@ -94,16 +104,19 @@ def main():
     wait_for_health(BASE, timeout=180, info=info)
     token = api_auth()
 
-    step(f"load tool-capable GGUF {GGUF_REPO} ({GGUF_VARIANT})")
+    backend = "GGUF" if GGUF_VARIANT else "MLX/safetensors"
+    step(f"load tool-capable model {MODEL_PATH} ({GGUF_VARIANT or backend})")
+    load_body = {
+        "model_path": MODEL_PATH,
+        "is_lora": False,
+        "max_seq_length": MAX_SEQ_LEN,
+    }
+    if GGUF_VARIANT:
+        load_body["gguf_variant"] = GGUF_VARIANT
     status, body = _api(
         "/api/inference/load",
         token=token,
-        body={
-            "model_path": GGUF_REPO,
-            "gguf_variant": GGUF_VARIANT,
-            "is_lora": False,
-            "max_seq_length": 2048,
-        },
+        body=load_body,
         timeout=LOAD_TIMEOUT_S,
     )
     if status != 200:
