@@ -3991,6 +3991,13 @@ class LlamaCppBackend:
         # refuses to load unless UNSLOTH_IS_PRESENT is set (normally by `import
         # unsloth`). The shim never imports unsloth, so set it here as unsloth does.
         env["UNSLOTH_IS_PRESENT"] = "1"
+        # On a GPU-less host the shim's `import unsloth_zoo` aborts in
+        # get_device_type() ("needs a GPU"), even though the shim only drives the
+        # CPU visual-server binary and does no torch GPU work. Allow the CPU device
+        # so the runner starts; the visual server still runs on the CPU llama.cpp build.
+        cpu_only = self._effective_gpu_count() == 0
+        if cpu_only:
+            env.setdefault("UNSLOTH_ALLOW_CPU", "1")
         env["DG_VISUAL_BIN"] = visual_bin
         env["DG_GPU"] = gpu
         # The file-override shim imports its sibling visual_engine; put its dir on PYTHONPATH.
@@ -4037,7 +4044,9 @@ class LlamaCppBackend:
         self._is_audio = False  # clear any prior TTS/audio model's routing flag
         self._model_identifier = model_identifier
         self._cache_type_kv = None
-        self._gpu_offload_active = True
+        # CPU-only diffusion holds no VRAM, so training_vram.py must not treat it
+        # as a GPU-resident model (matches the llama-server path's _classify_gpu_offload).
+        self._gpu_offload_active = not cpu_only
         if hf_variant:
             self._hf_variant = hf_variant
         elif gguf_path:
@@ -4055,7 +4064,7 @@ class LlamaCppBackend:
         healthy = self._wait_for_health(timeout = 600.0)
         if healthy:
             self._healthy = True
-            self._gpu_offload_active = True
+            self._gpu_offload_active = not cpu_only
             if extra_args is not None:
                 self._extra_args = list(extra_args)
                 self._extra_args_source = (model_identifier, hf_variant)
