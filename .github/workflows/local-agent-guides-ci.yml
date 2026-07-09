@@ -31,6 +31,10 @@
 name: Local Agent Guides CI
 
 on:
+  # staging: push-triggered on the experiment branch (the staging repo default
+  # branch does not carry this workflow, so dispatch/pull_request never register).
+  push:
+    branches: ["pr-7014-ci"]
   # Off-peak weekly, deliberately a NON-:00 minute to dodge the top-of-hour
   # GitHub-hosted-runner stampede.
   schedule:
@@ -484,7 +488,7 @@ jobs:
   # ═════════════════════════════════════════════════════════════════════
   resume:
     name: resume (${{ matrix.agent }})
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
