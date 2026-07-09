@@ -1479,6 +1479,9 @@ class UnslothTrainer:
 
         SNAC_MODEL_NAME = "hubertsiuzdak/snac_24khz"
         SNAC_SAMPLE_RATE = 24000
+
+        # SNAC codec unvalidated on Intel XPU; keep the pre-PR CPU
+        # fallback for non-CUDA hosts.
         device = "cuda" if torch.cuda.is_available() else "cpu"
         max_length = self.max_seq_length or 2048
         tokenizer = self.tokenizer
@@ -1640,7 +1643,8 @@ class UnslothTrainer:
         del snac_model
 
         gc.collect()
-        torch.cuda.empty_cache()
+
+        clear_gpu_cache()
         self._cuda_audio_used = True
 
         if not processed_examples:
@@ -1667,6 +1671,8 @@ class UnslothTrainer:
         import numpy as np
         import torchaudio.transforms as T
 
+        # Spark-TTS BiCodec unvalidated on Intel XPU; keep the pre-PR CPU
+        # fallback for non-CUDA hosts.
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # sparktts lives in the SparkAudio/Spark-TTS GitHub repo, not the HF model
@@ -1855,7 +1861,8 @@ class UnslothTrainer:
         del audio_tokenizer
 
         gc.collect()
-        torch.cuda.empty_cache()
+
+        clear_gpu_cache()
         self._cuda_audio_used = True
 
         if not processed_examples:
@@ -1892,6 +1899,8 @@ class UnslothTrainer:
         from datasets import Dataset as HFDataset
         from utils.paths import ensure_dir, tmp_root
 
+        # OuteTTS DAC/Whisper preprocess unvalidated on Intel XPU; keep the
+        # pre-PR CPU fallback for non-CUDA hosts.
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # Clone OuteTTS repo (same as audio_codecs._load_dac)
@@ -2063,7 +2072,8 @@ class UnslothTrainer:
         del prompt_processor
 
         gc.collect()
-        torch.cuda.empty_cache()
+
+        clear_gpu_cache()
         self._cuda_audio_used = True
 
         if not processed_examples:
