@@ -1,0 +1,57 @@
+# Disposable staging CI for unslothai/unsloth#7074 (Studio Voice settings tab).
+# Frontend gate replicated from studio-frontend-ci.yml: typecheck + i18n parity
+# + build, run cross-OS (ubuntu/macos/windows). Push-triggered so it runs on the
+# fork without a pull_request base workflow. Do not merge; branch is disposable.
+name: "staging-7074 frontend"
+on:
+  push:
+    branches: ["pr-7074-ci"]
+    paths:
+      - 'studio/frontend/**'
+      - '.github/workflows/staging-7074-frontend.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+    working-directory: studio/frontend
+jobs:
+  frontend:
+    name: frontend (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Upgrade npm to 11.x (allowScripts)
+        run: npm install -g npm@^11 --no-fund --no-audit
+      - name: Install deps (npm ci)
+        run: npm ci --no-fund --no-audit
+      - name: Typecheck (tsc -b)
+        run: npm run typecheck
+      - name: i18n parity check
+        run: npm run i18n:check
+      - name: Build (tsc -b && vite build)
+        run: npm run build
+      - name: Biome (non-blocking)
+        continue-on-error: true
+        run: npm run biome:check
+      - name: Upload built dist
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-7074-dist-${{ matrix.os }}
+          path: studio/frontend/dist
+          retention-days: 3
