@@ -1,0 +1,238 @@
+name: val6692-matrix
+
+# Validation matrix for the cuda-torch-index-override branch (PR 6692):
+# 1) companion (torchvision/torchaudio) constraints bounded to torch's window so
+#    no index leaf resolves a mismatched trio (cpu/mac previously got torch 2.10.0
+#    with torchaudio 2.11.0 after torchaudio 2.11 dropped its exact torch pin);
+# 2) the Strix-WSL reroute forwards UNSLOTH_TORCH_INDEX_URL / _FAMILY into the
+#    rerouted distro.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [pr-6692-ci]
+    paths: [".github/workflows/val6692-matrix.yml"]
+
+concurrency:
+  group: val6692-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install-trio:
+    # Real sandboxed install on every offered macOS label plus ubuntu-latest.
+    # ubuntu-latest also stands in for WSL: install.sh's index-selection logic
+    # takes the same Linux path on WSL (no /dev/dxg on the runner, so no
+    # Strix reroute), and the runner has no GPU, so the cpu leaf is exercised.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-26, macos-15-intel, macos-26-intel, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sandboxed real install
+        run: |
+          export UNSLOTH_STUDIO_HOME="$RUNNER_TEMP/studio"
+          export UNSLOTH_SKIP_AUTOSTART=1
+          mkdir -p "$UNSLOTH_STUDIO_HOME"
+          uname -m
+          sh ./install.sh
+      - name: Assert paired torch/torchaudio/torchvision trio
+        run: |
+          VENV_PY="$RUNNER_TEMP/studio/unsloth_studio/bin/python"
+          if [ ! -x "$VENV_PY" ]; then
+            if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "x86_64" ]; then
+              echo "NOTE: no venv python; Intel Mac x86_64 skip-torch path taken."
+              exit 0
+            fi
+            echo "FAIL: venv python missing at $VENV_PY"; exit 1
+          fi
+          "$VENV_PY" - <<'PY'
+          import platform, sys
+          import importlib.metadata as md
+          def ver(p):
+              try: return md.version(p)
+              except Exception: return None
+          t, ta, tv = ver("torch"), ver("torchaudio"), ver("torchvision")
+          print(f"TRIO torch={t} torchaudio={ta} torchvision={tv}")
+          if t is None:
+              if platform.system() == "Darwin" and platform.machine() == "x86_64":
+                  print("NOTE: torch not installed; Intel Mac skip-torch path taken.")
+                  sys.exit(0)
+              print("FAIL: torch not installed"); sys.exit(1)
+          def mm(v):
+              a, b = v.split("+")[0].split(".")[:2]
+              return int(a), int(b)
+          ok = True
+          if mm(t) >= (2, 11):
+              print("FAIL: torch outside the cpu/mac <2.11 window"); ok = False
+          if ta is None or mm(ta) != mm(t):
+              print("FAIL: torchaudio major.minor != torch major.minor"); ok = False
+          if tv is None or mm(tv) != (0, mm(t)[1] + 15):
+              print("FAIL: torchvision minor != torch minor + 15"); ok = False
+          print("PAIRED" if ok else "MISMATCH")
+          sys.exit(0 if ok else 1)
+          PY
+      - name: Mac intel compat mocks (fast)
+        if: startsWith(matrix.os, 'macos')
+        run: bash tests/sh/test_mac_intel_compat.sh
+
+  install-trio-override:
+    # Same paired-trio assertion with the index override pinned to the cpu leaf,
+    # confirming UNSLOTH_TORCH_INDEX_URL still yields a paired trio.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sandboxed install with UNSLOTH_TORCH_INDEX_URL=cpu
+        run: |
+          export UNSLOTH_STUDIO_HOME="$RUNNER_TEMP/studio"
+          export UNSLOTH_SKIP_AUTOSTART=1
+          export UNSLOTH_TORCH_INDEX_URL="https://download.pytorch.org/whl/cpu"
+          mkdir -p "$UNSLOTH_STUDIO_HOME"
+          sh ./install.sh
+      - name: Assert paired trio
+        run: |
+          VENV_PY="$RUNNER_TEMP/studio/unsloth_studio/bin/python"
+          [ -x "$VENV_PY" ] || { echo "FAIL: venv python missing"; exit 1; }
+          "$VENV_PY" - <<'PY'
+          import sys
+          import importlib.metadata as md
+          def ver(p):
+              try: return md.version(p)
+              except Exception: return None
+          t, ta, tv = ver("torch"), ver("torchaudio"), ver("torchvision")
+          print(f"TRIO torch={t} torchaudio={ta} torchvision={tv}")
+          if t is None:
+              print("FAIL: torch not installed"); sys.exit(1)
+          def mm(v):
+              a, b = v.split("+")[0].split(".")[:2]
+              return int(a), int(b)
+          ok = mm(t) < (2, 11) and ta and mm(ta) == mm(t) and tv and mm(tv) == (0, mm(t)[1] + 15)
+          print("PAIRED" if ok else "MISMATCH")
+          sys.exit(0 if ok else 1)
+          PY
+
+  windows-decision:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ps1 decision test suites
+        shell: pwsh
+        run: |
+          $fails = @()
+          Get-ChildItem tests/studio/*.ps1 | ForEach-Object {
+            Write-Host "=== $($_.Name) ==="
+            & pwsh -NoProfile -File $_.FullName
+            if ($LASTEXITCODE -ne 0) { $fails += $_.Name }
+          }
+          if ($fails.Count -gt 0) { Write-Host "FAILED: $($fails -join ', ')"; exit 1 }
+          Write-Host "All ps1 suites passed."
+      - name: Isolated Get-TorchIndexUrl probe (no GPU, expect cpu leaf)
+        shell: pwsh
+        run: |
+          $src = Get-Content install.ps1 -Raw
+          $i = $src.IndexOf('function Get-TorchIndexUrl')
+          if ($i -lt 0) { Write-Host 'NOTE: Get-TorchIndexUrl not found; probe skipped'; exit 0 }
+          $start = $src.IndexOf('{', $i)
+          $depth = 0; $end = -1
+          for ($j = $start; $j -lt $src.Length; $j++) {
+            if ($src[$j] -eq '{') { $depth++ }
+            elseif ($src[$j] -eq '}') { $depth--; if ($depth -eq 0) { $end = $j; break } }
+          }
+          if ($end -lt 0) { Write-Host 'NOTE: brace scan failed; probe skipped'; exit 0 }
+          $body = $src.Substring($i, $end - $i + 1)
+          try {
+            Invoke-Expression $body
+            $url = Get-TorchIndexUrl
+            Write-Host "Get-TorchIndexUrl -> $url"
+            if ($url -notmatch 'cpu') { Write-Host 'FAIL: expected the cpu leaf on a GPU-less runner'; exit 1 }
+          } catch {
+            Write-Host "NOTE: probe not runnable in isolation: $_"
+          }
+
+  rocm-simulation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hermetic sh suites (index selection, constraints, Strix reroute)
+        run: |
+          bash tests/sh/test_get_torch_index_url.sh
+          bash tests/sh/test_torch_constraint.sh
+          bash tests/sh/test_strixhalo_wsl_reroute.sh
+      - name: Simulated gfx1100 selects the rocm6.4 leaf
+        run: |
+          FUNC=$(mktemp)
+          {
+            sed -n '/^_run_bounded()/,/^}/p' install.sh
+            sed -n '/^_cvd_hides_nvidia()/,/^}/p' install.sh
+            sed -n '/^_has_amd_rocm_gpu()/,/^}/p' install.sh
+            sed -n '/^_has_usable_nvidia_gpu()/,/^}/p' install.sh
+            sed -n '/^_trim_index_path_slashes()/,/^}/p' install.sh
+            sed -n '/^get_torch_index_url()/,/^}/p' install.sh
+          } | sed "s|/usr/bin/nvidia-smi|/nonexistent/nvidia-smi|g" > "$FUNC"
+          MOCK=$(mktemp -d)
+          cat > "$MOCK/amd-smi" <<'MOCKEOF'
+          #!/bin/sh
+          case "$1" in
+              list) printf 'GPU: 0\n  BDF: 0000:03:00.0\n  NAME: gfx1100\n' ;;
+              *) echo 'AMDSMI Tool: 25.0.1+2b74356 | AMDSMI Library version: 25.0.1.0 | ROCm version: 6.4' ;;
+          esac
+          MOCKEOF
+          cat > "$MOCK/rocminfo" <<'MOCKEOF'
+          #!/bin/sh
+          echo '  Marketing Name:          Radeon RX 7900 XTX'
+          echo '  Name:                    gfx1100'
+          MOCKEOF
+          chmod +x "$MOCK/amd-smi" "$MOCK/rocminfo"
+          TOOLS=$(mktemp -d)
+          for c in uname grep sed head sh bash cat awk printf tr timeout; do
+            r=$(command -v "$c" 2>/dev/null || true); [ -n "$r" ] && ln -sf "$r" "$TOOLS/$c"
+          done
+          URL=$(env PATH="$TOOLS:$MOCK" sh -c ". '$FUNC'; get_torch_index_url")
+          echo "selected index: $URL"
+          [ "$URL" = "https://download.pytorch.org/whl/rocm6.4" ] || { echo "FAIL: expected rocm6.4 leaf"; exit 1; }
+      - name: rocm6.4 keeps the bounded default companion window
+        run: |
+          grep -q 'TORCHVISION_CONSTRAINT="torchvision>=0.19,<0.26.0"' install.sh
+          grep -q 'TORCHAUDIO_CONSTRAINT="torchaudio>=2.4,<2.11.0"' install.sh
+          # rocm6.4 must NOT be in the widened (<2.12/<0.27) family cases
+          if grep -E '^\s*(rocm7\.2|gfx|cu1)[^)]*\)' install.sh | grep -q 'rocm6\.4'; then
+            echo "FAIL: rocm6.4 unexpectedly widened"; exit 1
+          fi
+          echo "rocm6.4 uses the default <2.11 / <0.26 window as expected."
+      - name: Dry-run resolve of the trio against the rocm6.4 index
+        run: |
+          pipx install uv || pip install uv
+          uv venv "$RUNNER_TEMP/rocmenv" -p 3.12
+          uv pip install --python "$RUNNER_TEMP/rocmenv/bin/python" --dry-run \
+            --index-url https://download.pytorch.org/whl/rocm6.4 \
+            "torch>=2.4,<2.11.0" "torchvision>=0.19,<0.26.0" "torchaudio>=2.4,<2.11.0" \
+            2>&1 | tee "$RUNNER_TEMP/resolve.log"
+          python3 - "$RUNNER_TEMP/resolve.log" <<'PY'
+          import re, sys
+          text = open(sys.argv[1]).read()
+          def find(p):
+              m = re.search(rf"\b{p}==([0-9][^\s+]*)", text)
+              return m.group(1) if m else None
+          t, ta, tv = find("torch"), find("torchvision"), find("torchaudio")
+          print(f"resolved torch={t} torchvision={ta} torchaudio={tv}")
+          exp = {"torch": ("2.9.1", t), "torchaudio": ("2.9.1", tv), "torchvision": ("0.24.1", ta)}
+          ok = True
+          for name, (want, got) in exp.items():
+              if got != want:
+                  print(f"FAIL: {name} resolved {got}, expected {want}"); ok = False
+          sys.exit(0 if ok else 1)
+          PY
+      - name: Strix reroute forwards the index override env vars
+        run: |
+          grep -n '_rr_exports.*UNSLOTH_TORCH_INDEX_URL' install.sh
+          grep -n '_rr_exports.*UNSLOTH_TORCH_INDEX_FAMILY' install.sh
+          echo "Forwarding lines present in _maybe_reroute_strixhalo_to_2404."
