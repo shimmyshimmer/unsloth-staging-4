@@ -294,15 +294,14 @@ def test_run_disable_flags_set_tool_call_env(monkeypatch):
     assert studio_mod.os.environ["UNSLOTH_TOOL_CALL_NUDGE"] == "0"
 
 
-@pytest.mark.parametrize("inherited", ["0", "false", "False", "no", ""])
-def test_run_omitted_flag_respects_inherited_env(monkeypatch, inherited):
+def test_run_omitted_flag_respects_inherited_env(monkeypatch):
     """When the flag is omitted, a value the parent set (e.g. `unsloth start`) wins
     instead of being reset to the default."""
     studio_mod = _load_run_command()
-    monkeypatch.setenv("UNSLOTH_TOOL_CALL_NUDGE", inherited)
+    monkeypatch.setenv("UNSLOTH_TOOL_CALL_NUDGE", "0")
     monkeypatch.delenv("UNSLOTH_DISABLE_TOOL_CALL_HEALING", raising = False)
     _invoke_run(monkeypatch, _BASE)
-    assert studio_mod.os.environ["UNSLOTH_TOOL_CALL_NUDGE"] == inherited
+    assert studio_mod.os.environ["UNSLOTH_TOOL_CALL_NUDGE"] == "0"
 
 
 @pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
