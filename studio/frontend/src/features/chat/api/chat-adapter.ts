@@ -83,7 +83,9 @@ import {
 } from "../utils/last-local-model-load";
 import { getImageInputUnavailableReason } from "../utils/image-input-support";
 import {
+  drainThinkMarkupBuffer,
   hasClosedThinkTag,
+  neutralizeThinkMarkup,
   parseAssistantContent,
 } from "../utils/parse-assistant-content";
 import { resolveLoadMaxSeqLength } from "../presets/preset-policy";
@@ -659,7 +661,9 @@ function extractDeltaText(delta: unknown): string {
       else if (typeof obj.content === "string") out += obj.content;
     } else if (obj.type === "thinking" || obj.type === "reasoning") {
       const thinking = extractReasoningText(obj);
-      if (thinking) out += `<think>${thinking}</think>`;
+      // Neutralize literal </think> inside provider thinking parts so the
+      // synthetic wrapper cannot close early (#7066).
+      if (thinking) out += `<think>${neutralizeThinkMarkup(thinking)}</think>`;
     }
   }
   return out;
@@ -2594,6 +2598,13 @@ export function createOpenAIStreamAdapter(
       // <think>...</think> for parseAssistantContent. Lives outside the
       // SSE loop because the close tag fires when content arrives.
       let reasoningContentOpen = false;
+      let reasoningMarkupBuffer = "";
+      // Offsets in `cumulativeText` of the `</think>` we append ourselves when
+      // closing a synthetic reasoning_content wrapper. That boundary is known,
+      // not inferred, so the parser must not re-derive it with the raw-marker
+      // fence/quote heuristics -- reasoning ending in an unfinished ``` would
+      // otherwise keep every answer delta in the drawer until the end (#7334).
+      const syntheticCloses = new Set<number>();
       type ToolCallProvenance = {
         source?: string;
         healed?: boolean;
@@ -2657,7 +2668,13 @@ export function createOpenAIStreamAdapter(
         }
         return parts;
       };
-      const buildAssistantContent = (rawText: string) => {
+      // `streaming` marks a mid-stream build: an unclosed ``` fence in the
+      // reasoning may still close in a later delta, so its close tags stay
+      // deferred until the final build (#7334).
+      const buildAssistantContent = (
+        rawText: string,
+        options?: { streaming?: boolean },
+      ) => {
         const positionedTools = toolCallParts
           .map((part, index) => {
             const cursor = (part as PositionedToolCallPart).textCursor;
@@ -2680,8 +2697,12 @@ export function createOpenAIStreamAdapter(
 
         const appendTextThrough = (nextCursor: number) => {
           if (nextCursor <= textCursor) return;
+          const base = textCursor;
           assembled.push(
-            ...parseAssistantContent(rawText.slice(textCursor, nextCursor)),
+            ...parseAssistantContent(rawText.slice(base, nextCursor), {
+              ...options,
+              isKnownClose: (index) => syntheticCloses.has(index + base),
+            }),
           );
           textCursor = nextCursor;
         };
@@ -2729,7 +2750,22 @@ export function createOpenAIStreamAdapter(
         return merged;
       };
       const closeReasoningContent = () => {
+        if (reasoningMarkupBuffer) {
+          const { emit } = drainThinkMarkupBuffer(reasoningMarkupBuffer, {
+            finalize: true,
+          });
+          reasoningMarkupBuffer = "";
+          if (emit) {
+            if (!reasoningContentOpen) {
+              cumulativeText += `<think>${emit}`;
+              reasoningContentOpen = true;
+            } else {
+              cumulativeText += emit;
+            }
+          }
+        }
         if (!reasoningContentOpen) return;
+        syntheticCloses.add(cumulativeText.length);
         cumulativeText += "</think>";
         reasoningContentOpen = false;
       };
@@ -3419,7 +3455,9 @@ export function createOpenAIStreamAdapter(
                         argsText: partial.argsText,
                       };
                       yield {
-                        content: buildAssistantContent(cumulativeText),
+                        content: buildAssistantContent(cumulativeText, {
+                          streaming: true,
+                        }),
                         metadata: {
                           timing: buildTiming(
                             streamStartTime,
@@ -3706,7 +3744,9 @@ export function createOpenAIStreamAdapter(
                   }
                 }
                 yield {
-                  content: buildAssistantContent(cumulativeText),
+                  content: buildAssistantContent(cumulativeText, {
+                    streaming: true,
+                  }),
                   metadata: {
                     timing: buildTiming(
                       streamStartTime,
@@ -3899,7 +3939,9 @@ export function createOpenAIStreamAdapter(
                   }
                 }
                 yield {
-                  content: buildAssistantContent(cumulativeText),
+                  content: buildAssistantContent(cumulativeText, {
+                    streaming: true,
+                  }),
                   metadata: {
                     timing: buildTiming(
                       streamStartTime,
@@ -3922,11 +3964,20 @@ export function createOpenAIStreamAdapter(
               }
 
               if (reasoning) {
-                if (!reasoningContentOpen) {
-                  cumulativeText += `<think>${reasoning}`;
-                  reasoningContentOpen = true;
-                } else {
-                  cumulativeText += reasoning;
+                // Neutralize literal think markers inside reasoning_content so
+                // a mid-thought "</think>" (e.g. echoing the user) cannot close
+                // the synthetic <think> wrapper early (#7066).
+                reasoningMarkupBuffer += reasoning;
+                const drained = drainThinkMarkupBuffer(reasoningMarkupBuffer);
+                reasoningMarkupBuffer = drained.buffer;
+                const safeReasoning = drained.emit;
+                if (safeReasoning) {
+                  if (!reasoningContentOpen) {
+                    cumulativeText += `<think>${safeReasoning}`;
+                    reasoningContentOpen = true;
+                  } else {
+                    cumulativeText += safeReasoning;
+                  }
                 }
               }
               if (delta) {
@@ -3941,7 +3992,10 @@ export function createOpenAIStreamAdapter(
                   "",
                 );
               }
-              const textParts = parseAssistantContent(cumulativeText);
+              const textParts = parseAssistantContent(cumulativeText, {
+                streaming: true,
+                isKnownClose: (index) => syntheticCloses.has(index),
+              });
 
               // Fallback when no server-side reasoning_summary arrives.
               if (
@@ -3951,7 +4005,10 @@ export function createOpenAIStreamAdapter(
                 reasoningStartAt = Date.now();
               }
               if (
-                hasClosedThinkTag(cumulativeText) &&
+                hasClosedThinkTag(cumulativeText, {
+                  streaming: true,
+                  isKnownClose: (index) => syntheticCloses.has(index),
+                }) &&
                 reasoningStartAt &&
                 !reasoningDuration
               ) {
@@ -3962,7 +4019,9 @@ export function createOpenAIStreamAdapter(
 
               if (textParts.length > 0 || toolCallParts.length > 0) {
                 yield {
-                  content: buildAssistantContent(cumulativeText),
+                  content: buildAssistantContent(cumulativeText, {
+                    streaming: true,
+                  }),
                   metadata: {
                     timing: buildTiming(
                       streamStartTime,
