@@ -1,0 +1,228 @@
+name: "staging-7256 ubuntu-latest"
+on:
+  push:
+    branches: ["pr-7256-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Shell parse gate (install.sh / setup.sh / uninstall.sh / provision_llama_cuda.sh)
+        shell: bash
+        run: |
+          set -e
+          for f in install.sh studio/setup.sh scripts/uninstall.sh studio/scripts/provision_llama_cuda.sh; do
+            [ -f "$f" ] || { echo "skip $f (absent)"; continue; }
+            bash -n "$f" && echo "$f parsed with no errors"
+          done
+
+      - name: tests/sh installer suite (whole directory, no skips)
+        shell: bash
+        run: |
+          set +e
+          failed=""; found=0
+          for s in tests/sh/test_*.sh; do
+            found=$((found + 1))
+            echo "::group::$s"
+            bash "$s"; rc=$?
+            echo "::endgroup::"
+            if [ $rc -ne 0 ]; then echo "FAIL $s (exit $rc)"; failed="$failed $s"
+            else echo "PASS $s"; fi
+          done
+          echo "ran $found shell installer test files"
+          if [ -n "$failed" ]; then echo "=== failed:$failed ==="; exit 1; fi
+
+      - name: Installer pytest
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio
+          UNSLOTH_COMPILE_DISABLE: '1'
+        run: |
+          python -m pip install -q pytest pytest-timeout packaging
+          python -m pytest -q --tb=short tests/python/test_cross_platform_parity.py tests/python/test_tokenizers_and_torch_constraint.py tests/studio/install/test_rocm_support.py
+
+      # STAGING-ONLY, NOT part of upstream CI. All 17 upstream install.sh call sites
+      # pass --no-torch, which skips exactly the code this PR changes.
+      - name: "STAGING-ONLY: real torch install path (install.sh, NO --no-torch)"
+        shell: bash
+        run: |
+          set +e
+          export UNSLOTH_STUDIO_HOME="$RUNNER_TEMP/ustudio"
+          export UNSLOTH_SKIP_ROCM_WSL_SETUP=1
+          VENV="$UNSLOTH_STUDIO_HOME/unsloth_studio"
+          mkdir -p "$UNSLOTH_STUDIO_HOME"
+          python3 -m venv "$VENV"
+          "$VENV/bin/python" -m pip install -q --upgrade pip
+          "$VENV/bin/python" -m pip install -q "torch==2.10.0" --index-url https://download.pytorch.org/whl/cpu
+          seeded=$("$VENV/bin/python" -c "import importlib.metadata as m; print(m.version('torch'))" | tail -n1)
+          echo "seeded torch: $seeded"
+          touch "$VENV/.unsloth-studio-owned"
+          mkdir -p logs
+          # NO --no-torch. This is the entire point of this staging-only job.
+          timeout 1800 bash install.sh --local > logs/install_keep.log 2>&1
+          echo "installer exit: $? (124 = bounded timeout; the torch decision is printed well before the end)"
+          echo "::group::tail of installer log"; tail -n 60 logs/install_keep.log; echo "::endgroup::"
+          rc=0
+          if grep -q "existing install has torch $seeded -- keeping it" logs/install_keep.log; then
+            echo "PASS decision: preservation line printed for torch $seeded"
+          else
+            echo "FAIL decision: no preservation line for torch $seeded"; rc=1
+            grep -n "torch" logs/install_keep.log | head -40
+          fi
+          if grep -q "install PyTorch (kept release)" logs/install_keep.log; then
+            echo "PASS command: the kept-release uv install path was taken"
+          else
+            echo "FAIL command: kept-release uv install path not taken"; rc=1
+          fi
+          after=$("$VENV/bin/python" -c "import importlib.metadata as m; print(m.version('torch'))" 2>/dev/null | tail -n1)
+          echo "torch after install: '$after'"
+          if [ "${after%%+*}" = "$seeded" ]; then
+            echo "PASS end-to-end: venv still on $seeded after a real (no --no-torch) install"
+          else
+            echo "FAIL end-to-end: venv moved to '$after' (expected $seeded)"; rc=1
+          fi
+          exit $rc
+
+      - name: "STAGING-ONLY: UNSLOTH_TORCH_UPGRADE=1 opt-out control (NO --no-torch)"
+        shell: bash
+        run: |
+          set +e
+          export UNSLOTH_STUDIO_HOME="$RUNNER_TEMP/ustudio_neg"
+          export UNSLOTH_SKIP_ROCM_WSL_SETUP=1
+          VENV="$UNSLOTH_STUDIO_HOME/unsloth_studio"
+          mkdir -p "$UNSLOTH_STUDIO_HOME"
+          python3 -m venv "$VENV"
+          "$VENV/bin/python" -m pip install -q --upgrade pip
+          "$VENV/bin/python" -m pip install -q "torch==2.10.0" --index-url https://download.pytorch.org/whl/cpu
+          touch "$VENV/.unsloth-studio-owned"
+          mkdir -p logs
+          # Opt-out control on the same real path: UNSLOTH_TORCH_UPGRADE=1 must NOT preserve.
+          UNSLOTH_TORCH_UPGRADE=1 timeout 1500 bash install.sh --local > logs/install_upgrade.log 2>&1
+          echo "installer exit: $?"
+          if grep -q "keeping it" logs/install_upgrade.log; then
+            echo "FAIL: UNSLOTH_TORCH_UPGRADE=1 still preserved the old release"; exit 1
+          fi
+          echo "PASS: UNSLOTH_TORCH_UPGRADE=1 opt-out honoured on the real path"
+
+
+  baseline_main:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Shell parse gate (install.sh / setup.sh / uninstall.sh / provision_llama_cuda.sh)
+        shell: bash
+        run: |
+          set -e
+          for f in install.sh studio/setup.sh scripts/uninstall.sh studio/scripts/provision_llama_cuda.sh; do
+            [ -f "$f" ] || { echo "skip $f (absent)"; continue; }
+            bash -n "$f" && echo "$f parsed with no errors"
+          done
+
+      - name: tests/sh installer suite (whole directory, no skips)
+        shell: bash
+        run: |
+          set +e
+          failed=""; found=0
+          for s in tests/sh/test_*.sh; do
+            found=$((found + 1))
+            echo "::group::$s"
+            bash "$s"; rc=$?
+            echo "::endgroup::"
+            if [ $rc -ne 0 ]; then echo "FAIL $s (exit $rc)"; failed="$failed $s"
+            else echo "PASS $s"; fi
+          done
+          echo "ran $found shell installer test files"
+          if [ -n "$failed" ]; then echo "=== failed:$failed ==="; exit 1; fi
+
+      - name: Installer pytest
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio
+          UNSLOTH_COMPILE_DISABLE: '1'
+        run: |
+          python -m pip install -q pytest pytest-timeout packaging
+          python -m pytest -q --tb=short tests/python/test_cross_platform_parity.py tests/python/test_tokenizers_and_torch_constraint.py tests/studio/install/test_rocm_support.py
+
+      # STAGING-ONLY, NOT part of upstream CI. All 17 upstream install.sh call sites
+      # pass --no-torch, which skips exactly the code this PR changes.
+      - name: "STAGING-ONLY: real torch install path (install.sh, NO --no-torch)"
+        shell: bash
+        run: |
+          set +e
+          export UNSLOTH_STUDIO_HOME="$RUNNER_TEMP/ustudio"
+          export UNSLOTH_SKIP_ROCM_WSL_SETUP=1
+          VENV="$UNSLOTH_STUDIO_HOME/unsloth_studio"
+          mkdir -p "$UNSLOTH_STUDIO_HOME"
+          python3 -m venv "$VENV"
+          "$VENV/bin/python" -m pip install -q --upgrade pip
+          "$VENV/bin/python" -m pip install -q "torch==2.10.0" --index-url https://download.pytorch.org/whl/cpu
+          seeded=$("$VENV/bin/python" -c "import importlib.metadata as m; print(m.version('torch'))" | tail -n1)
+          echo "seeded torch: $seeded"
+          touch "$VENV/.unsloth-studio-owned"
+          mkdir -p logs
+          # NO --no-torch. This is the entire point of this staging-only job.
+          timeout 1800 bash install.sh --local > logs/install_keep.log 2>&1
+          echo "installer exit: $? (124 = bounded timeout; the torch decision is printed well before the end)"
+          echo "::group::tail of installer log"; tail -n 60 logs/install_keep.log; echo "::endgroup::"
+          rc=0
+          if grep -q "existing install has torch $seeded -- keeping it" logs/install_keep.log; then
+            echo "PASS decision: preservation line printed for torch $seeded"
+          else
+            echo "FAIL decision: no preservation line for torch $seeded"; rc=1
+            grep -n "torch" logs/install_keep.log | head -40
+          fi
+          if grep -q "install PyTorch (kept release)" logs/install_keep.log; then
+            echo "PASS command: the kept-release uv install path was taken"
+          else
+            echo "FAIL command: kept-release uv install path not taken"; rc=1
+          fi
+          after=$("$VENV/bin/python" -c "import importlib.metadata as m; print(m.version('torch'))" 2>/dev/null | tail -n1)
+          echo "torch after install: '$after'"
+          if [ "${after%%+*}" = "$seeded" ]; then
+            echo "PASS end-to-end: venv still on $seeded after a real (no --no-torch) install"
+          else
+            echo "FAIL end-to-end: venv moved to '$after' (expected $seeded)"; rc=1
+          fi
+          exit $rc
+
+      - name: "STAGING-ONLY: UNSLOTH_TORCH_UPGRADE=1 opt-out control (NO --no-torch)"
+        shell: bash
+        run: |
+          set +e
+          export UNSLOTH_STUDIO_HOME="$RUNNER_TEMP/ustudio_neg"
+          export UNSLOTH_SKIP_ROCM_WSL_SETUP=1
+          VENV="$UNSLOTH_STUDIO_HOME/unsloth_studio"
+          mkdir -p "$UNSLOTH_STUDIO_HOME"
+          python3 -m venv "$VENV"
+          "$VENV/bin/python" -m pip install -q --upgrade pip
+          "$VENV/bin/python" -m pip install -q "torch==2.10.0" --index-url https://download.pytorch.org/whl/cpu
+          touch "$VENV/.unsloth-studio-owned"
+          mkdir -p logs
+          # Opt-out control on the same real path: UNSLOTH_TORCH_UPGRADE=1 must NOT preserve.
+          UNSLOTH_TORCH_UPGRADE=1 timeout 1500 bash install.sh --local > logs/install_upgrade.log 2>&1
+          echo "installer exit: $?"
+          if grep -q "keeping it" logs/install_upgrade.log; then
+            echo "FAIL: UNSLOTH_TORCH_UPGRADE=1 still preserved the old release"; exit 1
+          fi
+          echo "PASS: UNSLOTH_TORCH_UPGRADE=1 opt-out honoured on the real path"
+
