@@ -1,0 +1,30 @@
+name: "baseline-main macos-14"
+on:
+  push:
+    branches: ["baseline-main-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: python -m pip install transformers
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_rocm_multi_gpu_vram_system_wide.py studio/backend/tests/test_text_io_encoding.py studio/backend/tests/test_training_worker_flash_attn.py -q --tb=short || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
