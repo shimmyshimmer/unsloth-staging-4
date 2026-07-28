@@ -59,9 +59,20 @@ for check in "$@"; do
         # UNSLOTH_ALLOW_TOOLS lets that leg allow-list it explicitly.
         allow="${UNSLOTH_ALLOW_TOOLS:-}"
         hits=""
-        while IFS=$'\t' read -r tool _rest; do
+        while IFS=$'\t' read -r tool rest; do
           [ -n "$tool" ] || continue
           case " $allow " in *" $tool "*) continue ;; esac
+          # `xcode-select -p` ASKS whether a toolchain is selected; it cannot build
+          # anything. The installer has to ask in order to tell the user whether a
+          # source build is available, and the whole point of the fix is that it then
+          # carries on without one. Treating the question as toolchain USE would fail
+          # the very leg that proves the toolchain was never used. `--install`, which
+          # pops the CLT installer, stays a hit.
+          if [ "$tool" = "xcode-select" ]; then
+            case "$rest" in
+              -p|--print-path|-v|--version|"") continue ;;
+            esac
+          fi
           hits="$hits $tool"
         done < "$TRACE"
         if [ -n "$hits" ]; then
@@ -74,15 +85,35 @@ for check in "$@"; do
       ;;
 
     nobuild)
+      # "Built an sdist" is NOT the same as "needed a compiler". Four packages on the
+      # macOS path are sdist-only PURE PYTHON projects that build fine with no
+      # toolchain (verified by resolving each against cp313/macos-arm64):
+      #   openai-whisper, argbind, randomname  -- no version ever ships a wheel
+      #   antlr4-python3-runtime==4.9.3        -- pinned below the 4.13.2 wheel
+      # Failing on those would be a false alarm, so the contract asserted here is
+      # "nothing that needs a COMPILER was built", with that allowlist subtracted.
+      # UNSLOTH_ALLOW_SDIST can extend it.
+      _allow="openai-whisper argbind randomname antlr4-python3-runtime ${UNSLOTH_ALLOW_SDIST:-}"
       if [ ! -f "$LOG" ]; then
         fail "nobuild requested but $LOG is missing"
       else
-        # uv/pip say "Building wheel for X" / "Running setup.py" only on an sdist.
-        if grep -qiE "building wheel for|running setup\.py|preparing metadata \(setup\.py\)|building editable for" "$LOG"; then
-          fail "install compiled from source (sdist fallback) -- wheels-only contract broken"
-          grep -iE "building wheel for|running setup\.py" "$LOG" | head -20
+        _built="$(grep -oiE "building wheel for [a-z0-9._-]+" "$LOG" 2>/dev/null \
+                  | sed -E 's/.* for //' | tr 'A-Z' 'a-z' | sort -u || true)"
+        _bad=""
+        for pkg in $_built; do
+          case " $_allow " in *" $pkg "*) continue ;; esac
+          _bad="$_bad $pkg"
+        done
+        if [ -n "$_bad" ]; then
+          fail "built from source:$_bad -- these must resolve to wheels on a clean machine"
         else
-          ok "no source build in $LOG"
+          [ -n "$_built" ] && say_built="$(echo "$_built" | tr '\n' ' ')" || say_built="none"
+          ok "no non-allowlisted source build (built: $say_built)"
+        fi
+        # Independent of package names: a compiler error means a toolchain was needed.
+        if grep -qiE "error: command '(cc|gcc|clang|cl)' failed|no such file or directory: 'cc'|clang: error|cargo: not found|error: linker \`cc\` not found" "$LOG"; then
+          fail "compiler invocation appears in the install log"
+          grep -iE "error: command '(cc|gcc|clang|cl)' failed|clang: error" "$LOG" | head -10
         fi
       fi
       ;;
