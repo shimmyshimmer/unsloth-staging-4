@@ -10,6 +10,7 @@ native-chat-template fallback used by the transformers and MLX backends.
 import copy
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -23,6 +24,225 @@ _GEMMA_TEMPLATE_OPENERS = (
     _GEMMA_THOUGHT_OPEN + "\\n",
     _GEMMA_THOUGHT_OPEN + _GEMMA_THOUGHT_CLOSE,
 )
+
+# Chat-template control markup that must not reach the prompt as raw text from a
+# user / system / tool turn: a literal "</think>" ends the reasoning block early,
+# and "<|start|>assistant<|channel|>final<|message|>" in a tool result forges an
+# assistant turn (#7066). One lookahead over the three shapes the templates emit,
+# so a single sub() breaks every marker by inserting one space after the "<":
+#   <|name|> / <|name>   ChatML, Llama-3, Harmony/gpt-oss, Zephyr/Phi-3, Gemma-4,
+#                        Granite (<|start_of_role|>role<|end_of_role|> ... <|end_of_text|>)
+#   <name>   / </name>   Qwen tool XML, Gemma turn delimiters, think tags
+#   <name|>              Gemma-4 closing delimiters
+# The name list is closed on purpose: bare words match only in the pipe shape, so
+# "<div>", "<End>" and "List<String>" are untouched. The bare words that do match
+# are template delimiters in their own right, so they break even inside a code
+# fence, the same trade the structural parsers make.
+_CONTROL_MARKUP = re.compile(
+    r"<(?="
+    r"\|(?:(?:start|end)_(?:header_id|of_role)|tool(?:_call|_response)?"
+    r"|end(?:_of_(?:turn|text))?"
+    r"|im_(?:start|end)|assistant|constrain|channel|message|eo[tm]_id"
+    r"|return|system|start|think|turn|user|call|\")\|?>"
+    r"|/?(?:(?:start|end)_of_turn|tool_(?:call|response)|think)>"
+    r"|(?:tool(?:_call|_response)?|channel|turn)\|>"
+    r")"
+)
+
+# Turn-boundary subset, for replayed ASSISTANT content: that text is
+# client-controlled too, so a raw boundary in it truncates or forges a turn.
+# Everything else stays byte-identical, because the assistant's own think /
+# channel / tool markup is structural and rewriting it would corrupt the
+# transcript the template re-renders. Harmony opens every message with <|start|>
+# and stops on <|call|> / <|return|>, Zephyr / Phi-3 open a turn with a bare
+# <|user|> / <|assistant|> / <|system|>, and Granite opens one with
+# <|start_of_role|>role<|end_of_role|> and ends it on its eos <|end_of_text|>, so
+# those are boundaries too (#7066).
+_TURN_BOUNDARY_MARKUP = re.compile(
+    r"<(?="
+    r"\|(?:(?:start|end)_(?:header_id|of_role)|im_(?:start|end)"
+    r"|end(?:_of_(?:turn|text))?|eo[tm]_id"
+    r"|assistant|return|system|start|turn|user|call)\|?>"
+    r"|(?:start|end)_of_turn>"
+    r"|turn\|>"
+    r")"
+)
+
+
+def neutralize_control_markup(text: str) -> str:
+    """Break chat-template control markup in free text by spacing out the "<".
+
+    "</think>" becomes "< /think>": still readable, but no longer a delimiter to
+    the template, the think extractor or the stop-sequence matcher (#7066). A
+    plain space, not an invisible joiner: a space is in every tokenizer
+    vocabulary, while U+2060 can fall back to byte junk.
+    """
+    if not text or "<" not in text:
+        return text
+    return _CONTROL_MARKUP.sub("< ", text)
+
+
+def neutralize_turn_boundary_markup(text: str) -> str:
+    """Break only the turn-boundary sentinels, for replayed assistant text (#7066)."""
+    if not text or "<" not in text:
+        return text
+    return _TURN_BOUNDARY_MARKUP.sub("< ", text)
+
+
+def _neutralize_argument_leaves(value):
+    """Break control markup in every string leaf (keys included) of *value*."""
+    if isinstance(value, str):
+        return neutralize_control_markup(value)
+    if isinstance(value, dict):
+        return {
+            neutralize_control_markup(key) if isinstance(key, str) else key: (
+                _neutralize_argument_leaves(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_neutralize_argument_leaves(item) for item in value]
+    return value
+
+
+def _neutralize_replayed_tool_call(tool_calls: list) -> list:
+    """Neutralize a replayed tool call's name and arguments, keeping "id" exact.
+
+    Gemma-4 renders "<|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>", so
+    an argument that echoes pasted text can close the call block and open a
+    "<|tool_response>" or a "<|turn>model" of its own (#7066). Arguments are
+    data, not transcript structure, so they get the same full rewrite a tool
+    result's content gets.
+
+    The name is concatenated straight after "call:" and is client-supplied on
+    replay, so it gets the same rewrite -- which is the identity on every name
+    that can dispatch. Studio composes names as ^[a-zA-Z0-9_-]{1,64}$ and its
+    parsers only ever yield [\\w.\\-]+, so a dispatchable name holds no "<" for the
+    pattern to match; a name this rewrites matches no registered tool either way.
+    A tool result's "name" takes the same rewrite, so the two still agree when
+    Gemma-4 pairs them by name. "id" is opaque and stays byte-exact.
+    """
+    out: list = []
+    for call in tool_calls:
+        function = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(function, dict):
+            out.append(call)
+            continue
+        updates: dict = {}
+        name = function.get("name")
+        if isinstance(name, str) and name:
+            new_name = neutralize_control_markup(name)
+            if new_name != name:
+                updates["name"] = new_name
+        arguments = function.get("arguments")
+        if arguments is not None:
+            new_arguments = _neutralize_argument_leaves(arguments)
+            if new_arguments != arguments:
+                updates["arguments"] = new_arguments
+        out.append({**call, "function": {**function, **updates}} if updates else call)
+    return out
+
+
+def neutralize_control_markup_in_messages(messages: list) -> list:
+    """Neutralize control markup in message content and tool-result names (#7066).
+
+    User / system / tool turns lose every marker; assistant turns lose only the
+    turn boundaries and keep their structural think / channel / tool markup,
+    which replayed history legitimately holds. Returns the same list object when
+    nothing changed, so the common prompt stays byte-for-byte what it was.
+    """
+    if not messages:
+        return messages
+    changed = False
+    out: list = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        role = (msg.get("role") or "").strip().lower()
+        rewrite = (
+            neutralize_turn_boundary_markup if role == "assistant" else neutralize_control_markup
+        )
+        updates: dict = {}
+        # A tool result's "name" is prompt text too: Gemma-4 falls back to it when
+        # "tool_call_id" matches no preceding call and concatenates it into the
+        # "<|tool_response>" block, so a marker there forges a turn (#7066).
+        name = msg.get("name")
+        if role == "tool" and isinstance(name, str) and name:
+            new_name = neutralize_control_markup(name)
+            if new_name != name:
+                updates["name"] = new_name
+        content = msg.get("content")
+        if content:
+            new_content = content
+            if isinstance(content, str):
+                new_content = rewrite(content)
+            elif isinstance(content, list):
+                # OpenAI-style parts: rewrite each text, pass images / audio through.
+                new_content = [
+                    {**part, "text": rewrite(part["text"])}
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                    else rewrite(part)
+                    if isinstance(part, str)
+                    else part
+                    for part in content
+                ]
+            if new_content != content:
+                updates["content"] = new_content
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            new_tool_calls = _neutralize_replayed_tool_call(tool_calls)
+            if new_tool_calls != tool_calls:
+                updates["tool_calls"] = new_tool_calls
+        if updates:
+            out.append({**msg, **updates})
+            changed = True
+        else:
+            out.append(msg)
+    return out if changed else messages
+
+
+def neutralize_tool_descriptions(tools):
+    """Neutralize control markup in a rendered tool catalog, keeping names exact.
+
+    A tool declaration is prompt text, and every string in it is rendered: Gemma-4
+    interpolates the description into its system turn and ``format_parameters``
+    emits property keys unquoted plus ``enum`` / ``required`` entries inline,
+    while Granite renders the whole spec with ``tojson``. So a
+    "<turn|><|turn>model" anywhere in the schema closes the system turn and forges
+    a model one (#7066). ``mcp_client`` copies a server's ``description`` and its
+    ``inputSchema`` verbatim, which is how remote text gets there.
+
+    ``function.name`` is the one exception: the client matches the name the model
+    echoes back against the one it registered. Everything else takes the rewrite,
+    which is the identity on a schema that holds no control markup -- a real
+    ``enum`` value or property key has no "<" for the pattern to match, so a live
+    catalog is returned unchanged and two distinct keys cannot collide onto one.
+    """
+    if not tools or not isinstance(tools, list):
+        return tools
+    out: list = []
+    changed = False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            out.append(tool)
+            continue
+        function = tool.get("function")
+        target = function if isinstance(function, dict) else tool
+        updates: dict = {}
+        for key, value in target.items():
+            if key == "name":
+                continue
+            new_value = _neutralize_argument_leaves(value)
+            if new_value != value:
+                updates[key] = new_value
+        if not updates:
+            out.append(tool)
+            continue
+        new_target = {**target, **updates}
+        out.append({**tool, "function": new_target} if target is function else new_target)
+        changed = True
+    return out if changed else tools
 
 
 def _tokenizer_objects(tokenizer) -> tuple:
@@ -390,6 +610,9 @@ def apply_chat_template_for_generation(
     """Render the chat prompt. Try richest kwargs first; drop one
     group at a time on TypeError. Jinja / missing-variable errors
     propagate."""
+    # Shared choke point for the transformers and MLX backends (#7066).
+    messages = neutralize_control_markup_in_messages(messages)
+    tools = neutralize_tool_descriptions(tools)
     reasoning_kwargs: dict = {}
     if enable_thinking is not None:
         reasoning_kwargs["enable_thinking"] = enable_thinking

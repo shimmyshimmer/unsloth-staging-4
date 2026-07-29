@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import re
 import socket
@@ -49,7 +50,18 @@ import logging as _logging  # noqa: E402
 _loggers_stub = types.ModuleType("loggers")
 _loggers_stub.get_logger = lambda name: _logging.getLogger(name)
 sys.modules.setdefault("loggers", _loggers_stub)
-sys.modules.setdefault("structlog", types.ModuleType("structlog"))
+# A bare setdefault parked an empty stub before anything imported the real (lazily
+# imported) structlog, shadowing it session-wide: later modules calling
+# structlog.get_logger at import time died with AttributeError, but only when this
+# file was collected first. Check sys.modules FIRST, since find_spec() raises
+# ValueError on a module whose __spec__ is None and another test module may have
+# parked its own stub. Only a genuinely absent package gets stubbed.
+if "structlog" not in sys.modules and importlib.util.find_spec("structlog") is None:
+    _structlog_stub = types.ModuleType("structlog")
+    _structlog_stub.get_logger = lambda *args, **kwargs: _logging.getLogger(
+        args[0] if args else "structlog"
+    )
+    sys.modules["structlog"] = _structlog_stub
 
 import httpx  # noqa: E402
 

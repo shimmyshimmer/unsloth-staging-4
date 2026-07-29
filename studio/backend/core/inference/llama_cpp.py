@@ -11330,10 +11330,13 @@ class LlamaCppBackend:
         if not self.is_loaded:
             raise RuntimeError("llama-server is not loaded")
 
+        from core.inference.chat_template_helpers import neutralize_control_markup_in_messages
+
         openai_messages = self._build_openai_messages(messages, image_b64)
 
         payload = {
-            "messages": openai_messages,
+            # llama-server applies the chat template itself (#7066).
+            "messages": neutralize_control_markup_in_messages(openai_messages),
             "stream": True,
             "temperature": temperature,
             "top_p": top_p,
@@ -11793,8 +11796,16 @@ class LlamaCppBackend:
 
             # Build payload -- stream: True so we detect tool signals
             # in the first 1-2 chunks without a non-streaming penalty.
+            from core.inference.chat_template_helpers import (
+                neutralize_control_markup_in_messages,
+                neutralize_tool_descriptions,
+            )
+
             payload = {
-                "messages": conversation,
+                # Re-run every iteration: tool results land in ``conversation`` as the
+                # loop goes, and a forged assistant turn in one would render for
+                # real (#7066).
+                "messages": neutralize_control_markup_in_messages(conversation),
                 "stream": True,
                 "stream_options": {"include_usage": True},
                 "temperature": temperature,
@@ -11803,7 +11814,9 @@ class LlamaCppBackend:
                 "min_p": min_p,
                 "repeat_penalty": repetition_penalty,
                 "presence_penalty": presence_penalty,
-                "tools": active_tools,
+                # An MCP server's description and inputSchema are remote text that
+                # the template renders into the system turn (#7066).
+                "tools": neutralize_tool_descriptions(active_tools),
                 "tool_choice": "auto",
             }
             _reasoning_kw = self._request_reasoning_kwargs(
@@ -12916,8 +12929,10 @@ class LlamaCppBackend:
         yield {"type": "status", "text": ""}
 
         # Final streaming pass with the full conversation context.
+        from core.inference.chat_template_helpers import neutralize_control_markup_in_messages
+
         stream_payload = {
-            "messages": conversation,
+            "messages": neutralize_control_markup_in_messages(conversation),
             "stream": True,
             "temperature": temperature,
             "top_p": top_p,
@@ -13125,6 +13140,18 @@ class LlamaCppBackend:
             system_text = system
         elif isinstance(system, list):
             system_text = _block_text(system)
+
+        # Count the prompt generation actually sends: the chat paths neutralize
+        # before templating, so counting raw text budgets a prompt nobody uses (#7066).
+        from core.inference.chat_template_helpers import (
+            neutralize_control_markup,
+            neutralize_control_markup_in_messages,
+            neutralize_tool_descriptions,
+        )
+
+        messages = neutralize_control_markup_in_messages(messages)
+        system_text = neutralize_control_markup(system_text)
+        tools = neutralize_tool_descriptions(tools)
 
         try:
             with httpx.Client(timeout = 10, headers = self._auth_headers, trust_env = False) as client:

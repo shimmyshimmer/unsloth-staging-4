@@ -37,6 +37,7 @@ from core.inference.chat_template_helpers import (
     ReasoningChannelNormalizer,
     detect_reasoning_channel_markers,
     detect_think_prefill,
+    neutralize_control_markup_in_messages,
 )
 from core.inference.presence_penalty import _make_presence_penalty_processor
 from io import StringIO
@@ -1223,6 +1224,12 @@ class InferenceBackend:
             else:
                 vision_messages = [user_msg]
 
+            # Renders through the processor's own template, so it skips the choke
+            # point (#7066). Rebind user_msg so the no-system retry below keeps the
+            # neutralized copy.
+            vision_messages = neutralize_control_markup_in_messages(vision_messages)
+            user_msg = vision_messages[-1]
+
             try:
                 input_text = processor.apply_chat_template(
                     vision_messages, add_generation_prompt = True, tokenize = False
@@ -1437,6 +1444,9 @@ class InferenceBackend:
                 ],
             },
         ]
+
+        # Direct processor render like the vision path, so neutralize here too (#7066).
+        audio_messages = neutralize_control_markup_in_messages(audio_messages)
 
         # apply_chat_template does audio embedding + tokenization in one step
         inputs = processor.apply_chat_template(
@@ -2102,6 +2112,13 @@ class InferenceBackend:
         if chat_messages and chat_messages[-1]["role"] == "assistant":
             logger.debug("Removing final assistant message to ensure proper alternation")
             chat_messages.pop()
+
+        # This renders with the tokenizer directly, so it is another path around
+        # the choke point: a text-only request to a vision model comes straight
+        # here, and the text path falls back here when the template raises. The
+        # user sub above only strips user turns, so system_prompt and replayed
+        # assistant text would still reach the template as markup (#7066).
+        chat_messages = neutralize_control_markup_in_messages(chat_messages)
 
         logger.info(f"Sending {len(chat_messages)} messages to tokenizer:")
         for i, msg in enumerate(chat_messages):
