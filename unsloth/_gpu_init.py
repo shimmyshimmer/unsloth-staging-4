@@ -167,6 +167,11 @@ from unsloth_zoo.device_type import (
     ALLOW_PREQUANTIZED_MODELS,
 )
 
+# The same bitsandbytes probe device_type.py and kernels/utils.py use. Imported
+# from the leaf module, not from .device_type: that would run device_type.py's
+# probe before the CUDA relink below has had a chance to repair the wheel.
+from .bnb_availability import check_bitsandbytes as _check_bitsandbytes
+
 # Fix other issues
 from .import_fixes import (
     fix_xformers_performance_issue,
@@ -309,6 +314,9 @@ if DEVICE_TYPE == "cuda":
         )
         bnb = None
     try:
+        # Every symbol kernels/utils.py binds, not just this one: a wheel missing
+        # any of them is equally unusable, and the relink below may fix them all.
+        _check_bitsandbytes(bnb, DEVICE_TYPE)
         cdequantize_blockwise_fp32 = bnb.functional.lib.cdequantize_blockwise_fp32
         libcuda_dirs()
     except:
@@ -340,8 +348,17 @@ if DEVICE_TYPE == "cuda":
                 del possible_cudas, find_cuda
 
             if bnb is not None:
-                importlib.reload(bnb)
-            importlib.reload(triton)
+                # A wheel whose spec can no longer be found makes reload raise.
+                # That must not take down `import unsloth` from inside the
+                # recovery path we entered precisely because it is broken.
+                try:
+                    importlib.reload(bnb)
+                except Exception:
+                    pass
+            try:
+                importlib.reload(triton)
+            except Exception:
+                pass
             try:
                 libcuda_dirs = lambda: None
                 if Version(triton.__version__) >= Version("3.0.0"):
@@ -351,6 +368,7 @@ if DEVICE_TYPE == "cuda":
                         pass
                 else:
                     from triton.common.build import libcuda_dirs
+                _check_bitsandbytes(bnb, DEVICE_TYPE)
                 cdequantize_blockwise_fp32 = bnb.functional.lib.cdequantize_blockwise_fp32
                 libcuda_dirs()
             except:

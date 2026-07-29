@@ -20,6 +20,7 @@ __all__ = [
     "DEVICE_COUNT",
     "ALLOW_PREQUANTIZED_MODELS",
     "ALLOW_BITSANDBYTES",
+    "BITSANDBYTES",
     "is_mlx_available",
 ]
 
@@ -27,6 +28,7 @@ import functools
 import inspect
 import os
 from unsloth_zoo.utils import Version
+from .bnb_availability import probe_bitsandbytes
 
 
 def is_mlx_available():
@@ -118,14 +120,15 @@ ALLOW_PREQUANTIZED_MODELS: bool = True
 # HSA_STATUS_ERROR_EXCEPTION checks - sometimes AMD fails for BnB
 ALLOW_BITSANDBYTES: bool = True
 # Unusable bitsandbytes on any backend, not just hip: clear the flags the loader
-# reads before it selects a 4bit checkpoint. Same guarded import the fallbacks in
-# _gpu_init.py and kernels/utils.py use rather than a find_spec probe, so an
-# installed-but-broken wheel (missing .so, wrong ROCm/CUDA build) is treated as
-# unavailable by all three, not only by the ones that import it.
-try:
-    import bitsandbytes as _bnb_probe
-    del _bnb_probe
-except Exception:
+# reads before it selects a 4bit checkpoint. This is the one shared availability
+# result - kernels/utils.py binds `BITSANDBYTES` itself and _gpu_init.py runs the
+# same check - so an installed-but-broken wheel (missing .so, wrong ROCm/CUDA
+# build, no `functional`) is unavailable to all three and the flag cannot stay
+# true while the kernels fall back to a stub. Neither find_spec nor a bare
+# `import bitsandbytes` can see that: such a wheel imports fine and only raises
+# when the kernels are read.
+BITSANDBYTES = probe_bitsandbytes(DEVICE_TYPE)
+if BITSANDBYTES is None:
     ALLOW_PREQUANTIZED_MODELS = False
     ALLOW_BITSANDBYTES = False
 # gfx906 (MI50 / Radeon VII / Vega 20): Dynamo/Inductor codegen is broken on this
@@ -146,15 +149,16 @@ if DEVICE_TYPE == "hip":
             "(community-maintained legacy GCN path)."
         )
 if DEVICE_TYPE == "hip":
-    try:
-        import bitsandbytes
-    except:
+    # Flags are already cleared above when the shared probe found no usable wheel.
+    if BITSANDBYTES is None:
         print(
-            "Unsloth: `bitsandbytes` is not installed - 4bit QLoRA unallowed, but 16bit and full finetuning works."
+            "Unsloth: `bitsandbytes` is unavailable - 4bit QLoRA unallowed, but 16bit and full finetuning works."
         )
-        ALLOW_PREQUANTIZED_MODELS = False
-        ALLOW_BITSANDBYTES = False
-    if ALLOW_BITSANDBYTES:
+    else:
+        bitsandbytes = BITSANDBYTES
+    # `BITSANDBYTES is not None` rather than the flag it just set: the name
+    # `bitsandbytes` below is bound only on that branch.
+    if BITSANDBYTES is not None:
         ALLOW_BITSANDBYTES = Version(bitsandbytes.__version__) > Version("0.48.2.dev0")
         if Version(bitsandbytes.__version__) >= Version("0.49.2"):
             pass
