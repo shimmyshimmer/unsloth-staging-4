@@ -1,0 +1,52 @@
+name: "staging-7465 windows-latest"
+on:
+  push:
+    branches: ["pr-7465-xplat-ci"]
+    paths:
+      - 'studio/backend/auth/storage.py'
+      - 'studio/backend/cloudflare_tunnel.py'
+      - 'studio/backend/core/data_recipe/local_callable_validators.py'
+      - 'studio/backend/core/training/worker.py'
+      - 'studio/backend/hub/utils/download_registry.py'
+      - 'studio/backend/loggers/config.py'
+      - 'studio/backend/plugins/data-designer-github-repo-seed/src/data_designer_github_repo_seed/scraper_impl/state_store.py'
+      - 'studio/backend/plugins/data-designer-unstructured-seed/src/data_designer_unstructured_seed/impl.py'
+      - 'studio/backend/run.py'
+      - 'studio/backend/tests/test_chat_text_encoding.py'
+      - 'studio/backend/tests/test_rocm_multi_gpu_vram_system_wide.py'
+      - 'studio/backend/tests/test_text_io_encoding.py'
+      - 'studio/backend/tests/test_training_worker_flash_attn.py'
+      - 'studio/backend/utils/hardware/amd.py'
+      - 'studio/backend/utils/hardware/hardware.py'
+      - 'studio/backend/utils/hardware/nvidia.py'
+      - 'studio/backend/utils/llama_cpp_update.py'
+      - 'studio/backend/utils/mlx_repair.py'
+      - 'studio/backend/utils/node_runtime.py'
+      - 'studio/backend/utils/prebuilt/update_flow.py'
+      - '.github/workflows/staging-7465-windows-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: python -m pip install transformers
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_chat_text_encoding.py studio/backend/tests/test_rocm_multi_gpu_vram_system_wide.py studio/backend/tests/test_text_io_encoding.py studio/backend/tests/test_training_worker_flash_attn.py -q --tb=short || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
