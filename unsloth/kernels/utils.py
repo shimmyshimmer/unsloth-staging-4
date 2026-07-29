@@ -28,6 +28,7 @@ from ..device_type import (
     DEVICE_TYPE_TORCH,
     DEVICE_COUNT,
     ALLOW_PREQUANTIZED_MODELS,
+    BITSANDBYTES,
 )
 from .fp8 import weight_dequant, fp8_linear
 import functools
@@ -133,13 +134,14 @@ def calculate_settings(
 
 
 HAS_CUDA_STREAM = False
-try:
-    import bitsandbytes as bnb
-except Exception:
-    # device_type.py already degrades to 16bit/full finetuning when bnb is missing
-    # (e.g. gfx906, whose generic wheel has no kernels). Keep the import working and
-    # fail only if a 4bit path is actually entered.
-    bnb = None
+# device_type.py already probed every attribute read below (bnb_availability.py),
+# so this is None unless all of them resolve - a broken wheel that imports but
+# never binds `functional`, or binds a `functional.lib` that is None or missing a
+# kernel, cannot raise here. device_type.py degrades to 16bit/full finetuning in
+# that case (e.g. gfx906, whose generic wheel has no kernels) using the same
+# result, so ALLOW_BITSANDBYTES can never disagree with these fallbacks. 4bit only
+# fails if a 4bit path is actually entered.
+bnb = BITSANDBYTES
 
 
 def _bnb_required(*args, **kwargs):
