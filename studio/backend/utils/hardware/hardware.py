@@ -24,6 +24,7 @@ import platform
 import re
 import subprocess
 import sys
+import threading
 import types
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 import structlog
@@ -78,6 +79,89 @@ CHAT_ONLY: bool = True  # No CUDA GPU -> GGUF chat only (Mac, CPU-only, etc.)
 CHAT_ONLY_REASON: Optional[str] = None
 IS_ROCM: bool = False  # True when running on AMD ROCm (HIP) -- routes GPU monitoring to amd.py
 
+# Detection has concurrent callers (the warm thread plus any early get_device()).
+# Unlocked, two runs interleave on the globals above and a reader between the reset and
+# the CUDA branch sees "chat only" on a GPU host. Re-entrant: get_device() ->
+# detect_hardware() nests on one thread.
+_DETECT_LOCK = threading.RLock()
+
+# Bumped by shutdown so a detection still inside the torch import cannot publish over
+# the reset, leaving the next lifespan a non-None DEVICE that makes it skip detection.
+# An epoch, not _DETECT_LOCK: taking that lock would park teardown behind the import.
+_EPOCH_LOCK = threading.Lock()
+DETECTION_EPOCH = 0
+
+
+def invalidate_detection() -> int:
+    """Retire any detection in flight. Returns the new epoch."""
+    global DETECTION_EPOCH
+    with _EPOCH_LOCK:
+        DETECTION_EPOCH += 1
+        return DETECTION_EPOCH
+
+
+def current_detection_epoch() -> int:
+    with _EPOCH_LOCK:
+        return DETECTION_EPOCH
+
+
+def _discard_detection_locked() -> None:
+    """Drop a verdict produced for an epoch that has been retired."""
+    global DEVICE, CHAT_ONLY, CHAT_ONLY_REASON, IS_ROCM
+    DEVICE = None
+    CHAT_ONLY = True
+    CHAT_ONLY_REASON = None
+    IS_ROCM = False
+    DETECTION_COMPLETE.clear()
+
+
+# Set once detection has a settled answer, including its CPU/chat-only fallback. Poll
+# this, not DEVICE: DEVICE is assigned mid-detection and can be revised.
+DETECTION_COMPLETE = threading.Event()
+# Bumped every time detection settles. Detection is not once-per-process (the MLX
+# self-heal re-detects and flips CHAT_ONLY), so snapshot holders can spot staleness.
+DETECTION_GENERATION = 0
+
+# Drives start_background_detection(). Separate from _DETECT_LOCK: held only for this
+# bookkeeping, never across the import.
+_DETECT_KICK_LOCK = threading.Lock()
+_DETECT_THREAD: Optional[threading.Thread] = None
+
+
+def start_background_detection() -> None:
+    """Run detection on a daemon thread if nothing is running it yet.
+
+    For callers on a deadline that cannot await ensure_hardware_detected(), such as
+    /api/health under the desktop launcher's 2s timeout. They poll DEVICE against
+    their own budget; this guarantees something is filling it in even when the warm
+    thread is past its hardware stage or a shutdown cleared the verdict.
+
+    Callers skip it under UNSLOTH_STUDIO_DISABLE_TORCH_WARM=1: that switch means no
+    background torch import at all, so they answer provisionally instead.
+
+    At most one thread at a time, and none once DEVICE is set, so a route that keeps
+    returning "still detecting" cannot pile them up. Not the asyncio executor: a
+    to_thread outliving its awaiter holds a slot, and a polled endpoint would exhaust
+    the pool during a slow import.
+    """
+    global _DETECT_THREAD
+    if DEVICE is not None:
+        return
+    with _DETECT_KICK_LOCK:
+        if DEVICE is not None:
+            return
+        if _DETECT_THREAD is not None and _DETECT_THREAD.is_alive():
+            return
+        # Epoch read before start(): the thread can be scheduled after a shutdown
+        # retires this epoch, and it must lose to that, not adopt it.
+        _DETECT_THREAD = threading.Thread(
+            target = ensure_hardware_detected,
+            args = (current_detection_epoch(),),
+            daemon = True,
+            name = "hardware-detect",
+        )
+        _DETECT_THREAD.start()
+
 
 def _backend_label(device: DeviceType) -> str:
     """Return the user-facing backend name for API responses.
@@ -98,12 +182,46 @@ def is_apple_silicon() -> bool:
     return platform.system() == "Darwin" and platform.machine() == "arm64"
 
 
+# Set by _has_torch() when torch is installed but its import blew up (a wheel whose
+# CUDA libs do not resolve raises OSError). Read by the CPU fallback: such a host is a
+# detection failure to report, not a machine that simply has no GPU.
+TORCH_IMPORT_ERROR: Optional[str] = None
+
+
 def _has_torch() -> bool:
-    """True if PyTorch is importable."""
+    """True if PyTorch is importable.
+
+    Any failure counts as "no torch", not just ImportError: ensure_hardware_detected()
+    re-runs while DEVICE is None, so an escaping OSError would make every request
+    retry the import. Treat a broken torch like an absent one and take the CPU path,
+    but record the error, or the host is reported as GPU-less and told to install the
+    torch it has.
+    """
+    global TORCH_IMPORT_ERROR
     try:
         import torch
+        TORCH_IMPORT_ERROR = None
         return True
-    except ImportError:
+    except Exception as exc:
+        # ImportError does NOT mean "not installed": a wheel with unresolved native libraries
+        # raises it from inside torch's own __init__ ("libcudart.so.N: cannot open shared
+        # object file"), OSError on Windows. Only ModuleNotFoundError naming torch itself is
+        # absent; a failed submodule is still a broken install. Both still purge.
+        absent = isinstance(exc, ModuleNotFoundError) and exc.name == "torch"
+        TORCH_IMPORT_ERROR = None if absent else repr(exc)
+        if TORCH_IMPORT_ERROR is not None:
+            logger.error("torch is installed but failed to import: %r", exc)
+        # A part-way failure leaves torch submodules cached under an evicted parent, so
+        # the next importer gets a torch missing pieces. purge_partial_import() clears
+        # that (and declines once a compiled submodule is loaded).
+        try:
+            from utils.torch_warmup import purge_partial_import
+        except Exception:
+            # Also exec'd standalone with no package around it (see
+            # tests/python/test_e2e_no_torch_sandbox.py). Nothing to purge there.
+            pass
+        else:
+            purge_partial_import("torch")
         return False
 
 
@@ -185,13 +303,107 @@ def detect_hardware() -> DeviceType:
       4. MLX   (Apple Silicon via MLX framework)
       5. CPU   (fallback)
     """
+    global DEVICE, CHAT_ONLY, CHAT_ONLY_REASON, IS_ROCM, DETECTION_GENERATION
+    with _DETECT_LOCK:
+        # A forced pass mutates the globals partway through; with the event left set
+        # /api/health would serve that intermediate state as settled, so the sidebar MLX
+        # poll caches reason=None, stops, and leaves Train hidden on a repaired host.
+        # Clear for the duration, republish once it settles.
+        was_complete = DETECTION_COMPLETE.is_set()
+        # Snapshot the whole verdict, not just the event: a raise mid-pass leaves a
+        # half-written answer that the autorepair path swallows, and losing
+        # "mlx_unavailable" stops the sidebar poll for good.
+        published = (DEVICE, CHAT_ONLY, CHAT_ONLY_REASON, IS_ROCM)
+        epoch = current_detection_epoch()
+        DETECTION_COMPLETE.clear()
+        try:
+            device = _detect_hardware_locked()
+        except BaseException:
+            if current_detection_epoch() != epoch:
+                # Shutdown ran mid-pass. Restoring would put back the verdict it just
+                # cleared, and the next lifespan would treat that as measured.
+                _discard_detection_locked()
+                raise
+            DEVICE, CHAT_ONLY, CHAT_ONLY_REASON, IS_ROCM = published
+            # Restore rather than leave it clear: start_background_detection() declines
+            # once DEVICE is set, so an unset event keeps health provisional forever.
+            if was_complete:
+                DETECTION_COMPLETE.set()
+            raise
+        if current_detection_epoch() != epoch:
+            # Shutdown ran mid-pass; this verdict belongs to a lifespan that ended.
+            _discard_detection_locked()
+            return device
+        DETECTION_GENERATION += 1
+        DETECTION_COMPLETE.set()
+        return device
+
+
+def ensure_hardware_detected(epoch: Optional[int] = None) -> DeviceType:
+    """Detect once, from any thread. Prefer this to detect_hardware() unless you want
+    a forced re-detect: it collapses the warm thread and an early request into one
+    detection, and a caller arriving mid-detection waits rather than start a second.
+
+    Never raises. On the warm thread a raise is swallowed and leaves DEVICE None, so
+    every later request would retry the same failing import and /api/health, which
+    waits on this, would 500. Record CPU + chat-only with a reason instead.
+
+    ``epoch`` is the epoch this pass belongs to. A spawner passes the one it read
+    before Thread.start(): the thread can be scheduled after a shutdown that retired
+    that epoch, and reading it here would bind the pass to the retirement it was
+    supposed to lose to. Direct callers pass nothing and own the current epoch."""
+    global DEVICE, CHAT_ONLY, CHAT_ONLY_REASON, DETECTION_GENERATION
+    with _DETECT_LOCK:
+        if epoch is None:
+            epoch = current_detection_epoch()
+        elif DEVICE is None and current_detection_epoch() != epoch:
+            # Retired before this worker reached the lock, and nothing newer has been
+            # published. Probing would import torch for a lifespan that has stopped,
+            # and the next lifespan's warm would queue on this lock behind it only to
+            # detect all over again. A shutdown landing mid-probe is still caught below.
+            return DEVICE
+        produced_here = DEVICE is None
+        if produced_here:
+            try:
+                _detect_hardware_locked()
+            except BaseException as exc:  # noqa: BLE001 - degrade, never 500 the health check
+                logger.error("Hardware detection failed; falling back to CPU: %r", exc)
+                DEVICE = DeviceType.CPU
+                CHAT_ONLY = True
+                CHAT_ONLY_REASON = "detection_failed"
+            # Inside the branch: the orchestrator rebuilds its curated defaults whenever
+            # this counter moves, so bumping it on the cached path caused needless
+            # rebuilds. Forced detect_hardware() bumps it too.
+            DETECTION_GENERATION += 1
+        if produced_here and current_detection_epoch() != epoch:
+            # See detect_hardware(): a retired pass must not publish. Only what this
+            # call produced, though: a retired worker that waited out the lock and found
+            # DEVICE set is looking at the new lifespan's verdict, and discarding that
+            # would leave the restart provisional.
+            _discard_detection_locked()
+            return DEVICE
+        # Set only here, where a final value is guaranteed: a non-None DEVICE means only
+        # that a candidate was picked (the XPU branch assigns before a probe that can
+        # raise), so a waiter trusting it could publish training-enabled for a host that
+        # ends up CPU/chat-only. Unconditional, unlike the counter: re-setting is a no-op
+        # and a late waiter still has to find it set.
+        DETECTION_COMPLETE.set()
+        return DEVICE
+
+
+def _detect_hardware_locked() -> DeviceType:
+    """detect_hardware() body. Call only with _DETECT_LOCK held."""
     global DEVICE, CHAT_ONLY, CHAT_ONLY_REASON, IS_ROCM
     CHAT_ONLY = True  # reset -- only CUDA/ROCm/XPU/MLX sets it to False
     CHAT_ONLY_REASON = None
     IS_ROCM = False
 
+    # Probe torch once per pass: a failed probe is expensive, and a second one just
+    # repeats the cost and can disagree with the first.
+    torch_ok = _has_torch()
+
     # --- CUDA / ROCm / XPU: try PyTorch ---
-    if _has_torch():
+    if torch_ok:
         import torch
 
         # --- Explicit-XPU hint ---
@@ -255,7 +467,7 @@ def detect_hardware() -> DeviceType:
             return DEVICE
 
     # --- XPU: Intel GPU ---
-    if _has_torch():
+    if torch_ok:
         import torch
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             DEVICE = DeviceType.XPU
@@ -292,6 +504,10 @@ def detect_hardware() -> DeviceType:
             "Train/Export disabled (chat-only). Run `unsloth studio update` to "
             "restore MLX training."
         )
+    elif TORCH_IMPORT_ERROR is not None:
+        # torch is installed and broken, so this host was never measured. "no_gpu"
+        # would tell a GPU box it has no GPU.
+        CHAT_ONLY_REASON = "detection_failed"
     elif platform.system() == "Darwin":
         CHAT_ONLY_REASON = "intel_mac"  # Intel Mac: no PyTorch/MLX -> GGUF-only by design.
     else:
@@ -308,10 +524,7 @@ def get_device() -> DeviceType:
     Return the detected device, auto-detecting if detect_hardware() hasn't run.
     Prefer calling detect_hardware() explicitly at startup.
     """
-    global DEVICE
-    if DEVICE is None:
-        detect_hardware()
-    return DEVICE
+    return ensure_hardware_detected()
 
 
 def export_capability() -> dict:
@@ -329,9 +542,16 @@ def export_capability() -> dict:
             "export_unsupported_reason": None,
             "export_unsupported_message": None,
         }
-    # No accelerator: name the blocker. Apple Silicon first -- its path is MLX, so "install PyTorch"
-    # would be wrong advice on a Mac even when torch is also absent.
-    if is_apple_silicon():
+    # No accelerator: name the blocker. Detection failure comes first, since the
+    # branches below all describe a host that was actually measured -- otherwise a GPU
+    # host with a broken probe is told to install PyTorch or that it has no GPU.
+    if CHAT_ONLY_REASON == "detection_failed":
+        reason = "detection_failed"
+        message = (
+            "Hardware detection failed on this host, so export is disabled. The server log records "
+            "the underlying error; restart Unsloth Studio to retry detection."
+        )
+    elif is_apple_silicon():
         reason = "mlx_unavailable"
         message = (
             "Export on Apple Silicon requires the MLX stack, which is unavailable or too old. Run "

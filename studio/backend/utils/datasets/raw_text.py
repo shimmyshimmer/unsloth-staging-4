@@ -3,10 +3,15 @@
 
 """Shared helpers for raw-text dataset preparation."""
 
-from dataclasses import dataclass
-from typing import Literal
+# `Dataset` is annotation-only, and importing `datasets` at module scope drags torch
+# in via datasets.formatting.torch_formatter.
+from __future__ import annotations
 
-from datasets import Dataset
+from dataclasses import dataclass
+from typing import Literal, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from datasets import Dataset
 
 
 @dataclass(frozen = True)
