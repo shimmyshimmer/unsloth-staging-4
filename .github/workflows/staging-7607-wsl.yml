@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# The deferred-torch change under a real WSL2 kernel.
+#
+# WSL is the one platform where the warm's assumptions are most likely to bend:
+# no GPU by default, so hardware detection takes the degraded branch, and the
+# filesystem is a 9p mount whose import latency is nothing like a native disk.
+# The other three legs run the same subset on native filesystems.
+#
+# A freshly imported Ubuntu rootfs is genuinely bare (no python3, no pip), which
+# is the point: the leg installs only what the test subset needs.
+
+name: "staging-7607 wsl"
+
+on:
+  push:
+    branches: ["pr-7607-xplat-ci"]
+    paths:
+      - 'studio/backend/main.py'
+      - 'studio/backend/core/inference/orchestrator.py'
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/routes/models.py'
+      - 'studio/backend/utils/hardware/hardware.py'
+      - 'studio/backend/utils/lifespan_shutdown.py'
+      - 'studio/backend/utils/torch_warmup.py'
+      - 'studio/backend/tests/**'
+      - '.github/workflows/staging-7607-wsl.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: wsl ubuntu-24.04
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Import a fresh Ubuntu 24.04 WSL distro
+        shell: pwsh
+        run: |
+          # WSL2 ships on windows-2022+ runner images; only a distro is missing.
+          wsl --set-default-version 2
+          $url = 'https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-24.04lts.rootfs.tar.gz'
+          $expected = '2a790896740b14d637dbdc583cce1ba081ac53b9e9cdb46dc09a2f73abbd9934'
+          New-Item -ItemType Directory -Force -Path wsl-dist | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile wsl-dist/rootfs.tar.gz -UseBasicParsing -TimeoutSec 900
+          $actual = (Get-FileHash wsl-dist/rootfs.tar.gz -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) {
+            Write-Host "::error::rootfs checksum mismatch: got $actual"
+            exit 1
+          }
+          wsl --import unsloth-ci "$PWD/wsl-dist/instance" "$PWD/wsl-dist/rootfs.tar.gz" --version 2
+          wsl -d unsloth-ci -- uname -a
+
+      - name: Install python and the studio requirements inside WSL
+        shell: pwsh
+        run: |
+          wsl -d unsloth-ci -u root -- sh -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 python3-pip python3-venv ca-certificates'
+          # Copy the tree in rather than running off /mnt/c: a 9p mount makes every
+          # import a Windows filesystem round trip and the timings stop meaning
+          # anything. This measures WSL's own disk.
+          # The interop mount is /mnt/<lowercase drive>; the runner's checkout is on
+          # D:, so uppercasing the letter yields a path that does not exist.
+          $repo = $PWD.Path -replace '\\','/'
+          if ($repo -notmatch '^([A-Za-z]):(.*)$') { Write-Host "::error::unexpected workspace path $repo"; exit 1 }
+          $repo = '/mnt/' + $matches[1].ToLower() + $matches[2]
+          Write-Host "repo inside WSL: $repo"
+          # The whole checkout, not just studio/: test_desktop_auth spawns a
+          # subprocess that imports unsloth_cli, so a studio-only copy fails seven
+          # cases on a harness gap rather than on anything under test.
+          wsl -d unsloth-ci -u root -- sh -c "set -e; mkdir -p /work; tar -C '$repo' --exclude=./.git -cf - . | tar -C /work -xf -; ls /work | head -20"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          wsl -d unsloth-ci -u root -- sh -c 'python3 -m venv /work/venv && /work/venv/bin/python -m pip install -q --upgrade pip'
+          wsl -d unsloth-ci -u root -- sh -c '/work/venv/bin/python -m pip install -q -r /work/studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart'
+
+      - name: Run the deferred-startup subset inside WSL
+        shell: pwsh
+        env:
+          UNSLOTH_COMPILE_DISABLE: '1'
+          UNSLOTH_IS_PRESENT: '1'
+        run: |
+          # Same -k exclusions as the native legs: those cases need a real GPU or
+          # the full transformers stack, neither of which this leg installs.
+          $tests = @(
+            'test_async_singleton_access', 'test_defaults_refresh_after_redetect',
+            'test_desktop_auth', 'test_export_capability',
+            'test_health_answers_within_probe_budget', 'test_inference_backend_singleton', 'test_warm_window_review_fixes',
+            'test_lifespan_restart_rewarms', 'test_lifespan_shutdown',
+            'test_openai_tool_passthrough', 'test_startup_defers_stack_dependent_work',
+            'test_startup_defers_torch', 'test_training_streaming_mlx_warm'
+          ) | ForEach-Object { "studio/backend/tests/$_.py" }
+          $k = "not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda"
+          # No rc==5 carve-out here: this leg installs the requirements itself, so
+          # "no tests ran" is a failure, not a host that lacks the deps.
+          $cmd = "cd /work && PYTHONPATH=studio/backend UNSLOTH_COMPILE_DISABLE=1 UNSLOTH_IS_PRESENT=1 /work/venv/bin/python -m pytest $($tests -join ' ') -q --tb=short -k '$k'"
+          wsl -d unsloth-ci -u root -- sh -c $cmd
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: The warm module must not drag torch in under WSL either
+        # always(): the subset above still reports the one pre-existing failure
+        # (routes.whisper under a repo-root invocation, reproduced on origin/main),
+        # and that must not skip the assertion this leg exists for.
+        if: always()
+        shell: pwsh
+        run: |
+          # The property the change rests on: importing the warm module costs
+          # nothing and imports no ML stack. Reported, not gated -- a hosted WSL2
+          # VM is not a budget worth pinning.
+          $probe = 'import sys, time; sys.path.insert(0, "studio/backend"); t = time.perf_counter(); __import__("utils.torch_warmup"); print("import utils.torch_warmup: %.0f ms" % ((time.perf_counter() - t) * 1000)); print("torch imported by it:", "torch" in sys.modules); assert "torch" not in sys.modules'
+          wsl -d unsloth-ci -u root -- sh -c "cd /work && /work/venv/bin/python -c '$probe'"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
