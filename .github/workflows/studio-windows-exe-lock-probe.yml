@@ -64,6 +64,22 @@ jobs:
           echo "--- probe after it exits ---"
           "$PY" tests/windows/exe_lock_probe.py | tee probe_after.json
 
+      - name: B2. while a process launched via the SHIM is alive
+        run: |
+          PY="$HOME/.unsloth/studio/unsloth_studio/Scripts/python.exe"
+          SHIM="$HOME/.unsloth/studio/bin/unsloth.exe"
+          UNSLOTH_API_ONLY=1 "$SHIM" studio -H 127.0.0.1 -p 18894 > server2.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 60); do
+            curl -fsS "http://127.0.0.1:18894/api/health" >/dev/null 2>&1 && break
+            sleep 2
+          done
+          echo "--- with only the SHIM running, is Scripts\unsloth.exe free? ---"
+          "$PY" tests/windows/exe_lock_probe.py > probe_shim.json 2> identity.json
+          cat identity.json; cat probe_shim.json
+          kill $SRV 2>/dev/null || true
+          sleep 5
+
       - name: C. the real failure -- force pip to reinstall unsloth
         continue-on-error: true
         run: |
@@ -75,7 +91,12 @@ jobs:
           # pass has to replace it, which is the case the issue is about.
           "$PY" -m pip install --no-deps --force-reinstall --no-build-isolation . 2>&1 | tail -20
           echo "=== now the update that the issue reports ==="
+          SHIM_DIR="$HOME/.unsloth/studio/bin"
+          test -f "$SHIM_DIR/unsloth.exe" || { echo "::error::no shim"; exit 1; }
+          export PATH="$SHIM_DIR:$PATH"
+          command -v unsloth || { echo "::error::unsloth still not resolvable"; exit 1; }
           unsloth studio update --local 2>&1 | tee update.log || true
+          grep -q "update" update.log || { echo "::error::update produced no output -- step is vacuous"; exit 1; }
           echo "=== did it hit the lock? ==="
           grep -iE "WinError 32|could not rename|being used by another process" update.log || echo "NO LOCK ERROR SEEN"
 
@@ -92,6 +113,8 @@ jobs:
           name: exe-lock-probe
           path: |
             probe_*.json
+            identity.json
+            server2.log
             update.log
             install.log
             server.log

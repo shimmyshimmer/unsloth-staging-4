@@ -76,8 +76,23 @@ def _try_replace(exe: Path):
     return {"path": str(exe), "exists": True, "renamed": True}
 
 
+def _identity(path: Path):
+    """File index + link count, so a hardlinked shim is told apart from a copy."""
+    try:
+        st = path.stat()
+        return {"nlink": getattr(st, "st_nlink", None), "ino": getattr(st, "st_ino", None),
+                "size": st.st_size}
+    except OSError as e:
+        return {"err": str(e)}
+
+
 def main():
     home = Path(os.path.expanduser("~")) / ".unsloth" / "studio"
+    scripts = home / "unsloth_studio" / "Scripts" / "unsloth.exe"
+    shim = home / "bin" / "unsloth.exe"
+    print(json.dumps({"identity": {"scripts": _identity(scripts), "shim": _identity(shim),
+                                   "same_file": _identity(scripts).get("ino") == _identity(shim).get("ino")}},
+                     indent = 2), file = sys.stderr)
     report = {
         "sys_executable": sys.executable,
         "argv0": sys.argv[0],
