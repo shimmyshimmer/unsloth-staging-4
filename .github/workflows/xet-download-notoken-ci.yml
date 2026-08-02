@@ -1,0 +1,102 @@
+# Xet vs HTTP downloads on a real CI runner: no HF_TOKEN, modest RAM, ordinary bandwidth.
+#
+# This is the environment the change is actually for. A GitHub runner has ~16GB of RAM and 4 cores,
+# so hf_xet's stock 8GB reconstruction buffer (64GB under high-performance mode) is sized for a
+# machine that does not exist here -- and no secret is configured, so every download is anonymous,
+# which is how most users download.
+#
+# Models are fetched sequentially and the cache is deleted between cells: a runner has ~14GB of
+# free disk, less than any one of these repos in full.
+name: xet-download-notoken-ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: xet-download-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  download-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install download deps only
+        # Deliberately NOT the full unsloth install: this measures the transport, and torch would
+        # add ~2.5GB of disk and minutes of install time for nothing.
+        run: |
+          python -m pip install -q --upgrade pip
+          python -m pip install -q "huggingface_hub>=0.36" "hf_xet>=1.5" psutil
+          python -m pip install -q "git+https://github.com/unslothai/unsloth_zoo@feat/xet-http-auto-fallback"
+
+      - name: Record the machine
+        run: |
+          echo "## Runner" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          { free -g; nproc; df -h / | tail -1; } >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          from unsloth_zoo.hf_xet_tuning import system_profile, xet_env_overrides
+          p = system_profile()
+          print(f"\nDetected: {p.total_ram_bytes/1e9:.1f}GB RAM ({p.ram_source}), "
+                f"{p.cpu_count} cores ({p.cpu_source})\n")
+          print("| var | value |\n| --- | --- |")
+          for k, v in sorted(xet_env_overrides(p).items()):
+              print(f"| {k} | {v} |")
+          PY
+
+      - name: Confirm no HF token is present
+        # The whole point of this job. If a token ever leaks into the environment the numbers stop
+        # describing what a normal user sees, so fail loudly rather than silently measure something
+        # else.
+        run: |
+          for v in HF_TOKEN HUGGING_FACE_HUB_TOKEN HUGGINGFACE_HUB_TOKEN HF_HUB_TOKEN; do
+            if [ -n "${!v:-}" ]; then echo "::error::$v is set; this job must run anonymously"; exit 1; fi
+          done
+          echo "anonymous: no HF token in the environment"
+
+      - name: Download matrix (sequential, cache deleted between cells)
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+          HF_HUB_DISABLE_TELEMETRY: "1"
+          HF_HUB_ENABLE_HF_TRANSFER: "0"
+          HF_HUB_DISABLE_IMPLICIT_TOKEN: "1"
+        run: python .github/scripts/xet_download_matrix.py
+
+      - name: Summarise
+        if: always()
+        run: |
+          test -f xet-download-results.jsonl || exit 0
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          rows = [json.loads(l) for l in open("xet-download-results.jsonl")]
+          print("\n## Anonymous download matrix\n")
+          print("| repo | file | transport | profile | ok | peak RSS | wall | Mbps |")
+          print("| --- | --- | --- | --- | --- | --- | --- | --- |")
+          for r in rows:
+              print(f"| {r['repo']} | {r['filename']} | {r['transport']} | {r['profile']} | "
+                    f"{'yes' if r['ok'] else 'NO'} | {r['peak_rss_gb']:.2f} GB | "
+                    f"{r['wall_seconds']:.1f}s | {r['throughput_mbps']:.0f} |")
+          stock = [r for r in rows if r["transport"] == "xet" and r["profile"] == "stock" and r["ok"]]
+          tuned = [r for r in rows if r["transport"] == "xet" and r["profile"] == "tuned" and r["ok"]]
+          if stock and tuned:
+              s = max(r["peak_rss_gb"] for r in stock)
+              t = max(r["peak_rss_gb"] for r in tuned)
+              print(f"\nPeak RSS over all Xet cells: stock **{s:.2f} GB**, capped **{t:.2f} GB**.")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xet-download-results
+          path: |
+            xet-download-results.jsonl
+            xetlogs/
+          if-no-files-found: warn
