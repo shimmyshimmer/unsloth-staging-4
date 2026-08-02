@@ -21,6 +21,10 @@ jobs:
   download-matrix:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # unsloth_zoo.__init__ runs torch accelerator detection and raises on a CPU-only host. The
+      # Xet helpers themselves are pure stdlib, so skip that init to import them here.
+      UNSLOTH_ZOO_DISABLE_GPU_INIT: "1"
     steps:
       - uses: actions/checkout@v4
 
