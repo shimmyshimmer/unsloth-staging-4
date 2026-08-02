@@ -5,22 +5,35 @@
 # machine that does not exist here -- and no secret is configured, so every download is anonymous,
 # which is how most users download.
 #
-# Models are fetched sequentially and the cache is deleted between cells: a runner has ~14GB of
-# free disk, less than any one of these repos in full.
+# One job per repo, so the seven repos run in parallel and each stays well inside its timeout.
+# Within a job the transports run sequentially and the cache is deleted between them: a runner has
+# ~14GB of free disk, less than any one of these repos in full.
 name: xet-download-notoken-ci
 
 on:
   pull_request:
   workflow_dispatch:
 
+# Deliberately NOT cancel-in-progress: repeated runs of the same ref are the experiment. One
+# anonymous download says almost nothing about variance, and variance is half the question.
 concurrency:
-  group: xet-download-${{ github.ref }}
-  cancel-in-progress: true
+  group: xet-download-${{ github.ref }}-${{ github.run_id }}
 
 jobs:
   download-matrix:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        repo:
+          - unsloth/Qwen3.5-2B-MTP-GGUF
+          - unsloth/Qwen3.5-4B-GGUF
+          - unsloth/gemma-4-E2B-it-GGUF
+          - unsloth/Qwen3-30B-A3B-Instruct-2507
+          - unsloth/gemma-4-31B-it-GGUF
+          - unsloth/gemma-4-26B-A4B-it-GGUF
+          - unsloth/Qwen3.6-35B-A3B-GGUF
     env:
       # unsloth_zoo.__init__ runs torch accelerator detection and raises on a CPU-only host. The
       # Xet helpers themselves are pure stdlib, so skip that init to import them here.
@@ -40,9 +53,16 @@ jobs:
           python -m pip install -q "huggingface_hub>=0.36" "hf_xet>=1.5" psutil
           python -m pip install -q "git+https://github.com/unslothai/unsloth_zoo@feat/xet-http-auto-fallback"
 
+      - name: Reclaim disk
+        # The two monolithic MoE quants want several GB at once, and the default image ships ~25GB
+        # of toolchains this job never touches.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          df -h / | tail -1
+
       - name: Record the machine
         run: |
-          echo "## Runner" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Runner (${{ matrix.repo }})" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           { free -g; nproc; df -h / | tail -1; } >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -59,7 +79,8 @@ jobs:
       - name: Confirm no HF token is present
         # The whole point of this job. If a token ever leaks into the environment the numbers stop
         # describing what a normal user sees, so fail loudly rather than silently measure something
-        # else.
+        # else. BENCH_HF_TOKEN is the one deliberate exception, and it is injected per-cell by the
+        # matrix script rather than into the job environment.
         run: |
           for v in HF_TOKEN HUGGING_FACE_HUB_TOKEN HUGGINGFACE_HUB_TOKEN HF_HUB_TOKEN; do
             if [ -n "${!v:-}" ]; then echo "::error::$v is set; this job must run anonymously"; exit 1; fi
@@ -72,7 +93,10 @@ jobs:
           HF_HUB_DISABLE_TELEMETRY: "1"
           HF_HUB_ENABLE_HF_TRANSFER: "0"
           HF_HUB_DISABLE_IMPLICIT_TOKEN: "1"
-        run: python .github/scripts/xet_download_matrix.py
+          # Empty unless the repo owner set the secret. When set, the script adds token cells so the
+          # token-vs-anonymous comparison happens on the same runner, link and minute.
+          BENCH_HF_TOKEN: ${{ secrets.BENCH_HF_TOKEN }}
+        run: python .github/scripts/xet_download_matrix.py --repo "${{ matrix.repo }}"
 
       - name: Summarise
         if: always()
@@ -82,12 +106,13 @@ jobs:
           import json
           rows = [json.loads(l) for l in open("xet-download-results.jsonl")]
           print("\n## Anonymous download matrix\n")
-          print("| repo | file | transport | profile | ok | peak RSS | wall | Mbps |")
-          print("| --- | --- | --- | --- | --- | --- | --- | --- |")
+          print("| file | transport | profile | auth | ok | trunc | peak RSS | wall | Mbps |")
+          print("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
           for r in rows:
-              print(f"| {r['repo']} | {r['filename']} | {r['transport']} | {r['profile']} | "
-                    f"{'yes' if r['ok'] else 'NO'} | {r['peak_rss_gb']:.2f} GB | "
-                    f"{r['wall_seconds']:.1f}s | {r['throughput_mbps']:.0f} |")
+              print(f"| {r['filename']} | {r['transport']} | {r['profile']} | {r.get('auth','anon')} | "
+                    f"{'yes' if r['ok'] else 'NO'} | {'yes' if r.get('truncated') else ''} | "
+                    f"{r['peak_rss_gb']:.2f} GB | {r['wall_seconds']:.1f}s | "
+                    f"{r['throughput_mbps']:.0f} |")
           stock = [r for r in rows if r["transport"] == "xet" and r["profile"] == "stock" and r["ok"]]
           tuned = [r for r in rows if r["transport"] == "xet" and r["profile"] == "tuned" and r["ok"]]
           if stock and tuned:
@@ -99,7 +124,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xet-download-results
+          name: xet-download-results-${{ strategy.job-index }}
           path: |
             xet-download-results.jsonl
             xetlogs/
