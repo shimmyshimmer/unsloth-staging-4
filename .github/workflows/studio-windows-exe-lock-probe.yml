@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Temporary diagnostic for issue #7697: establish WHICH process holds
+# unsloth.exe when `unsloth studio update` cannot replace it. Renaming a running
+# image is normally permitted on Windows, so the failure needs attributing
+# rather than guessing. Not intended to be merged.
+
+name: "Windows exe lock probe (7697)"
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: exe lock probe
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Unsloth (--local, --no-torch)
+        shell: pwsh
+        run: |
+          & ./install.ps1 --local --no-torch *>&1 | Tee-Object -FilePath install.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: A. baseline -- nothing of ours running
+        run: |
+          PY="$HOME/.unsloth/studio/unsloth_studio/Scripts/python.exe"
+          echo "--- baseline: can a quiescent unsloth.exe be renamed? ---"
+          "$PY" tests/windows/exe_lock_probe.py | tee probe_baseline.json
+
+      - name: B. while a child of unsloth.exe is alive
+        run: |
+          PY="$HOME/.unsloth/studio/unsloth_studio/Scripts/python.exe"
+          EXE="$HOME/.unsloth/studio/unsloth_studio/Scripts/unsloth.exe"
+          echo "--- starting the server via unsloth.exe so it is a live process ---"
+          UNSLOTH_API_ONLY=1 "$EXE" studio -H 127.0.0.1 -p 18893 > server.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 60); do
+            curl -fsS "http://127.0.0.1:18893/api/health" >/dev/null 2>&1 && break
+            sleep 2
+          done
+          echo "--- probe while unsloth.exe is running ---"
+          "$PY" tests/windows/exe_lock_probe.py | tee probe_running.json
+          kill $SRV 2>/dev/null || true
+          sleep 5
+          echo "--- probe after it exits ---"
+          "$PY" tests/windows/exe_lock_probe.py | tee probe_after.json
+
+      - name: C. the real failure -- force pip to reinstall unsloth
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          PY="$HOME/.unsloth/studio/unsloth_studio/Scripts/python.exe"
+          echo "--- installed version before ---"
+          "$PY" -m pip show unsloth 2>&1 | grep -i ^version || true
+          # Make the installed copy differ from the checkout so the dependency
+          # pass has to replace it, which is the case the issue is about.
+          "$PY" -m pip install --no-deps --force-reinstall --no-build-isolation . 2>&1 | tail -20
+          echo "=== now the update that the issue reports ==="
+          unsloth studio update --local 2>&1 | tee update.log || true
+          echo "=== did it hit the lock? ==="
+          grep -iE "WinError 32|could not rename|being used by another process" update.log || echo "NO LOCK ERROR SEEN"
+
+      - name: Summary
+        if: always()
+        run: |
+          for f in probe_baseline.json probe_running.json probe_after.json; do
+            echo "=================== $f"; cat "$f" 2>/dev/null || echo "(missing)"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: exe-lock-probe
+          path: |
+            probe_*.json
+            update.log
+            install.log
+            server.log
+          if-no-files-found: warn
