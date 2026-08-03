@@ -1,0 +1,83 @@
+name: "staging-7679 frontend cross-platform"
+on:
+  push:
+    branches: ["pr-7679-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  frontend:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        node: ['22', '24']
+    defaults:
+      run:
+        working-directory: studio/frontend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Line endings must be LF despite the platform default
+        shell: bash
+        run: |
+          set -e
+          for f in src/features/hub/lib/format.ts tests/hub-format.test.ts; do
+            if grep -qU $'\r' "$f"; then echo "::error::$f has CRLF after checkout"; exit 1; fi
+            echo "$f: LF ok"
+          done
+
+      - run: npm ci --no-fund --no-audit
+
+      - name: Unit tests (npm script, platform default shell)
+        run: npm test
+
+      - name: Unit tests via cmd.exe
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: npm test
+
+      - name: Unit tests via PowerShell
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: npm test
+
+      - name: The hub-format regression test specifically
+        run: npm test -- --test-name-pattern="download ETA hides estimates"
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
+      - name: Formatter behaviour must be identical on this platform
+        shell: bash
+        run: |
+          node --experimental-strip-types --no-warnings -e '
+            import("./src/features/hub/lib/format.ts").then(({ formatEta }) => {
+              const cases = [
+                [(753 * 24 + 5) * 3600, ""], [86400, ""], [86399.5, ""],
+                [86399, "23h 59m left"], [3600, "1h left"], [3660, "1h 1m left"],
+                [60, "1m left"], [61, "1m 1s left"], [59, "59s left"],
+                [0, ""], [-1, ""], [Number.NaN, ""], [Infinity, ""],
+              ];
+              let bad = 0;
+              for (const [input, want] of cases) {
+                const got = formatEta(input);
+                if (got !== want) { bad++; console.log(`MISMATCH ${input}: got ${JSON.stringify(got)} want ${JSON.stringify(want)}`); }
+              }
+              console.log(bad === 0 ? `OK ${process.platform}/${process.arch} node ${process.version}` : `FAILED (${bad})`);
+              process.exit(bad === 0 ? 0 : 1);
+            });
+          '
