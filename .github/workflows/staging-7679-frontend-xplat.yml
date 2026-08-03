@@ -1,0 +1,111 @@
+name: "staging-7679 frontend cross-platform"
+on:
+  push:
+    branches: ["pr-7679-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  frontend:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        node: ['22', '24']
+    defaults:
+      run:
+        working-directory: studio/frontend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Line endings must be LF despite the platform default
+        shell: bash
+        run: |
+          set -e
+          for f in src/features/hub/lib/format.ts src/lib/transfer-stats.ts \
+                   src/features/hub/download-manager/poll-loop.ts \
+                   tests/hub-format.test.ts tests/hub-download-rate.test.ts; do
+            if grep -qU $'\r' "$f"; then echo "::error::$f has CRLF after checkout"; exit 1; fi
+            echo "$f: LF ok"
+          done
+
+      - name: The moved estimator must not be left behind at its old path
+        shell: bash
+        run: |
+          set -e
+          test ! -e src/features/chat/utils/transfer-stats.ts
+          test -e src/lib/transfer-stats.ts
+          ! grep -rn "features/chat/utils/transfer-stats" src tests
+          echo "transfer-stats move is clean"
+
+      - run: npm ci --no-fund --no-audit
+
+      - name: Unit tests (npm script, platform default shell)
+        run: npm test
+
+      - name: Unit tests via cmd.exe
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: npm test
+
+      - name: Unit tests via PowerShell
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: npm test
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
+      - name: Formatter and estimator must behave identically on this platform
+        shell: bash
+        run: |
+          node --experimental-strip-types --no-warnings -e '
+            Promise.all([
+              import("./src/features/hub/lib/format.ts"),
+              import("./src/lib/transfer-stats.ts"),
+            ]).then(([{ formatEta }, { appendSample, computeTransferStats }]) => {
+              let bad = 0;
+              const eq = (got, want, what) => {
+                if (JSON.stringify(got) !== JSON.stringify(want)) {
+                  bad++; console.log(`MISMATCH ${what}: got ${JSON.stringify(got)} want ${JSON.stringify(want)}`);
+                }
+              };
+              for (const [input, want] of [
+                [(753 * 24 + 5) * 3600, "> 24h left"], [86400, "> 24h left"], [86399.5, "> 24h left"],
+                [86399, "23h 59m left"], [3600, "1h left"], [3660, "1h 1m left"],
+                [60, "1m left"], [61, "1m 1s left"], [59, "59s left"],
+                [0, ""], [-1, ""], [Number.NaN, ""], [Infinity, ""],
+              ]) eq(formatEta(input), want, `formatEta(${input})`);
+
+              // The gate the hub download bar relies on.
+              const rate = (s, t, b) => {
+                appendSample(s, t, b);
+                const st = computeTransferStats(s, 6.8e9);
+                return st.stable ? st.rateBytesPerSecond : 0;
+              };
+              const s = [];
+              eq(rate(s, 0, 0), 0, "ramp-up poll 1");
+              eq(rate(s, 1, 100), 0, "ramp-up poll 2");
+              eq(rate(s, 2, 200), 0, "ramp-up poll 3");
+              eq(rate(s, 3, 60e6) > 0, true, "stable after 3s of progress");
+              let stalled = 0;
+              for (let t = 4; t <= 40; t++) stalled = rate(s, t, 60e6);
+              eq(stalled, 0, "stall reports no rate");
+
+              console.log(bad === 0 ? `OK ${process.platform}/${process.arch} node ${process.version}` : `FAILED (${bad})`);
+              process.exit(bad === 0 ? 0 : 1);
+            });
+          '
