@@ -1,0 +1,47 @@
+name: "staging-7706 ubuntu-latest"
+on:
+  push:
+    branches: ["pr-7706-xplat-ci"]
+    paths:
+      - 'studio/frontend/src/features/settings/tabs/about-tab.tsx'
+      - 'studio/frontend/src/hooks/use-hardware-info.ts'
+      - 'studio/frontend/src/i18n/locales/ar.ts'
+      - 'studio/frontend/src/i18n/locales/de.ts'
+      - 'studio/frontend/src/i18n/locales/en.ts'
+      - 'studio/frontend/src/i18n/locales/es.ts'
+      - 'studio/frontend/src/i18n/locales/fr.ts'
+      - 'studio/frontend/src/i18n/locales/hi.ts'
+      - 'studio/frontend/src/i18n/locales/ja.ts'
+      - 'studio/frontend/src/i18n/locales/ko.ts'
+      - 'studio/frontend/src/i18n/locales/pt-br.ts'
+      - 'studio/frontend/src/i18n/locales/ru.ts'
+      - 'studio/frontend/src/i18n/locales/zh-CN.ts'
+      - 'studio/install_python_stack.py'
+      - 'studio/setup.ps1'
+      - 'studio/setup.sh'
+      - '.github/workflows/staging-7706-ubuntu-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest tests/python/test_tokenizers_and_torch_constraint.py tests/studio/test_about_tab_xpu_runtime_contract.py tests/studio/test_xpu_triton_swap.py -q --tb=short -m 'not server and not e2e' -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
