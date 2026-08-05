@@ -3322,6 +3322,309 @@ def test_dense_quant_prefetch_needed_gates(fake_runtime, monkeypatch):
     assert backend._dense_quant_prefetch_needed(fam, {"transformer_quant": "fp8"}) is False
 
 
+# ── an auto quant never buys a second denoiser for a GGUF pick ────────────────
+
+
+_HOSTED_PREQUANT = types.SimpleNamespace(
+    kind = "repo",
+    location = "unsloth/Z-Image-Turbo-FP8",
+    filename = "Z-Image-Turbo-FP8.pt",
+    fallback_filename = "transformer_fp8.pt",
+)
+
+
+def _stub_hosted_prequant(monkeypatch, *, cached: bool):
+    """Resolve the family's hosted fp8 checkpoint, present or absent from the cache."""
+    from core.inference import diffusion as dmod
+
+    monkeypatch.setattr(dmod, "dense_transformer_supported", lambda target: True)
+    monkeypatch.setattr(
+        dmod, "select_transformer_quant_scheme", lambda target, mode, family = None: "fp8"
+    )
+    monkeypatch.setattr(dmod, "usable_prequant_source", lambda fam, scheme, **kw: _HOSTED_PREQUANT)
+    monkeypatch.setattr(dmod, "prequant_checkpoint_cached", lambda source, **kw: cached)
+
+
+def _spy_dense_quant(monkeypatch):
+    """Record every dense/prequant fast-path build and keep it from running.
+
+    Keyed by backend INSTANCE: the patch is class-level, and an earlier test's begin_load leaves a
+    daemon thread that can still be loading while this one runs, so a bare count is not this
+    test's. Read it through ``_dense_calls``."""
+    calls: list = []
+
+    def _record(self, *a, **k):
+        calls.append((self, k.get("prequant_path")))
+        return None, None
+
+    monkeypatch.setattr(DiffusionBackend, "_load_dense_quant_pipeline", _record)
+    return calls
+
+
+def _dense_calls(calls, backend):
+    """The recorded fast-path builds belonging to ``backend`` alone."""
+    return [prequant_path for (owner, prequant_path) in calls if owner is backend]
+
+
+def test_auto_quant_declines_an_uncached_hosted_prequant(fake_runtime, tmp_path, monkeypatch):
+    # The reported bug: picking unsloth/Z-Image-GGUF fetched the GGUF and THEN a 6.29 GB hosted fp8
+    # checkpoint that became the denoiser, so the GGUF was never used.
+    _stub_hosted_prequant(monkeypatch, cached = False)
+    calls = _spy_dense_quant(monkeypatch)
+    backend = DiffusionBackend()
+    _force_cuda_target(backend, monkeypatch)
+    (tmp_path / "m.gguf").write_bytes(b"x")
+
+    status = backend.load_pipeline(str(tmp_path), gguf_filename = "m.gguf", family_override = "z-image")
+
+    # The fast path never ran, so nothing fetched a second transformer.
+    assert _dense_calls(calls, backend) == []
+    assert status["loaded"] is True
+    assert status["transformer_quant"] is None
+    assert _FakeTransformer.last["path"]  # the GGUF the user picked
+
+
+def test_auto_quant_takes_a_hosted_prequant_that_is_already_cached(
+    fake_runtime, tmp_path, monkeypatch
+):
+    # Free shortcuts are still taken: dense+torchao beats per-matmul dequant and costs no bytes.
+    _stub_hosted_prequant(monkeypatch, cached = True)
+    calls = _spy_dense_quant(monkeypatch)
+    backend = DiffusionBackend()
+    _force_cuda_target(backend, monkeypatch)
+    (tmp_path / "m.gguf").write_bytes(b"x")
+
+    backend.load_pipeline(str(tmp_path), gguf_filename = "m.gguf", family_override = "z-image")
+
+    assert len(_dense_calls(calls, backend)) == 1
+
+
+@pytest.mark.parametrize("loras", [[("adapter", 0.0)], [("a", 0.0), ("b", 0.0)]])
+def test_all_zero_weight_loras_do_not_look_like_a_bake(loras, fake_runtime, tmp_path, monkeypatch):
+    # LoraSpec and every sibling check read weight 0 as disabled, so plain truthiness on the list
+    # would call this a bake, skip the decline and fetch the dense companion for a request that
+    # applies no adapter at all.
+    _stub_hosted_prequant(monkeypatch, cached = False)
+    calls = _spy_dense_quant(monkeypatch)
+    backend = DiffusionBackend()
+    _force_cuda_target(backend, monkeypatch)
+    (tmp_path / "m.gguf").write_bytes(b"x")
+
+    backend.load_pipeline(
+        str(tmp_path), gguf_filename = "m.gguf", family_override = "z-image", loras = loras
+    )
+
+    assert _dense_calls(calls, backend) == []
+
+
+def test_a_weighted_lora_is_still_treated_as_a_bake(fake_runtime, tmp_path, monkeypatch):
+    # The other direction, so the zero-weight fix does not turn every bake into a GGUF load: a
+    # real adapter must still take the dense route, which this runtime cannot complete and so
+    # reports rather than silently dropping the adapter.
+    _stub_hosted_prequant(monkeypatch, cached = False)
+    _spy_dense_quant(monkeypatch)
+    backend = DiffusionBackend()
+    _force_cuda_target(backend, monkeypatch)
+    (tmp_path / "m.gguf").write_bytes(b"x")
+
+    with pytest.raises(RuntimeError, match = "LoRA adapters could not be applied"):
+        backend.load_pipeline(
+            str(tmp_path),
+            gguf_filename = "m.gguf",
+            family_override = "z-image",
+            loras = [("adapter", 0.8)],
+        )
+
+
+def test_an_explicit_quant_request_still_downloads_the_hosted_prequant(
+    fake_runtime, tmp_path, monkeypatch
+):
+    # Only the AUTO-derived case is restricted: asking for fp8 asks for the artifact serving it.
+    _stub_hosted_prequant(monkeypatch, cached = False)
+    calls = _spy_dense_quant(monkeypatch)
+    backend = DiffusionBackend()
+    _force_cuda_target(backend, monkeypatch)
+    (tmp_path / "m.gguf").write_bytes(b"x")
+
+    backend.load_pipeline(
+        str(tmp_path),
+        gguf_filename = "m.gguf",
+        family_override = "z-image",
+        transformer_quant = "fp8",
+    )
+
+    assert len(_dense_calls(calls, backend)) == 1
+
+
+def test_a_baked_lora_load_is_unaffected_by_the_prequant_cache(fake_runtime, tmp_path, monkeypatch):
+    # A LoRA bake needs the DENSE transformer (adapters attach before quantize_) and the GGUF fallback cannot carry the adapters, so it must not be declined here.
+    _stub_hosted_prequant(monkeypatch, cached = False)
+    calls = _spy_dense_quant(monkeypatch)
+    backend = DiffusionBackend()
+    _force_cuda_target(backend, monkeypatch)
+    (tmp_path / "m.gguf").write_bytes(b"x")
+
+    with pytest.raises(RuntimeError, match = "LoRA"):
+        backend.load_pipeline(
+            str(tmp_path),
+            gguf_filename = "m.gguf",
+            family_override = "z-image",
+            loras = [("adapter", 1.0)],
+        )
+
+    assert len(_dense_calls(calls, backend)) == 1
+
+
+@pytest.mark.parametrize(
+    "lora_specs, consults_prequant",
+    [([("adapter", 0.0)], True), ([("adapter", 0.8)], False), (None, True)],
+)
+def test_the_dense_builder_skips_the_prequant_only_for_a_real_bake(
+    lora_specs, consults_prequant, fake_runtime, monkeypatch
+):
+    # The decline let the auto path continue, but the raw list was handed on and this builder's own
+    # gate read it as truthy, skipping the cached prequant and building the dense transformer for
+    # adapters that apply nothing. The rule has to hold here too, not just at the decline.
+    import contextlib
+
+    from core.inference import diffusion as dmod
+
+    consulted: list = []
+    monkeypatch.setattr(
+        dmod, "select_transformer_quant_scheme", lambda target, mode, family = None: "fp8"
+    )
+    monkeypatch.setattr(
+        dmod, "resolve_prequant_source", lambda *a, **k: consulted.append(1) or None
+    )
+    backend = DiffusionBackend()
+    target = _force_cuda_target(backend, monkeypatch)
+
+    with contextlib.suppress(Exception):  # the build cannot complete here; the gate is the subject
+        backend._load_dense_quant_pipeline(
+            object(),
+            object(),
+            "Tongyi-MAI/Z-Image-Turbo",
+            "cuda",
+            None,
+            None,
+            target,
+            "fp8",
+            None,
+            fam = detect_family("unsloth/Z-Image-GGUF"),
+            lora_specs = lora_specs,
+        )
+
+    assert bool(consulted) is consults_prequant
+
+
+def test_the_plan_does_not_force_a_dense_bake_for_disabled_adapters(fake_runtime, monkeypatch):
+    # The gate above stopped calling it a bake, but the candidate sizing right below still passed
+    # force_dense on the raw list, so the plan sized a dense LoRA bake and staged the base repo
+    # transformer/ shards while the load ran the cached prequant. Both must read the same rule.
+    from core.inference import diffusion as dmod
+
+    backend = DiffusionBackend()
+    _force_cuda_target(backend, monkeypatch)
+    fam = detect_family("unsloth/Z-Image-GGUF")
+    forced: list = []
+    monkeypatch.setattr(
+        dmod,
+        "resolve_dense_quant_candidate",
+        lambda **kw: forced.append(kw.get("force_dense")) or types.SimpleNamespace(prequant = True),
+    )
+    # Cached, so the decline does not fire and sizing is actually reached.
+    _stub_hosted_prequant(monkeypatch, cached = True)
+
+    backend._dense_quant_prefetch_needed(fam, {"loras": [("adapter", 0.0)]})
+    backend._dense_quant_prefetch_needed(fam, {"loras": [("adapter", 0.8)]})
+
+    assert forced == [False, True]
+
+
+def test_the_plan_reads_pydantic_lora_specs_as_the_load_reads_tuples(fake_runtime, monkeypatch):
+    # /images/load converts to (id, weight) tuples but /images/download-plan passes the LoraSpec
+    # models through, and unpacking a pydantic model yields its (field, value) pairs, so a plain
+    # (_lid, w) unpack binds w to ("weight", 0.0) and reads a disabled adapter as an active bake.
+    from core.inference import diffusion as dmod
+    from models.inference import LoraSpec
+
+    backend = DiffusionBackend()
+    _force_cuda_target(backend, monkeypatch)
+    fam = detect_family("unsloth/Z-Image-GGUF")
+    consulted: list = []
+    monkeypatch.setattr(
+        dmod,
+        "resolve_dense_quant_candidate",
+        lambda **kw: consulted.append(kw) or types.SimpleNamespace(prequant = True),
+    )
+    _stub_hosted_prequant(monkeypatch, cached = False)
+
+    assert (
+        backend._dense_quant_prefetch_needed(fam, {"loras": [LoraSpec(id = "adapter", weight = 0)]})
+        is False
+    )
+    assert consulted == []  # declined on the cache verdict, never sized as a bake
+
+    # A weighted spec is still a bake, so the normalisation did not disable the candidate path.
+    backend._dense_quant_prefetch_needed(fam, {"loras": [LoraSpec(id = "adapter", weight = 0.8)]})
+    assert consulted != []
+
+
+def test_the_plan_reads_zero_weight_loras_exactly_as_the_load_does(fake_runtime, monkeypatch):
+    # The plan and the load must agree on what a bake is. Gating the prefetch on the raw list while
+    # load_pipeline gates on active weights stages the base transformer/ shards for a load that
+    # will run the GGUF. The return value alone does not show it, so this asserts the decline
+    # happened on the cache verdict, BEFORE any candidate sizing, exactly as with no loras at all.
+    from core.inference import diffusion as dmod
+
+    backend = DiffusionBackend()
+    _force_cuda_target(backend, monkeypatch)
+    fam = detect_family("unsloth/Z-Image-GGUF")
+    consulted: list = []
+    monkeypatch.setattr(
+        dmod,
+        "resolve_dense_quant_candidate",
+        lambda **kw: consulted.append(kw) or types.SimpleNamespace(prequant = True),
+    )
+    _stub_hosted_prequant(monkeypatch, cached = False)
+
+    for loras in ([("adapter", 0.0)], [("a", 0.0), ("b", 0.0)]):
+        consulted.clear()
+        assert backend._dense_quant_prefetch_needed(fam, {"loras": loras}) is False
+        assert consulted == []
+
+    # A real bake still sizes the dense build, so the fix did not disable the candidate path.
+    consulted.clear()
+    backend._dense_quant_prefetch_needed(fam, {"loras": [("adapter", 0.8)]})
+    assert consulted != []
+
+
+def test_dense_quant_prefetch_declines_with_the_load(fake_runtime, monkeypatch):
+    # The plan must call it as the loader does: a declined prequant means the GGUF runs, so the
+    # prefetch must not widen to the base transformer/ shards.
+    from core.inference import diffusion as dmod
+
+    backend = DiffusionBackend()
+    _force_cuda_target(backend, monkeypatch)
+    fam = detect_family("unsloth/Z-Image-GGUF")
+    consulted: list = []
+    monkeypatch.setattr(
+        dmod,
+        "resolve_dense_quant_candidate",
+        lambda **kw: consulted.append(kw) or types.SimpleNamespace(prequant = True),
+    )
+
+    _stub_hosted_prequant(monkeypatch, cached = False)
+    assert backend._dense_quant_prefetch_needed(fam, {}) is False
+    # Declined on the cache verdict alone, BEFORE any candidate sizing.
+    assert consulted == []
+    # Cached, or an explicit request: the candidate decides as before.
+    assert backend._dense_quant_prefetch_needed(fam, {"transformer_quant": "fp8"}) is False
+    _stub_hosted_prequant(monkeypatch, cached = True)
+    assert backend._dense_quant_prefetch_needed(fam, {}) is False
+    assert len(consulted) == 2
+
+
 def test_diffusion_status_response_carries_resolved():
     # The backend records per-control auto-policy provenance on state.resolved, so the response model must declare the field or Pydantic drops it.
     from models.inference import DiffusionStatusResponse
@@ -3958,6 +4261,56 @@ def test_download_plan_keeps_the_dense_encoder_when_the_precast_repo_is_unavaila
     base = next(e for e in plan["entries"] if e["repo_id"] == "black-forest-labs/FLUX.1-dev")
     assert "text_encoder/model.safetensors" in base["files"]
     assert not any(e["repo_id"] == "unsloth/does-not-exist" for e in plan["entries"])
+
+
+_ZIMAGE_BASE_SIBLINGS = [
+    _FakeSibling("model_index.json", 1000),
+    _FakeSibling("transformer/diffusion_pytorch_model-00001-of-00002.safetensors", 12 * GB),
+    _FakeSibling("text_encoder/model.safetensors", 8 * GB),
+    _FakeSibling("vae/diffusion_pytorch_model.safetensors", 300),
+]
+
+
+def test_download_plan_stages_no_second_denoiser_for_an_uncached_prequant(monkeypatch):
+    # The plan drives the download manager, so it must agree with the load: a declined prequant
+    # stages neither its .pt nor the base transformer/ shards the dense build wanted.
+    _fake_hf_api(
+        monkeypatch,
+        {
+            "unsloth/Z-Image-GGUF": [_FakeSibling("Z-Image-Turbo-Q4_K_M.gguf", 4 * GB)],
+            "Tongyi-MAI/Z-Image-Turbo": _ZIMAGE_BASE_SIBLINGS,
+        },
+    )
+    monkeypatch.setattr(
+        "core.inference.diffusion._resolve_base_repo", lambda *a, **k: "Tongyi-MAI/Z-Image-Turbo"
+    )
+    _stub_hosted_prequant(monkeypatch, cached = False)
+
+    plan = DiffusionBackend().download_plan(
+        "unsloth/Z-Image-GGUF", gguf_filename = "Z-Image-Turbo-Q4_K_M.gguf"
+    )
+
+    assert [e["repo_id"] for e in plan["entries"]] == [
+        "unsloth/Z-Image-GGUF",
+        "Tongyi-MAI/Z-Image-Turbo",
+    ]
+    checkpoint, base = plan["entries"]
+    assert checkpoint["files"] == ["Z-Image-Turbo-Q4_K_M.gguf"]
+    # No hosted checkpoint and no dense shards: the companions are all the base repo owes.
+    assert not any(f.endswith(".pt") for e in plan["entries"] for f in e["files"])
+    assert not any(f.startswith("transformer/") for f in base["files"])
+    assert "text_encoder/model.safetensors" in base["files"]
+    assert plan["total_bytes"] == 4 * GB + base["bytes"] < 17 * GB
+
+
+def test_download_plan_for_a_pipeline_kind_ignores_the_prequant_cache(monkeypatch):
+    # Only a GGUF pick is restricted: a full pipeline's transformer IS the repo's.
+    _fake_hf_api(monkeypatch, {"unsloth/some-pipeline": _ZIMAGE_BASE_SIBLINGS})
+    _stub_hosted_prequant(monkeypatch, cached = False)
+
+    plan = DiffusionBackend().download_plan("unsloth/some-pipeline", model_kind = "pipeline")
+
+    assert any(f.startswith("transformer/") for f in plan["entries"][0]["files"])
 
 
 # ── teardown fence ────────────────────────────────────────────────────────────
