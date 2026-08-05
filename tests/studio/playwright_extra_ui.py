@@ -565,10 +565,14 @@ with sync_playwright() as p:
             # recovery; on Linux/Windows a crash and any live-page failure stay a hard fail.
             try:
                 voice_tab.click()
-                page.get_by_label("Dictation engine").click()
-                page.get_by_role("option", name = "Local transcription").click()
-                page.get_by_label("Speech recognition model").click()
-                page.get_by_placeholder("Search model").fill("whisper")
+                # All four by test id. Every one of these was bound to
+                # t()-rendered English, and they gate the same popover, so a
+                # reword of any of them reproduces the #7835 outage a line or
+                # two earlier than the one that actually fired.
+                page.get_by_test_id("dictation-engine-trigger").click()
+                page.get_by_test_id("dictation-engine-model").click()
+                page.get_by_test_id("stt-model-trigger").click()
+                page.get_by_test_id("stt-model-search").fill("whisper")
                 results = page.get_by_test_id("stt-model-results")
                 page.wait_for_function(
                     """() => {
