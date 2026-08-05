@@ -320,6 +320,7 @@ from routes.preview import router as preview_router
 from hub.routes import (
     inventory_router as hub_inventory_router,
     datasets_router as hub_datasets_router,
+    hf_proxy_router as hub_hf_proxy_router,
     token_router as hub_token_router,
 )
 from picker.routes import templates_router as picker_templates_router
@@ -1167,6 +1168,9 @@ app.add_middleware(
     allow_credentials = True,
     allow_methods = ["*"],
     allow_headers = ["*"],
+    # Link and ETag are not CORS-safelisted, so cross-origin webviews (Tauri)
+    # could not read the pagination cursor from /api/hub/hf-proxy responses.
+    expose_headers = ["Link", "ETag"],
 )
 
 
@@ -1205,6 +1209,7 @@ app.include_router(hub_inventory_router, prefix = "/api/hub", tags = ["hub"])
 app.include_router(hub_datasets_router, prefix = "/api/hub/datasets", tags = ["hub"])
 app.include_router(picker_templates_router, prefix = "/api/picker", tags = ["picker"])
 app.include_router(hub_token_router, prefix = "/api/hub", tags = ["hub"])
+app.include_router(hub_hf_proxy_router, prefix = "/api/hub", tags = ["hub"])
 
 # Re-wrap client-error responses on the /v1/* surface into OpenAI/Anthropic
 # error envelopes; non-/v1 paths keep FastAPI's default {"detail": ...} shape.
