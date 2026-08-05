@@ -38,6 +38,7 @@ class CheckFormatResponse(BaseModel):
     detected_audio_column: Optional[str] = None
     detected_text_column: Optional[str] = None
     detected_speaker_column: Optional[str] = None
+    chat_column: Optional[str] = None
     preview_samples: Optional[List[Dict]] = None
     total_rows: Optional[int] = None
     warning: Optional[str] = None
@@ -94,6 +95,7 @@ class CachedDatasetItem(BaseModel):
     repo_id: str
     size_bytes: int = 0
     cache_path: Optional[str] = None
+    load_cache_path: Optional[str] = None
     processed_cache: bool = False
     partial: bool = False
     partial_transport: Optional[str] = None

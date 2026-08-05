@@ -1003,6 +1003,7 @@ def finish_run(
     error_message: Optional[str] = None,
     clear_output_dir: bool = False,
     resume_blocked: bool = False,
+    config_json: Optional[str] = None,
 ) -> None:
     conn = get_connection()
     try:
@@ -1011,6 +1012,7 @@ def finish_run(
             UPDATE training_runs
             SET status = ?, ended_at = ?, final_step = ?, final_loss = ?,
                 duration_seconds = ?, loss_sparkline = ?,
+                config_json = COALESCE(?, config_json),
                 output_dir = CASE
                     WHEN resume_blocked = 1 OR ? = 1 THEN NULL
                     WHEN ? IS NOT NULL THEN ?
@@ -1028,6 +1030,7 @@ def finish_run(
                 final_loss,
                 duration_seconds,
                 loss_sparkline,
+                config_json,
                 int(clear_output_dir),
                 output_dir,
                 output_dir,
@@ -1105,6 +1108,22 @@ def update_run_output_dir(id: str, output_dir: Optional[str]) -> None:
             (output_dir, id),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def update_run_config_json(id: str, config_json: str) -> bool:
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE training_runs SET config_json = ?
+            WHERE id = ? AND status = 'running'
+            """,
+            (config_json, id),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
     finally:
         conn.close()
 
@@ -1336,6 +1355,18 @@ def delete_run(id: str) -> None:
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+def list_other_run_output_dirs(exclude_id: str) -> list[str]:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT output_dir FROM training_runs WHERE output_dir IS NOT NULL AND id != ?",
+            (exclude_id,),
+        ).fetchall()
+        return [str(row[0]) for row in rows]
     finally:
         conn.close()
 

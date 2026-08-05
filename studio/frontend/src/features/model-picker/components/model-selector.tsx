@@ -12,6 +12,7 @@ import {
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { usePlatformStore } from "@/config/env";
 import { isCustomProviderType } from "@/features/chat";
+import { useT } from "@/i18n";
 import { ChevronDownStandardIcon } from "@/lib/chevron-icons";
 import { cn } from "@/lib/utils";
 import {
@@ -369,6 +370,7 @@ function ModelSelectorContent({
   task?: HfTaskFilter;
   catalog?: CatalogGroup[];
 }) {
+  const t = useT();
   const hasSelection = Boolean(value);
   const chatOnly = usePlatformStore((s) => s.isChatOnly());
   const hasExternal = externalModels.length > 0;
@@ -591,83 +593,83 @@ function ModelSelectorContent({
           />
         ) : (
           <>
-        {tabs.length > 1 ? (
-          <PillTabs
-            ariaLabel="Model source"
-            tabs={tabs}
-            value={effectiveTab}
-            onValueChange={setActiveTab}
-            fit={true}
-            className="mb-2"
-          />
-        ) : null}
-
-        {effectiveTab === "hub" ? (
-          <HubModelPicker
-            models={models}
-            loraModels={fineTunedModels}
-            externalModels={externalModels}
-            value={value}
-            onSelect={handlePick}
-            onFoldersChange={onFoldersChange}
-            onBrowseHub={onBrowseHub}
-            onModelsChange={onModelsChange}
-            onConfigure={openConfigPage}
-            deleteDisabled={deleteDisabled}
-            onEject={hasSelection && onEject ? onEject : undefined}
-            task={task}
-            catalog={catalog}
-            section={effectiveHubSection}
-            sectionToggle={
+            {tabs.length > 1 ? (
               <PillTabs
-                ariaLabel="Hub section"
-                tabs={hubSectionTabs}
-                value={effectiveHubSection}
-                onValueChange={(next) => {
-                  const section = next as HubSection;
-                  setHubSection(section);
-                  saveLastHubSection(section);
-                }}
+                ariaLabel={t("picker.modelSourceAriaLabel")}
+                tabs={tabs}
+                value={effectiveTab}
+                onValueChange={setActiveTab}
                 fit={true}
+                className="mb-2"
               />
-            }
-          />
-        ) : null}
+            ) : null}
 
-        {effectiveTab === "external" ? (
-          <ExternalModelPicker
-            externalModels={externalModels}
-            value={value}
-            onSelect={onSelect}
-          />
-        ) : null}
+            {effectiveTab === "hub" ? (
+              <HubModelPicker
+                models={models}
+                loraModels={fineTunedModels}
+                externalModels={externalModels}
+                value={value}
+                onSelect={handlePick}
+                onFoldersChange={onFoldersChange}
+                onBrowseHub={onBrowseHub}
+                onModelsChange={onModelsChange}
+                onConfigure={openConfigPage}
+                deleteDisabled={deleteDisabled}
+                onEject={hasSelection && onEject ? onEject : undefined}
+                task={task}
+                catalog={catalog}
+                section={effectiveHubSection}
+                sectionToggle={
+                  <PillTabs
+                    ariaLabel={t("picker.hubSectionAriaLabel")}
+                    tabs={hubSectionTabs}
+                    value={effectiveHubSection}
+                    onValueChange={(next) => {
+                      const section = next as HubSection;
+                      setHubSection(section);
+                      saveLastHubSection(section);
+                    }}
+                    fit={true}
+                  />
+                }
+              />
+            ) : null}
 
-        {onPickLocalModel ? (
-          <div className="mt-1.5 border-t border-border/70 pt-1.5">
-            <button
-              type="button"
-              onClick={onPickLocalModel}
-              className="flex w-full items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60"
-              title="Pick a model file from disk"
-            >
-              <HugeiconsIcon icon={FolderSearchIcon} className="size-3.5" />
-              Pick a model file from disk
-            </button>
-          </div>
-        ) : null}
-        {effectiveTab !== "hub" && hasSelection && onEject ? (
-          <div className="mt-1.5 border-t border-border/70 pt-1.5 pb-2">
-            <button
-              type="button"
-              onClick={onEject}
-              className="flex w-full items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-destructive transition-colors hover:bg-destructive/10"
-              title="Eject model"
-            >
-              <HugeiconsIcon icon={RemoveCircleIcon} className="size-3.5" />
-              Eject loaded model
-            </button>
-          </div>
-        ) : null}
+            {effectiveTab === "external" ? (
+              <ExternalModelPicker
+                externalModels={externalModels}
+                value={value}
+                onSelect={onSelect}
+              />
+            ) : null}
+
+            {onPickLocalModel ? (
+              <div className="mt-1.5 border-t border-border/70 pt-1.5">
+                <button
+                  type="button"
+                  onClick={onPickLocalModel}
+                  className="flex w-full items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60"
+                  title={t("picker.pickModelFile")}
+                >
+                  <HugeiconsIcon icon={FolderSearchIcon} className="size-3.5" />
+                  {t("picker.pickModelFile")}
+                </button>
+              </div>
+            ) : null}
+            {effectiveTab !== "hub" && hasSelection && onEject ? (
+              <div className="mt-1.5 border-t border-border/70 pt-1.5 pb-2">
+                <button
+                  type="button"
+                  onClick={onEject}
+                  className="flex w-full items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-destructive transition-colors hover:bg-destructive/10"
+                  title={t("picker.ejectLoadedModel")}
+                >
+                  <HugeiconsIcon icon={RemoveCircleIcon} className="size-3.5" />
+                  {t("picker.ejectLoadedModel")}
+                </button>
+              </div>
+            ) : null}
           </>
         )}
       </TooltipProvider>
