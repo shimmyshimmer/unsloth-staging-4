@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { Field, FieldLabel } from "@/components/ui/field";
 import {
   Select,
   SelectContent,
@@ -14,11 +15,8 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import {
-  Field,
-  FieldLabel,
-} from "@/components/ui/field";
 import { useHfDatasetSplits } from "@/hooks";
+import { useT } from "@/i18n";
 import { InformationCircleIcon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { useEffect } from "react";
@@ -48,6 +46,7 @@ export function HfDatasetSubsetSplitSelectors({
   datasetEvalSplit,
   setDatasetEvalSplit,
 }: Props) {
+  const t = useT();
   const {
     subsets: hfSubsets,
     splits: hfSplits,
@@ -87,44 +86,49 @@ export function HfDatasetSubsetSplitSelectors({
 
   const showDropdowns = !isLoading && !error && hfSubsets.length > 0;
 
+  const selectorFields = (disabled = false) => (
+    <>
+      <SelectorDropdown
+        variant={variant}
+        label={t("studio.dataset.selectors.subset")}
+        tooltip={t("studio.dataset.selectors.subsetTooltip")}
+        value={disabled ? null : datasetSubset}
+        onChange={setDatasetSubset}
+        options={disabled ? [] : hfSubsets}
+        placeholder={t("studio.dataset.selectors.selectSubset")}
+        disabled={disabled}
+      />
+      <SelectorDropdown
+        variant={variant}
+        label={t("studio.dataset.selectors.trainSplit")}
+        tooltip={t("studio.dataset.selectors.trainSplitTooltip")}
+        value={disabled ? null : datasetSplit}
+        onChange={setDatasetSplit}
+        options={disabled ? [] : hfSplits}
+        placeholder={t("studio.dataset.selectors.selectSplit")}
+        disabled={disabled}
+      />
+      <SelectorDropdown
+        variant={variant}
+        label={t("studio.dataset.selectors.evaluationSplit")}
+        tooltip={t("studio.dataset.selectors.evaluationSplitTooltip")}
+        value={disabled ? null : datasetEvalSplit}
+        onChange={setDatasetEvalSplit}
+        options={disabled ? [] : hfSplits}
+        placeholder={t("studio.dataset.selectors.none")}
+        noneLabel={t("studio.dataset.selectors.none")}
+        allowNone={true}
+        disabled={disabled}
+      />
+    </>
+  );
+
   return (
     <>
       {showPlaceholderDropdowns && (
-        <>
-          <div className="grid min-w-0 gap-3 sm:grid-cols-2">
-            <SelectorDropdown
-              variant={variant}
-              label="Subset"
-              tooltip="Select which subset (config) of the dataset to use."
-              value={null}
-              onChange={setDatasetSubset}
-              options={[]}
-              placeholder="Select a subset..."
-              disabled={true}
-            />
-            <SelectorDropdown
-              variant={variant}
-              label="Train Split"
-              tooltip="Select which split to use for training."
-              value={null}
-              onChange={setDatasetSplit}
-              options={[]}
-              placeholder="Select a split..."
-              disabled={true}
-            />
-          </div>
-          <SelectorDropdown
-            variant={variant}
-            label="Evaluation Split"
-            tooltip="Select which split to use for evaluation. None means no evaluation during training."
-            value={null}
-            onChange={setDatasetEvalSplit}
-            options={[]}
-            placeholder="None"
-            allowNone
-            disabled={true}
-          />
-        </>
+        <div className="grid min-w-0 gap-3 sm:grid-cols-3">
+          {selectorFields(true)}
+        </div>
       )}
 
       {isLoading && (
@@ -136,7 +140,7 @@ export function HfDatasetSubsetSplitSelectors({
           }
         >
           <Spinner className="size-3.5" />
-          Loading dataset configs and splits...
+          {t("studio.dataset.selectors.loading")}
         </div>
       )}
 
@@ -152,63 +156,14 @@ export function HfDatasetSubsetSplitSelectors({
         </div>
       )}
 
-      {showDropdowns && (
-        <>
-          {variant === "studio" ? (
-            <div className="grid min-w-0 gap-3 sm:grid-cols-2">
-              <SelectorDropdown
-                variant={variant}
-                label="Subset"
-                tooltip="Select which subset (config) of the dataset to use."
-                value={datasetSubset}
-                onChange={setDatasetSubset}
-                options={hfSubsets}
-                placeholder="Select a subset..."
-              />
-              <SelectorDropdown
-                variant={variant}
-                label="Train Split"
-                tooltip="Select which split to use for training."
-                value={datasetSplit}
-                onChange={setDatasetSplit}
-                options={hfSplits}
-                placeholder="Select a split..."
-              />
-            </div>
-          ) : (
-            <>
-              <SelectorDropdown
-                variant={variant}
-                label="Subset"
-                tooltip="Select which subset (config) of the dataset to use."
-                value={datasetSubset}
-                onChange={setDatasetSubset}
-                options={hfSubsets}
-                placeholder="Select a subset..."
-              />
-              <SelectorDropdown
-                variant={variant}
-                label="Train Split"
-                tooltip="Select which split to use for training."
-                value={datasetSplit}
-                onChange={setDatasetSplit}
-                options={hfSplits}
-                placeholder="Select a split..."
-              />
-            </>
-          )}
-          <SelectorDropdown
-            variant={variant}
-            label="Evaluation Split"
-            tooltip="Select which split to use for evaluation. None means no evaluation during training."
-            value={datasetEvalSplit}
-            onChange={setDatasetEvalSplit}
-            options={hfSplits}
-            placeholder="None"
-            allowNone
-          />
-        </>
-      )}
+      {showDropdowns &&
+        (variant === "studio" ? (
+          <div className="grid min-w-0 gap-3 sm:grid-cols-3">
+            {selectorFields()}
+          </div>
+        ) : (
+          selectorFields()
+        ))}
     </>
   );
 }
@@ -221,6 +176,7 @@ function SelectorDropdown({
   onChange,
   options,
   placeholder,
+  noneLabel,
   allowNone = false,
   disabled = false,
 }: {
@@ -231,11 +187,11 @@ function SelectorDropdown({
   onChange: (v: string | null) => void;
   options: string[];
   placeholder: string;
+  noneLabel?: string;
   allowNone?: boolean;
   disabled?: boolean;
 }) {
-  const selectValue =
-    value ?? (allowNone && !disabled ? "_none" : undefined);
+  const selectValue = value ?? (allowNone && !disabled ? "_none" : undefined);
 
   if (variant === "wizard") {
     return (
@@ -254,9 +210,7 @@ function SelectorDropdown({
                 />
               </button>
             </TooltipTrigger>
-            <TooltipContent className="max-w-xs">
-              {tooltip}
-            </TooltipContent>
+            <TooltipContent className="max-w-xs">{tooltip}</TooltipContent>
           </Tooltip>
         </FieldLabel>
         <Select
@@ -268,9 +222,7 @@ function SelectorDropdown({
             <SelectValue placeholder={placeholder} />
           </SelectTrigger>
           <SelectContent>
-            {allowNone && (
-              <SelectItem value="_none">None</SelectItem>
-            )}
+            {allowNone && <SelectItem value="_none">{noneLabel}</SelectItem>}
             {options.map((opt) => (
               <SelectItem key={opt} value={opt}>
                 {opt}
@@ -292,15 +244,10 @@ function SelectorDropdown({
               type="button"
               className="text-foreground/70 hover:text-foreground"
             >
-              <HugeiconsIcon
-                icon={InformationCircleIcon}
-                className="size-3"
-              />
+              <HugeiconsIcon icon={InformationCircleIcon} className="size-3" />
             </button>
           </TooltipTrigger>
-          <TooltipContent>
-            {tooltip}
-          </TooltipContent>
+          <TooltipContent>{tooltip}</TooltipContent>
         </Tooltip>
       </span>
       <Select
@@ -312,9 +259,7 @@ function SelectorDropdown({
           <SelectValue placeholder={placeholder} />
         </SelectTrigger>
         <SelectContent>
-          {allowNone && (
-            <SelectItem value="_none">None</SelectItem>
-          )}
+          {allowNone && <SelectItem value="_none">{noneLabel}</SelectItem>}
           {options.map((opt) => (
             <SelectItem key={opt} value={opt}>
               {opt}

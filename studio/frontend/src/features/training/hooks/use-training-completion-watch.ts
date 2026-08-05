@@ -4,7 +4,15 @@
 import { useEffect } from "react";
 
 import { getTrainingStatus } from "../api/train-api";
-import { useTrainingRuntimeStore } from "../stores/training-runtime-store";
+import { createSingleFlightRequest } from "../lib/single-flight-request";
+import {
+  isTrainingStatusRequestCurrent,
+  trainingStatusRequestKey,
+} from "../lib/training-status-request";
+import {
+  isTrainingStartPending,
+  useTrainingRuntimeStore,
+} from "../stores/training-runtime-store";
 
 const WATCH_INTERVAL_MS = 6000;
 
@@ -17,24 +25,27 @@ const WATCH_INTERVAL_MS = 6000;
  * progress (no traffic when idle). Mount once in an always-rendered shell.
  */
 export function useTrainingCompletionWatch(): void {
-  const active = useTrainingRuntimeStore(
-    (s) => s.isTrainingRunning || s.isStarting,
-  );
+  const active = useTrainingRuntimeStore(isTrainingStartPending);
 
   useEffect(() => {
-    if (!active) return;
+    if (!active) {
+      return;
+    }
     let cancelled = false;
 
-    const tick = async () => {
+    const tick = createSingleFlightRequest(async () => {
+      const initial = useTrainingRuntimeStore.getState();
+      const requestKey = trainingStatusRequestKey(initial);
       try {
-        const status = await getTrainingStatus();
-        if (!cancelled) {
-          useTrainingRuntimeStore.getState().applyStatus(status);
+        const status = await getTrainingStatus(requestKey);
+        const runtime = useTrainingRuntimeStore.getState();
+        if (!cancelled && isTrainingStatusRequestCurrent(requestKey, runtime)) {
+          runtime.applyStatus(status);
         }
       } catch {
         // Transient network/auth hiccup; the next tick retries.
       }
-    };
+    });
 
     const id = window.setInterval(tick, WATCH_INTERVAL_MS);
     return () => {

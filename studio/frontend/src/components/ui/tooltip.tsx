@@ -280,9 +280,12 @@ function Tooltip({
 
 function TooltipTrigger({
   onClick,
+  disableClickToggle = false,
   ref,
   ...props
-}: React.ComponentProps<typeof TooltipPrimitive.Trigger>) {
+}: React.ComponentProps<typeof TooltipPrimitive.Trigger> & {
+  disableClickToggle?: boolean;
+}) {
   const toggle = useContext(TooltipToggleCtx);
   const setTriggerElement = useContext(TooltipTriggerElementCtx);
 
@@ -305,13 +308,13 @@ function TooltipTrigger({
       // With a mouse, hover already shows it and pinning only strands it. Let
       // Radix's own close-on-click run instead. `toggle` is absent when the
       // consumer controls `open`, where a pin would be dead state anyway.
-      if (!toggle || !isTouchClick(e)) return;
+      if (disableClickToggle || !toggle || !isTouchClick(e)) return;
       // preventDefault keeps Radix Tooltip's internal close-on-click from
       // undoing the tap-toggle below (its composed handler checks it).
       e.preventDefault();
       toggle();
     },
-    [toggle, onClick],
+    [disableClickToggle, toggle, onClick],
   );
 
   return (

@@ -29,7 +29,10 @@ from hub.services.datasets.local import (
 )
 from hub.utils.dataset_cache import (
     cached_dataset_candidates as _shared_cached_dataset_candidates,
+    dataset_snapshot_from_cache_path as _shared_dataset_snapshot_from_cache_path,
+    latest_cached_dataset_path as _shared_latest_cached_dataset_path,
     latest_cached_dataset_snapshot as _shared_latest_cached_dataset_snapshot,
+    load_cached_hf_dataset as _shared_load_cached_hf_dataset,
     split_label_matches as _split_label_matches,
 )
 from hub.utils import download_registry
@@ -37,6 +40,7 @@ from hub.utils.dataset_format import check_dataset_format, format_dataset_previe
 from hub.utils.hf_errors import hf_error_status
 from hub.utils.paths import (
     is_valid_repo_id as _is_valid_repo_id,
+    normalize_path,
     resolve_dataset_path,
 )
 
@@ -45,6 +49,13 @@ logger = get_logger(__name__)
 _BINARY_IMAGE_PREVIEW_MAX_BYTES = 10 * 1024 * 1024
 _IMAGE_PREVIEW_MAX_PIXELS = 16_000_000
 _IMAGE_PREVIEW_THUMBNAIL_SIZE = (512, 512)
+_LOCAL_CACHE_MISS_ERROR_CODE = "dataset_local_cache_miss"
+_MISSING_DATASET_DETAIL = "This dataset is no longer on disk. Add it again or pick another dataset."
+
+
+def _is_local_dataset_ref(dataset_name: str) -> bool:
+    normalized = normalize_path(str(dataset_name or "").strip())
+    return Path(normalized).expanduser().is_absolute()
 
 
 def _image_pixel_count(image) -> int:
@@ -147,6 +158,8 @@ def _serialize_preview_rows(rows):
 def _latest_cached_dataset_snapshot(
     repo_id: str, local_path: Optional[str] = None
 ) -> Optional[Path]:
+    if local_path:
+        return _shared_dataset_snapshot_from_cache_path(local_path, repo_id)
     return _shared_latest_cached_dataset_snapshot(repo_id, local_path)
 
 
@@ -222,25 +235,19 @@ def _load_processed_hf_preview_slice(
 ):
     if not _is_valid_repo_id(request.dataset_name):
         return None
-    try:
-        from datasets import DownloadConfig
-
-        # Non-streaming loads take the cached builder lock; use the EACCES-safe wrapper.
-        from utils.datasets.cache_safe import load_dataset_cache_safe as load_dataset
-    except Exception:
-        return None
-
-    load_kwargs = {
-        "path": request.dataset_name,
-        "split": request.train_split or "train",
-        "download_config": DownloadConfig(local_files_only = True),
-    }
-    if request.subset:
-        load_kwargs["name"] = request.subset
-    if hf_token:
-        load_kwargs["token"] = hf_token
-
-    dataset = load_dataset(**load_kwargs)
+    local_path = request.local_path
+    if not local_path:
+        cached_path = _shared_latest_cached_dataset_path(request.dataset_name)
+        if cached_path is None:
+            return None
+        local_path = str(cached_path)
+    dataset = _shared_load_cached_hf_dataset(
+        request.dataset_name,
+        local_path,
+        subset = request.subset,
+        split = request.train_split or "train",
+        token = hf_token,
+    )
     total_rows = len(dataset)
     preview_slice = dataset.select(range(min(preview_size, total_rows)))
     return preview_slice, total_rows
@@ -291,7 +298,11 @@ def check_format_response(
             raise HTTPException(status_code = 400, detail = str(e)) from e
         total_rows = None
 
-        if dataset_path.exists():
+        dataset_exists = dataset_path.exists()
+        if not dataset_exists and _is_local_dataset_ref(request.dataset_name):
+            raise HTTPException(status_code = 404, detail = _MISSING_DATASET_DETAIL)
+
+        if dataset_exists:
             train_split = request.train_split or "train"
             preview_slice, total_rows = _load_local_preview_slice(
                 dataset_path = dataset_path,
@@ -312,7 +323,10 @@ def check_format_response(
             elif request.prefer_local_cache:
                 raise HTTPException(
                     status_code = 404,
-                    detail = "Dataset is not available in the local cache.",
+                    detail = {
+                        "code": _LOCAL_CACHE_MISS_ERROR_CODE,
+                        "message": "Dataset is not available in the local cache.",
+                    },
                 )
             else:
                 preview_slice = None
@@ -438,6 +452,7 @@ def check_format_response(
             detected_audio_column = result.get("detected_audio_column"),
             detected_text_column = result.get("detected_text_column"),
             detected_speaker_column = result.get("detected_speaker_column"),
+            chat_column = result.get("chat_column"),
             preview_samples = preview_samples,
             total_rows = total_rows,
             warning = warning,

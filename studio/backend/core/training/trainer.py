@@ -68,6 +68,7 @@ from datasets import Dataset
 from utils.datasets.cache_safe import load_dataset_cache_safe as load_dataset
 
 from utils.models import is_vision_model, detect_audio_type
+from utils.models.model_identity import restore_hf_cache_repo_identity
 from utils.models.model_config import _env_offline
 from utils.datasets import format_and_template_dataset
 from utils.datasets.completion_masking import apply_completion_masking
@@ -139,6 +140,9 @@ class UnslothTrainer:
         self._cuda_audio_used = False  # Set once after audio CUDA preprocessing; never cleared
         self._spark_tts_repo_dir = None  # Downloaded Spark-TTS repo path (for BiCodecTokenizer)
         self.model_name = None
+        self.model_load_error = None
+        self.dataset_loaded_from_exact_snapshot = False
+        self.dataset_snapshot_path = None
 
         # Training metrics tracking
         self.training_start_time: Optional[float] = None
@@ -164,6 +168,9 @@ class UnslothTrainer:
         is_dataset_image: bool = False,
         is_dataset_audio: bool = False,
         trust_remote_code: bool = False,
+        model_load_name: Optional[str] = None,
+        local_files_only: bool = False,
+        model_revision: Optional[str] = None,
     ) -> None:
         """Lightweight detection and tokenizer load — no model weights, no VRAM.
 
@@ -176,12 +183,18 @@ class UnslothTrainer:
         self.model_name = model_name
         self.max_seq_length = max_seq_length
         self.trust_remote_code = trust_remote_code
+        lookup_name = model_load_name or model_name
 
         if hf_token:
             os.environ["HF_TOKEN"] = hf_token
 
         # --- Detect audio type (reads config.json only, no VRAM) ---
-        self._audio_type = detect_audio_type(model_name, hf_token)
+        self._audio_type = detect_audio_type(
+            lookup_name,
+            hf_token,
+            local_files_only = local_files_only,
+            revision = model_revision,
+        )
         if self._audio_type == "audio_vlm":
             self.is_audio = False
             self.is_audio_vlm = is_dataset_audio
@@ -194,7 +207,16 @@ class UnslothTrainer:
             self._cuda_audio_used = False
 
         # --- Detect VLM ---
-        vision = is_vision_model(model_name, hf_token = hf_token) if not self.is_audio else False
+        vision = (
+            is_vision_model(
+                lookup_name,
+                hf_token = hf_token,
+                local_files_only = local_files_only,
+                revision = model_revision,
+            )
+            if not self.is_audio
+            else False
+        )
         self.is_vlm = not self.is_audio_vlm and vision and is_dataset_image
 
         logger.info(
@@ -211,16 +233,20 @@ class UnslothTrainer:
         if self._audio_type == "whisper":
             from transformers import AutoProcessor
             self.tokenizer = AutoProcessor.from_pretrained(
-                model_name,
+                lookup_name,
                 trust_remote_code = trust_remote_code,
                 token = hf_token,
+                local_files_only = local_files_only,
+                revision = model_revision,
             )
         else:
             from transformers import AutoTokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
+                lookup_name,
                 trust_remote_code = trust_remote_code,
                 token = hf_token,
+                local_files_only = local_files_only,
+                revision = model_revision,
             )
 
         logger.info("Pre-loaded tokenizer for %s", model_name)
@@ -236,6 +262,21 @@ class UnslothTrainer:
                 if hasattr(self.training_progress, key):
                     setattr(self.training_progress, key, value)
 
+            for callback in self.progress_callbacks:
+                try:
+                    callback(self.training_progress)
+                except Exception as e:
+                    logger.error(f"Error in progress callback: {e}")
+
+    def _record_warning(self, message: str) -> None:
+        message = str(message).strip()
+        if not message:
+            return
+        with self._lock:
+            if message in self.training_progress.warnings:
+                return
+            self.training_progress.warnings.append(message)
+            logger.warning(message)
             for callback in self.progress_callbacks:
                 try:
                     callback(self.training_progress)
@@ -506,10 +547,16 @@ class UnslothTrainer:
         trust_remote_code: bool = False,
         full_finetuning: bool = False,
         gpu_ids: Optional[list[int]] = None,
+        model_load_name: Optional[str] = None,
+        local_files_only: bool = False,
+        actual_model_repo_id: Optional[str] = None,
+        model_revision: Optional[str] = None,
     ) -> bool:
         """Load model for training (supports both text and vision models)"""
         self.load_in_4bit = load_in_4bit  # For training_meta.json
         self.trust_remote_code = trust_remote_code  # For AutoProcessor etc. used during training
+        lookup_name = model_load_name or model_name
+        self.model_load_error = None
         try:
             if self.model is not None:
                 del self.model
@@ -546,7 +593,12 @@ class UnslothTrainer:
             _preserve = ["Unsloth*Trainer.py"] if sys.platform in ("win32", "darwin") else None
             clear_unsloth_compiled_cache(preserve_patterns = _preserve)
             # Detect audio model type dynamically (config.json + tokenizer)
-            self._audio_type = detect_audio_type(model_name, hf_token)
+            self._audio_type = detect_audio_type(
+                lookup_name,
+                hf_token,
+                local_files_only = local_files_only,
+                revision = model_revision,
+            )
             # audio_vlm is detected as an audio_type now; handle separately
             if self._audio_type == "audio_vlm":
                 self.is_audio = False
@@ -560,7 +612,16 @@ class UnslothTrainer:
                 self._cuda_audio_used = False
 
             # VLM: vision model + image dataset (mutually exclusive with audio)
-            vision = is_vision_model(model_name, hf_token = hf_token) if not self.is_audio else False
+            vision = (
+                is_vision_model(
+                    lookup_name,
+                    hf_token = hf_token,
+                    local_files_only = local_files_only,
+                    revision = model_revision,
+                )
+                if not self.is_audio
+                else False
+            )
             self.is_vlm = not self.is_audio_vlm and vision and is_dataset_image
             self.model_name = model_name
             self.max_seq_length = max_seq_length
@@ -595,10 +656,14 @@ class UnslothTrainer:
 
             # Proactive gated-model check before from_pretrained (catches all
             # gated/private models). Skip when offline -- it uses the cache.
-            if "/" in model_name and not _env_offline():
+            if "/" in model_name and not local_files_only and not _env_offline():
                 try:
                     from huggingface_hub import model_info as hf_model_info
-                    info = hf_model_info(model_name, token = hf_token or None)
+
+                    model_info_kwargs = {"token": hf_token or None}
+                    if model_revision:
+                        model_info_kwargs["revision"] = model_revision
+                    info = hf_model_info(model_name, **model_info_kwargs)
                     # model_info succeeds for gated repos (metadata is public);
                     # info.gated tells us if files require acceptance/token.
                     if info.gated and not hf_token:
@@ -647,7 +712,7 @@ class UnslothTrainer:
                 from transformers import CsmForConditionalGeneration
 
                 self.model, self.tokenizer = FastModel.from_pretrained(
-                    model_name = model_name,
+                    model_name = lookup_name,
                     max_seq_length = max_seq_length,
                     dtype = _auto_dtype,
                     auto_model = CsmForConditionalGeneration,
@@ -656,6 +721,8 @@ class UnslothTrainer:
                     full_finetuning = full_finetuning,
                     token = hf_token,
                     trust_remote_code = trust_remote_code,
+                    revision = model_revision,
+                    use_exact_model_name = model_revision is not None,
                 )
                 logger.info("Loaded CSM audio model")
 
@@ -665,7 +732,7 @@ class UnslothTrainer:
                 from transformers import WhisperForConditionalGeneration
 
                 self.model, self.tokenizer = FastModel.from_pretrained(
-                    model_name = model_name,
+                    model_name = lookup_name,
                     dtype = _auto_dtype,
                     load_in_4bit = False,
                     device_map = device_map,
@@ -675,6 +742,8 @@ class UnslothTrainer:
                     whisper_task = "transcribe",
                     token = hf_token,
                     trust_remote_code = trust_remote_code,
+                    revision = model_revision,
+                    use_exact_model_name = model_revision is not None,
                 )
                 # Generation settings (notebook lines 100-105)
                 self.model.generation_config.language = "<|en|>"
@@ -686,7 +755,7 @@ class UnslothTrainer:
             elif self._audio_type == "snac":
                 # Orpheus: language model with audio codec tokens
                 self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-                    model_name = model_name,
+                    model_name = lookup_name,
                     max_seq_length = max_seq_length,
                     dtype = _auto_dtype,
                     load_in_4bit = load_in_4bit,
@@ -694,6 +763,8 @@ class UnslothTrainer:
                     full_finetuning = full_finetuning,
                     token = hf_token,
                     trust_remote_code = trust_remote_code,
+                    revision = model_revision,
+                    use_exact_model_name = model_revision is not None,
                 )
                 logger.info(f"Loaded {self._audio_type} audio model (FastLanguageModel)")
 
@@ -715,7 +786,14 @@ class UnslothTrainer:
                     local_dir = model_name.split("/")[-1]
                     llm_path = f"{local_dir}/LLM"
 
-                repo_path = snapshot_download(hf_repo, local_dir = local_dir)
+                if local_files_only:
+                    repo_path = lookup_name
+                else:
+                    repo_path = snapshot_download(
+                        hf_repo,
+                        local_dir = local_dir,
+                        revision = model_revision,
+                    )
                 self._spark_tts_repo_dir = os.path.abspath(repo_path)  # Absolute for sys.path
                 llm_path = os.path.join(self._spark_tts_repo_dir, "LLM")
 
@@ -735,13 +813,15 @@ class UnslothTrainer:
                 # OuteTTS: uses FastModel (not FastLanguageModel) with load_in_4bit=False
                 from unsloth import FastModel
                 self.model, self.tokenizer = FastModel.from_pretrained(
-                    model_name,
+                    lookup_name,
                     max_seq_length = max_seq_length,
                     load_in_4bit = False,
                     device_map = device_map,
                     full_finetuning = full_finetuning,
                     token = hf_token,
                     trust_remote_code = trust_remote_code,
+                    revision = model_revision,
+                    use_exact_model_name = model_revision is not None,
                 )
                 logger.info("Loaded OuteTTS (dac) model (FastModel)")
 
@@ -750,7 +830,7 @@ class UnslothTrainer:
                 # FastModel (general loader) returns (model, processor).
                 from unsloth import FastModel
                 self.model, self.tokenizer = FastModel.from_pretrained(
-                    model_name = model_name,
+                    model_name = lookup_name,
                     max_seq_length = max_seq_length,
                     dtype = _auto_dtype,
                     load_in_4bit = load_in_4bit,
@@ -758,13 +838,15 @@ class UnslothTrainer:
                     full_finetuning = full_finetuning,
                     token = hf_token,
                     trust_remote_code = trust_remote_code,
+                    revision = model_revision,
+                    use_exact_model_name = model_revision is not None,
                 )
                 logger.info("Loaded audio VLM model (FastModel)")
 
             elif self.is_vlm:
                 # Load vision model - returns (model, tokenizer)
                 self.model, self.tokenizer = FastVisionModel.from_pretrained(
-                    model_name = model_name,
+                    model_name = lookup_name,
                     max_seq_length = max_seq_length,
                     dtype = _auto_dtype,
                     load_in_4bit = load_in_4bit,
@@ -772,6 +854,8 @@ class UnslothTrainer:
                     full_finetuning = full_finetuning,
                     token = hf_token,
                     trust_remote_code = trust_remote_code,
+                    revision = model_revision,
+                    use_exact_model_name = model_revision is not None,
                 )
                 logger.info("Loaded vision model")
 
@@ -791,7 +875,7 @@ class UnslothTrainer:
             else:
                 # Load text model - returns (model, tokenizer)
                 self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-                    model_name = model_name,
+                    model_name = lookup_name,
                     max_seq_length = max_seq_length,
                     dtype = _auto_dtype,
                     load_in_4bit = load_in_4bit,
@@ -799,10 +883,22 @@ class UnslothTrainer:
                     full_finetuning = full_finetuning,
                     token = hf_token,
                     trust_remote_code = trust_remote_code,
+                    revision = model_revision,
+                    use_exact_model_name = model_revision is not None,
                 )
                 logger.info("Loaded text model")
 
             raise_if_offloaded(self.model, device_map, "Unsloth training")
+
+            restored_repo_id = restore_hf_cache_repo_identity(
+                self.model,
+                lookup_name,
+                expected_repo_id = actual_model_repo_id or model_name,
+            )
+            if restored_repo_id:
+                logger.info(
+                    f"Restored Hub model identity for saved adapter metadata: {restored_repo_id}"
+                )
 
             if self.should_stop:
                 return False
@@ -816,6 +912,7 @@ class UnslothTrainer:
             return True
 
         except OSError as e:
+            self.model_load_error = e
             if "could not get source code" in str(e) and not getattr(
                 self, "_source_code_retried", False
             ):
@@ -834,6 +931,10 @@ class UnslothTrainer:
                     trust_remote_code = trust_remote_code,
                     full_finetuning = full_finetuning,
                     gpu_ids = gpu_ids,
+                    model_load_name = model_load_name,
+                    local_files_only = local_files_only,
+                    actual_model_repo_id = actual_model_repo_id,
+                    model_revision = model_revision,
                 )
             error_msg = str(e)
             error_lower = error_msg.lower()
@@ -856,6 +957,7 @@ class UnslothTrainer:
             self._update_progress(error = error_msg, is_training = False)
             return False
         except Exception as e:
+            self.model_load_error = e
             error_msg = str(e)
             # Surface a friendly message for gated/auth errors
             error_lower = error_msg.lower()
@@ -2256,6 +2358,10 @@ class UnslothTrainer:
         dataset_slice_end: Optional[int] = None,
         is_cpt: bool = False,
         s3_config: dict = None,
+        dataset_local_files_only: bool = False,
+        dataset_local_path: Optional[str] = None,
+        dataset_revision: Optional[str] = None,
+        require_exact_resume_resources: bool = False,
     ) -> Optional[tuple]:
         """
         Load and prepare a dataset for training.
@@ -2270,11 +2376,30 @@ class UnslothTrainer:
 
         s3_download = None
         try:
+            self.dataset_loaded_from_exact_snapshot = False
+            self.dataset_snapshot_path = None
             dataset = None
             eval_dataset = None
+            dataset_attestation_source = None
             has_separate_eval_source = False  # True if eval comes from a separate HF split
             eval_enabled = eval_steps is not None and eval_steps > 0
             raw_text_mode = is_cpt or format_type == "raw"
+            dataset_loaded_from_cache = False
+
+            def _load_selected_cached_dataset(
+                split_name: Optional[str], *, row_limit: Optional[int] = None
+            ):
+                if not dataset_source or not dataset_local_path:
+                    return None
+                from hub.utils.dataset_cache import load_cached_hf_dataset
+
+                kwargs = {
+                    "subset": subset,
+                    "split": split_name or "train",
+                }
+                if row_limit is not None:
+                    kwargs["row_limit"] = row_limit
+                return load_cached_hf_dataset(dataset_source, dataset_local_path, **kwargs)
 
             def _raw_mode_label() -> str:
                 return "CPT" if is_cpt else "raw text"
@@ -2360,6 +2485,8 @@ class UnslothTrainer:
                 load_kwargs = {"path": dataset_source, "split": split_name}
                 if subset:
                     load_kwargs["name"] = subset
+                if dataset_revision:
+                    load_kwargs["revision"] = dataset_revision
 
                 if dataset_streaming:
                     self._update_progress(status_message = f"Streaming dataset: {dataset_source}...")
@@ -2407,8 +2534,66 @@ class UnslothTrainer:
                     # train_split already carries a slice expression, so fall back to
                     # the regular download path, which handles HF slice syntax.
                     _split_has_slice = (train_split or "").find("[") != -1
+                    dataset = None
+                    if dataset_local_files_only:
+                        self._update_progress(
+                            status_message = f"Loading cached dataset: {dataset_source}..."
+                        )
+                        try:
+                            cached_row_limit = None
+                            if (
+                                not _split_has_slice
+                                and dataset_slice_end is not None
+                                and dataset_slice_end >= 0
+                                and dataset_slice_end >= _slice_start
+                            ):
+                                cached_row_limit = dataset_slice_end + 1
+                            dataset = _load_selected_cached_dataset(
+                                split_name,
+                                row_limit = cached_row_limit,
+                            )
+                            if require_exact_resume_resources and dataset is None:
+                                raise FileNotFoundError(
+                                    f"The exact cached dataset split '{split_name}' "
+                                    "is no longer available."
+                                )
+                            dataset_loaded_from_cache = True
+                            from core.training.provenance import (
+                                exact_dataset_snapshot_path,
+                            )
+
+                            self.dataset_snapshot_path = exact_dataset_snapshot_path(
+                                dataset_local_path,
+                                dataset_source,
+                            )
+                            self.dataset_loaded_from_exact_snapshot = bool(
+                                self.dataset_snapshot_path
+                            )
+                            logger.info(
+                                f"Loaded cached dataset for {dataset_source}: "
+                                f"{len(dataset)} rows\n"
+                            )
+                        except Exception as error:
+                            from hub.utils.dataset_cache import (
+                                dataset_cache_fallback_allowed,
+                            )
+
+                            if not dataset_cache_fallback_allowed(
+                                error,
+                                require_exact = require_exact_resume_resources,
+                                revision = dataset_revision,
+                            ):
+                                raise
+                            self._update_progress(
+                                status_message = (
+                                    f"Cached dataset unavailable; "
+                                    f"downloading {dataset_source}..."
+                                )
+                            )
+                            dataset = None
                     if (
-                        not _split_has_slice
+                        dataset is None
+                        and not _split_has_slice
                         and dataset_slice_end is not None
                         and dataset_slice_end >= 0
                         and dataset_slice_end >= _slice_start
@@ -2420,12 +2605,13 @@ class UnslothTrainer:
                             f"streaming {rows_to_stream} rows\n"
                         )
                         stream = load_dataset(**load_kwargs, streaming = True)
+                        dataset_attestation_source = stream
                         dataset = Dataset.from_list(list(stream.take(rows_to_stream)))
                         logger.info(
                             f"[dataset-slice] Downloaded {len(dataset)} rows "
                             f"(requested {rows_to_stream})\n"
                         )
-                    else:
+                    elif dataset is None:
                         self._update_progress(
                             status_message = f"Downloading dataset: {dataset_source}..."
                         )
@@ -2453,6 +2639,8 @@ class UnslothTrainer:
                         eval_load_kwargs = {"path": dataset_source, "split": eval_split}
                         if subset:
                             eval_load_kwargs["name"] = subset
+                        if dataset_revision:
+                            eval_load_kwargs["revision"] = dataset_revision
 
                         if dataset_streaming:
                             # Probe available splits before the streaming load.
@@ -2464,6 +2652,8 @@ class UnslothTrainer:
                             probe_kwargs = {"path": dataset_source}
                             if subset:
                                 probe_kwargs["config_name"] = subset
+                            if dataset_revision:
+                                probe_kwargs["revision"] = dataset_revision
                             try:
                                 available_splits = get_dataset_split_names(**probe_kwargs)
                             except Exception as probe_err:
@@ -2492,7 +2682,41 @@ class UnslothTrainer:
                                     f"{STREAMING_EVAL_MAX_SAMPLES} samples\n"
                                 )
                         else:
-                            eval_dataset = load_dataset(**eval_load_kwargs)
+                            if dataset_loaded_from_cache:
+                                try:
+                                    eval_dataset = _load_selected_cached_dataset(eval_split)
+                                    if require_exact_resume_resources and eval_dataset is None:
+                                        raise FileNotFoundError(
+                                            f"The exact cached dataset split '{eval_split}' "
+                                            "is no longer available."
+                                        )
+                                except Exception as error:
+                                    from hub.utils.dataset_cache import (
+                                        dataset_cache_fallback_allowed,
+                                    )
+
+                                    if not dataset_cache_fallback_allowed(
+                                        error,
+                                        require_exact = require_exact_resume_resources,
+                                        revision = dataset_revision,
+                                    ):
+                                        raise
+                                    self._update_progress(
+                                        status_message = (
+                                            "Cached eval split unavailable; reloading train "
+                                            "and eval from the Hub..."
+                                        )
+                                    )
+                                    remote_train = load_dataset(**load_kwargs)
+                                    remote_eval = load_dataset(**eval_load_kwargs)
+                                    dataset = remote_train
+                                    dataset_attestation_source = None
+                                    eval_dataset = remote_eval
+                                    dataset_loaded_from_cache = False
+                                    self.dataset_loaded_from_exact_snapshot = False
+                                    self.dataset_snapshot_path = None
+                            else:
+                                eval_dataset = load_dataset(**eval_load_kwargs)
 
                         has_separate_eval_source = True
                         if hasattr(eval_dataset, "__len__"):
@@ -2517,14 +2741,45 @@ class UnslothTrainer:
                                 "Streaming mode currently requires an explicit eval split when evaluation is enabled."
                             )
                         # Auto-detect eval split from HF (separate dataset or None)
+                        if dataset_loaded_from_cache:
+                            split_info = getattr(getattr(dataset, "info", None), "splits", None)
+                            available_splits = list(split_info or ())
+                            split_loader = _load_selected_cached_dataset
+                        else:
+                            available_splits = None
+                            split_loader = None
                         eval_dataset = self._auto_detect_eval_split_from_hf(
                             dataset_source = dataset_source,
                             subset = subset,
+                            available_splits = available_splits,
+                            split_loader = split_loader,
+                            excluded_split = (train_split or "train").partition("[")[0].strip(),
+                            revision = dataset_revision,
+                            strict_split_loading = (
+                                require_exact_resume_resources and dataset_loaded_from_cache
+                            ),
                         )
                         if eval_dataset is not None:
                             has_separate_eval_source = True
                 else:
                     logger.info("Eval disabled (eval_steps <= 0), skipping eval split detection\n")
+
+                if not dataset_streaming:
+                    from core.training.provenance import attest_loaded_dataset
+
+                    train_attestation_source = (
+                        dataset_attestation_source
+                        if dataset_attestation_source is not None
+                        else dataset
+                    )
+                    snapshot, _ = attest_loaded_dataset(
+                        dataset_source,
+                        train_attestation_source,
+                        eval_dataset if has_separate_eval_source else None,
+                    )
+                    if snapshot is not None:
+                        self.dataset_snapshot_path = snapshot
+                        self.dataset_loaded_from_exact_snapshot = True
 
             if dataset is None:
                 raise ValueError("No dataset provided")
@@ -2710,37 +2965,62 @@ class UnslothTrainer:
                 s3_download.cleanup()
 
     def _auto_detect_eval_split_from_hf(
-        self, dataset_source: str, subset: str
+        self,
+        dataset_source: str,
+        subset: Optional[str],
+        *,
+        available_splits: Optional[list[str]] = None,
+        split_loader: Optional[Callable[[str], Dataset]] = None,
+        excluded_split: Optional[str] = None,
+        revision: Optional[str] = None,
+        strict_split_loading: bool = False,
     ) -> Optional[Dataset]:
         """Auto-detect an eval split from an HF dataset (named split only)."""
         try:
-            from datasets import get_dataset_split_names
+            if available_splits is None and split_loader is None:
+                from datasets import get_dataset_split_names
 
-            load_kwargs = {"path": dataset_source}
-            if subset:
-                load_kwargs["config_name"] = subset
-            available_splits = get_dataset_split_names(**load_kwargs)
+                load_kwargs = {"path": dataset_source}
+                if subset:
+                    load_kwargs["config_name"] = subset
+                if revision:
+                    load_kwargs["revision"] = revision
+                available_splits = get_dataset_split_names(**load_kwargs)
+            elif available_splits is None or split_loader is None:
+                raise ValueError("Cached split names and loader must be provided together")
             logger.info(f"Available splits: {available_splits}\n")
 
-            # Check for common eval split names
-            for candidate in ["eval", "validation", "valid", "val", "test"]:
-                if candidate in available_splits:
-                    eval_load_kwargs = {"path": dataset_source, "split": candidate}
-                    if subset:
-                        eval_load_kwargs["name"] = subset
-                    candidate_ds = load_dataset(**eval_load_kwargs)
-                    if len(candidate_ds) >= 16:
+            from core.training.eval_dataset import EVAL_SPLIT_CANDIDATES, MIN_EVAL_ROWS
+
+            for candidate in EVAL_SPLIT_CANDIDATES:
+                if candidate in available_splits and candidate != excluded_split:
+                    if split_loader is not None:
+                        candidate_ds = split_loader(candidate)
+                    else:
+                        eval_load_kwargs = {"path": dataset_source, "split": candidate}
+                        if subset:
+                            eval_load_kwargs["name"] = subset
+                        if revision:
+                            eval_load_kwargs["revision"] = revision
+                        candidate_ds = load_dataset(**eval_load_kwargs)
+                    if len(candidate_ds) >= MIN_EVAL_ROWS:
                         logger.info(
                             f"Auto-detected eval split '{candidate}' with {len(candidate_ds)} rows\n"
                         )
                         return candidate_ds
                     else:
                         logger.info(
-                            f"Found eval split '{candidate}' but only {len(candidate_ds)} rows (< 16), skipping\n"
+                            f"Found eval split '{candidate}' but only {len(candidate_ds)} rows "
+                            f"(< {MIN_EVAL_ROWS}), skipping\n"
                         )
 
         except Exception as e:
-            logger.warning(f"Could not check dataset splits: {e}")
+            if strict_split_loading and split_loader is not None:
+                raise
+            self._record_warning(
+                "Automatic eval split detection failed; a held-out split will be created "
+                f"from the training data when enough rows are available: {e}"
+            )
 
         # No separate HF eval split — caller handles programmatic splitting
         return None
@@ -2750,24 +3030,29 @@ class UnslothTrainer:
 
         Returns (train_dataset, eval_dataset), or None if too small.
         """
-        MIN_EVAL_ROWS = 16
-        MIN_TOTAL_ROWS = 32  # Need at least 16 train + 16 eval
+        from core.training.eval_dataset import (
+            MIN_TOTAL_ROWS_FOR_EVAL,
+            split_dataset_for_evaluation,
+        )
 
         n = len(dataset)
-        if n < MIN_TOTAL_ROWS:
-            logger.info(f"Dataset too small ({n} rows) for eval split, skipping eval\n")
+        split_result = split_dataset_for_evaluation(dataset)
+        if split_result is None:
+            self._record_warning(
+                f"Evaluation is enabled, but the training dataset has only {n} rows; "
+                f"at least {MIN_TOTAL_ROWS_FOR_EVAL} are required to create a held-out "
+                "eval split. Training will continue without evaluation."
+            )
             return None
 
-        eval_size = max(MIN_EVAL_ROWS, min(128, int(0.05 * n)))
-        # Don't take more than half the dataset
-        eval_size = min(eval_size, n // 2)
-
-        logger.info(f"Auto-splitting: {eval_size} rows for eval from {n} total\n")
-        split_result = dataset.train_test_split(test_size = eval_size, seed = 3407)
+        train_dataset, eval_dataset = split_result
+        eval_size = len(eval_dataset)
         logger.info(
-            f"Split complete: {len(split_result['train'])} train, {len(split_result['test'])} eval\n"
+            f"Auto-splitting: {eval_size} rows for eval from {n} total "
+            f"(minimum total: {MIN_TOTAL_ROWS_FOR_EVAL})\n"
         )
-        return (split_result["train"], split_result["test"])
+        logger.info(f"Split complete: {len(train_dataset)} train, {len(eval_dataset)} eval\n")
+        return train_dataset, eval_dataset
 
     def start_training(
         self,
