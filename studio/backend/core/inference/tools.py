@@ -148,11 +148,19 @@ _BLOCKED_COMMANDS_WIN = frozenset(
         "pwsh",
     }
 )
-_BLOCKED_COMMANDS = (
-    _BLOCKED_COMMANDS_COMMON | _BLOCKED_COMMANDS_WIN
-    if sys.platform == "win32"
-    else _BLOCKED_COMMANDS_COMMON
-)
+_BLOCKED_COMMANDS_ALL = _BLOCKED_COMMANDS_COMMON | _BLOCKED_COMMANDS_WIN
+
+
+def _blocked_commands() -> "frozenset[str]":
+    """The blocked names for the platform this call runs on.
+
+    Resolved per call rather than frozen at import so that a test can pin
+    sys.platform the way the rest of the Windows suite does. Freezing it meant
+    the Windows screen -- `cmd /c powershell` and friends -- could only ever be
+    exercised on a Windows runner, so it went untested everywhere it is built.
+    Both operands are constants, so this costs one comparison.
+    """
+    return _BLOCKED_COMMANDS_ALL if sys.platform == "win32" else _BLOCKED_COMMANDS_COMMON
 
 
 _SHELL_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "\n", "(", ")", "`", "{", "}"})
@@ -469,7 +477,7 @@ def _blocked_matching_glob(base: str) -> "set[str]":
     """Blocked command names a command-position glob can expand to."""
     if not _is_unresolved_command_glob(base):
         return set()
-    return {name for name in _BLOCKED_COMMANDS if fnmatch.fnmatchcase(name, base)}
+    return {name for name in _blocked_commands() if fnmatch.fnmatchcase(name, base)}
 
 
 def _is_sed_command(base: str) -> bool:
@@ -1165,6 +1173,57 @@ def _unquoted_glob_indexes(text: str, tokens: "list[str]", punctuation: str) -> 
     )
 
 
+def _skip_start_switches(tokens: "list[str]", index: int) -> int:
+    """The first index at or after ``index`` that is not one of `start`'s switches."""
+    while index < len(tokens):
+        switch = _win_switch(tokens[index].lower())
+        if not switch.startswith("/"):
+            break
+        # /d C:\dir and friends carry their value in the next token.
+        index += 2 if switch in _START_SWITCHES_WITH_VALUE else 1
+    return index
+
+
+def _quoted_token_indexes(
+    command: str, tokens: "list[str]", lexed_posix: bool
+) -> "frozenset[int]":
+    """Indexes of ``tokens`` that were written with quotes around them.
+
+    cmd reads `start`'s first argument as a window title only when it is quoted,
+    which is what separates `start "" prog` and `start "t" prog` -- a title with
+    the program behind it -- from `start prog arg`, where the second token is
+    just an argument. Screening an argument as if it were a command position is
+    not harmless: the recursive scan re-anchors its command-boundary regex at
+    the start of the token, so `start notepad rm.txt` reported `rm` even though
+    the same word in the same place on a full line does not match.
+
+    The non-POSIX lexer keeps the quotes, so the tokens answer for themselves.
+    The POSIX one strips them, so the text is lexed a second time without
+    stripping and the two are lined up one-to-one, reporting nothing when they
+    do not align -- the same technique as _quoted_separator_indexes. That second
+    lex has to be built like the first one: ``shlex.split`` passes no
+    punctuation_chars and clears the comment character, so `;`, `&&`, `|`, `(`
+    and `#` glued onto their neighbours, the two never lined up, and every
+    command holding a separator lost its title detection -- which is worse than
+    not having it, since the title was then screened in the program's place.
+    """
+    if not lexed_posix:
+        return frozenset(
+            index for index, token in enumerate(tokens) if token.startswith(('"', "'"))
+        )
+    try:
+        lexer = shlex.shlex(command, posix = False, punctuation_chars = ";&|()`")
+        lexer.whitespace_split = True
+        raw = list(lexer)
+    except ValueError:
+        return frozenset()
+    if len(raw) != len(tokens):
+        return frozenset()
+    return frozenset(
+        index for index, token in enumerate(raw) if token.startswith(('"', "'"))
+    )
+
+
 def _xargs_replacement(tokens: "list[str]", start: int, end: int) -> str:
     """The placeholder the xargs word at ``start`` substitutes into the command
     words behind it, or "" when it replaces nothing. GNU xargs takes it attached
@@ -1519,12 +1578,12 @@ def _find_blocked_commands(command: str) -> set[str]:
             sed_indexes.append(token_index)
             if xargs_index >= 0:
                 sed_xargs[token_index] = xargs_index
-        if base in _BLOCKED_COMMANDS:
+        if base in _blocked_commands():
             blocked.add(base)
         else:
             blocked |= _blocked_matching_glob(base)
         # Wrappers (env/time/xargs/sudo) consume one command; the next non-flag,
-        # non-numeric token is the real command. sudo is also in _BLOCKED_COMMANDS.
+        # non-numeric token is the real command, and that wrapper is blocked too.
         if base in _COMMAND_PREFIXES:
             if base == "xargs" and xargs_index < 0:
                 xargs_index = token_index
@@ -1572,7 +1631,7 @@ def _find_blocked_commands(command: str) -> set[str]:
                 # a command that could not have worked anyway; a spelling
                 # that does forward them would otherwise be a free pass.
                 sed_indexes.append(i)
-            if attached_base in _BLOCKED_COMMANDS:
+            if attached_base in _blocked_commands():
                 blocked.add(attached_base)
             else:
                 blocked |= _blocked_matching_glob(attached_base)
@@ -1597,7 +1656,7 @@ def _find_blocked_commands(command: str) -> set[str]:
                     # screened (`find . -exec sed '1e rm -f victim' {} +`, and
                     # behind a wrapper `find . -exec env sed '1e ...' {} +`).
                     sed_indexes.append(word)
-                if base in _BLOCKED_COMMANDS:
+                if base in _blocked_commands():
                     blocked.add(base)
                 else:
                     blocked |= _blocked_matching_glob(base)
@@ -1606,8 +1665,9 @@ def _find_blocked_commands(command: str) -> set[str]:
     # $(rm -rf), <(rm), backtick chains, or "foo;rm". Anchored to command-position
     # delimiters, so it doesn't match in argument position.
     lowered = command.lower()
-    if _BLOCKED_COMMANDS:
-        words_alt = "|".join(re.escape(w) for w in sorted(_BLOCKED_COMMANDS))
+    blocked_names = _blocked_commands()
+    if blocked_names:
+        words_alt = "|".join(re.escape(w) for w in sorted(blocked_names))
         pattern = (
             rf"(?:^|[;&|`\n(]\s*|[$]\(\s*|<\(\s*)"
             rf"(?:[\w./\\-]*/|[a-zA-Z]:[/\\][\w./\\-]*)?"
@@ -1648,19 +1708,28 @@ def _find_blocked_commands(command: str) -> set[str]:
 
     # `cmd /c start "" prog` puts prog in a command position the scan above
     # sees only as an argument, so screen what start actually launches.
+    quoted_tokens: "frozenset[int] | None" = None
     for i, token in enumerate(tokens):
         if os.path.basename(token).lower() not in ("start", "start.exe"):
             continue
-        j = i + 1
-        while j < len(tokens):
-            switch = _win_switch(tokens[j].lower())
-            if not switch.startswith("/"):
-                break
-            # /d C:\dir and friends carry their value in the next token.
-            j += 2 if switch in _START_SWITCHES_WITH_VALUE else 1
-        # `start ""` is the idiom for "no title"; anything else is the program.
-        if j < len(tokens) and tokens[j] == "":
-            j += 1
+        # Built at most once per call, and only when a start is actually here:
+        # it lexes the whole line, so doing it per start token made the scan
+        # quadratic (800 tokens took 1.1s against main's 34ms).
+        if quoted_tokens is None:
+            quoted_tokens = _quoted_token_indexes(command, tokens, lexed_posix)
+        j = _skip_start_switches(tokens, i + 1)
+        # `start "title" prog` is the documented form: cmd reads a quoted first
+        # argument as the window title, but only when something follows it, so
+        # the program is the token behind it. Matching `== ""` instead saw
+        # neither `start "" prog` on a Windows host without Git Bash -- where the
+        # non-POSIX lexer keeps the quotes and the token arrives as a literal
+        # `""` -- nor any non-empty title on either lexer, and left the program
+        # in both unscreened. A title is data, so it is not screened itself.
+        if j + 1 < len(tokens) and j in quoted_tokens:
+            # Microsoft documents the switches AFTER the title, so skip them on
+            # both sides of it: `start "" /min powershell` left the program at
+            # j + 2 and screened the switch instead.
+            j = _skip_start_switches(tokens, j + 1)
         if j < len(tokens):
             blocked |= _find_blocked_commands(tokens[j])
 
