@@ -936,7 +936,10 @@ _BODY_PROTECTED_PREFIXES = (
     "/api/export",
     "/mcp",
 )
-_DATASET_UPLOAD_PASSTHROUGH_PREFIX = "/api/datasets/upload"
+_DATASET_UPLOAD_PASSTHROUGH_PREFIXES = (
+    "/api/datasets/upload",
+    "/api/hub/datasets/upload",
+)
 _DATA_RECIPE_UNSTRUCTURED_UPLOAD_PASSTHROUGH_PREFIX = (
     "/api/data-recipe/seed/upload-unstructured-file"
 )
@@ -944,7 +947,7 @@ _DATA_RECIPE_UNSTRUCTURED_UPLOAD_PASSTHROUGH_PREFIX = (
 # /api/datasets/upload it enforces its own get_upload_limit_bytes() cap, so it bypasses the default here. EXACT path, so JSON sub-routes keep it.
 _DIFFUSION_DATASET_UPLOAD_PATH = "/api/train/diffusion/dataset"
 _BODY_UPLOAD_PASSTHROUGH_PREFIXES = (
-    _DATASET_UPLOAD_PASSTHROUGH_PREFIX,
+    *_DATASET_UPLOAD_PASSTHROUGH_PREFIXES,
     _DATA_RECIPE_UNSTRUCTURED_UPLOAD_PASSTHROUGH_PREFIX,
 )
 # Passthrough routes matched by EXACT path (the multipart upload only), so sibling JSON sub-routes keep the normal cap.
@@ -957,7 +960,7 @@ def _get_upload_passthrough_request_max_bytes(path: str) -> int:
     # The trailing-slash variant reaches this middleware BEFORE the router's redirect_slashes 307, so it must resolve to the
     # same upload cap. Stripping slashes cannot promote a JSON sub-route: those keep extra path components.
     if (
-        path.startswith(_DATASET_UPLOAD_PASSTHROUGH_PREFIX)
+        path.startswith(_DATASET_UPLOAD_PASSTHROUGH_PREFIXES)
         or path.rstrip("/") == _DIFFUSION_DATASET_UPLOAD_PATH
     ):
         return upload_request_limit_bytes()

@@ -151,6 +151,7 @@ import {
   emitTrainingRunDeleted,
   emitTrainingRunUpdated,
   getTrainingRunDisplayTitle,
+  isTrainingStartPending,
   removeTrainingUnloadGuard,
   renameTrainingRun,
   useTrainingCompletionWatch,
@@ -874,7 +875,7 @@ export function AppSidebar() {
   const selectedHistoryRunId = useTrainingRuntimeStore((s) => s.selectedHistoryRunId);
   const setSelectedHistoryRunId = useTrainingRuntimeStore((s) => s.setSelectedHistoryRunId);
   // Running or starting up. Drives the Train spinner + New Chat / Return to Chat swap.
-  const trainingInProgress = useTrainingRuntimeStore((s) => s.isTrainingRunning || s.isStarting);
+  const trainingInProgress = useTrainingRuntimeStore(isTrainingStartPending);
   // Export runs in the background (parallel with training/inference); reflect it
   // on the Export nav item so it is visible from any tab.
   const exportInProgress = useExportRuntimeStore((s) => s.isExporting);

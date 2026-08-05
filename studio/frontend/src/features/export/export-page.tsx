@@ -42,14 +42,11 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { usePlatformStore } from "@/config/env";
-import { useHubModelSearch } from "@/features/hub/hooks/use-hub-model-search";
-import { confirmRemoteCodeIfNeeded } from "@/features/security";
 import { prepareHfTokenForUse } from "@/features/hf-auth";
+import { hfApiToken, useHfTokenStore, useHubModelSearch } from "@/features/hub";
+import { confirmRemoteCodeIfNeeded } from "@/features/security";
 import { GuidedTour, useGuidedTourController } from "@/features/tour";
-import {
-  type LocalModelInfo,
-  useTrainingConfigStore,
-} from "@/features/training";
+import type { LocalModelInfo } from "@/features/training";
 import { useDebouncedValue, useHfTokenValidation } from "@/hooks";
 import { useHardwareInfo } from "@/hooks/use-hardware-info";
 import { ChevronDownStandardIcon } from "@/lib/chevron-icons";
@@ -80,13 +77,13 @@ import {
   getEstimatedSize,
   mergedFormatPayload,
 } from "./constants";
-import { useExportSizeEstimate } from "./hooks/use-export-size-estimate";
 import {
   getCachedCheckpoints,
   getCachedLocalModels,
   refreshCheckpoints,
   refreshLocalModels,
 } from "./export-navigation-cache";
+import { useExportSizeEstimate } from "./hooks/use-export-size-estimate";
 import {
   isExportPanelActive,
   useExportRuntimeStore,
@@ -168,10 +165,10 @@ function siblingGgufDirectory(sourcePath: string): string | null {
 }
 
 export function ExportPage() {
-  const { hfToken, setHfToken } = useTrainingConfigStore(
+  const { hfToken, setHfToken } = useHfTokenStore(
     useShallow((s) => ({
-      hfToken: s.hfToken,
-      setHfToken: s.setHfToken,
+      hfToken: s.token,
+      setHfToken: s.setToken,
     })),
   );
 
@@ -442,7 +439,7 @@ export function ExportPage() {
     isLoading: isLoadingHfModels,
     error: hfSearchError,
   } = useHubModelSearch(debouncedModelQuery, {
-    accessToken: debouncedHfToken || undefined,
+    accessToken: hfApiToken(debouncedHfToken),
     excludeGguf: true,
     // Curated unsloth listing by default, but a typed query searches the whole
     // Hub (unsloth floated first) so non-unsloth base models stay selectable.

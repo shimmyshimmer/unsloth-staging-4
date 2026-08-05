@@ -13,6 +13,7 @@ import {
   isOllamaLinkPath,
   isStandaloneGgufPath,
   modelIdsMatch,
+  normalizeModelIdentity,
   publicModelId,
   residentModelIdMatches,
 } from "../src/features/hub/lib/model-identity.ts";
@@ -257,6 +258,11 @@ test("two spellings of one Windows path keep a single stored record", () => {
   assert.equal(listPerModelConfigs().length, 1);
 });
 
+test("a Windows drive root stays distinct from a drive-relative identity", () => {
+  assert.equal(normalizeModelIdentity("C:\\"), "c:/");
+  assert.equal(normalizeModelIdentity("C:"), "c:");
+});
+
 test("a POSIX path is case sensitive, so its two spellings stay separate", () => {
   store.clear();
   savePerModelConfig("/models/Foo.gguf", null, config(4096));
@@ -357,4 +363,65 @@ test("only a file on this machine counts as a standalone gguf", () => {
   }
   assert.equal(isStandaloneGgufPath(null), false);
   assert.equal(isStandaloneGgufPath(undefined), false);
+});
+
+test("normalizes relative Windows separators without changing path case", () => {
+  assert.equal(
+    normalizeModelIdentity(String.raw`.\models\demo`),
+    normalizeModelIdentity("./models/demo"),
+  );
+  assert.equal(
+    normalizeModelIdentity(String.raw`..\Models\Demo\\`),
+    "../Models/Demo",
+  );
+  assert.notEqual(
+    normalizeModelIdentity("./Models/Demo"),
+    normalizeModelIdentity("./models/demo"),
+  );
+});
+
+test("normalizes tilde path separators without changing path case", () => {
+  assert.equal(
+    normalizeModelIdentity(String.raw`~\Models\Demo\\`),
+    "~/Models/Demo",
+  );
+  assert.equal(
+    normalizeModelIdentity(String.raw`~user\Models\Demo`),
+    "~user/Models/Demo",
+  );
+  assert.notEqual(
+    normalizeModelIdentity(String.raw`~\Models\Demo`),
+    normalizeModelIdentity(String.raw`~\models\demo`),
+  );
+});
+
+test("keeps backslashes in POSIX-shaped paths as filename characters", () => {
+  assert.notEqual(
+    normalizeModelIdentity(String.raw`./models/foo\bar`),
+    normalizeModelIdentity("./models/foo/bar"),
+  );
+  assert.notEqual(
+    normalizeModelIdentity(String.raw`/models/foo\bar`),
+    normalizeModelIdentity("/models/foo/bar"),
+  );
+});
+
+test("preserves existing platform and Hub identity rules", () => {
+  assert.equal(
+    normalizeModelIdentity(String.raw`C:\Models\Demo\\`),
+    "c:/models/demo",
+  );
+  assert.equal(
+    normalizeModelIdentity(String.raw`C:Models\Demo\\`),
+    "c:models/demo",
+  );
+  assert.equal(
+    normalizeModelIdentity(String.raw`\Models\Demo\\`),
+    "/models/demo",
+  );
+  assert.equal(
+    normalizeModelIdentity(String.raw`\\Server\Share\Models\Demo\\`),
+    "//server/share/models/demo",
+  );
+  assert.equal(normalizeModelIdentity("Org/Model"), "org/model");
 });

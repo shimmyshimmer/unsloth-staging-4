@@ -55,7 +55,7 @@ def no_hub(monkeypatch):
 def _check(dataset_name: str) -> HTTPException:
     request = datasets_route.CheckFormatRequest(dataset_name = dataset_name)
     with pytest.raises(HTTPException) as exc:
-        datasets_route.check_format(request, current_subject = "test")
+        datasets_route.check_format(request, hf_token = None, current_subject = "test")
     return exc.value
 
 

@@ -756,7 +756,7 @@ export function ModelConfigPage({
     return resolved;
   };
   const [initial] = useState(resolveInitial);
-  const [config, setConfig] = useState<PerModelConfig>(() =>
+  const [configState, setConfig] = useState<PerModelConfig>(() =>
     reconcileConfigGpuSelection(initial.config, isDiffusion, gpuDevices),
   );
   const [remember, setRemember] = useState(() => initial.remembered);
@@ -773,7 +773,7 @@ export function ModelConfigPage({
   // Until the switch is used anywhere, a model carrying non-default advanced
   // values opens the section on its own so those stay visible. Frozen at mount
   // so editing a field back to its default cannot close the section underfoot.
-  const [autoOpenAdvanced] = useState(() => hasNonDefaultAdvanced(config));
+  const [autoOpenAdvanced] = useState(() => hasNonDefaultAdvanced(configState));
   const showAdvanced = advancedPreference ?? autoOpenAdvanced;
   const toggleAdvanced = saveAdvancedSettingsOpen;
   const contextInputRef = useRef<NumericValueInputHandle>(null);
@@ -801,9 +801,6 @@ export function ModelConfigPage({
   const resolvedDefaultLoading = hasLoadedDefaultTemplate
     ? false
     : templateDefaults.loading;
-
-  const update = (patch: Partial<PerModelConfig>) =>
-    setConfig((current) => ({ ...current, ...patch }));
 
   // Fetch GGUF header dims (context + layer/MoE counts) to size the GPU Memory
   // sliders; the context also fills in below when target.meta lacks it.
@@ -867,10 +864,6 @@ export function ModelConfigPage({
   ]);
   const stagedDims =
     fetchedStagedDims?.key === contextFetchKey ? fetchedStagedDims : null;
-  const stagedMetadataPending =
-    contextFetchKey != null &&
-    stagedDims == null &&
-    (config.gpuMemoryMode === "manual" || config.selectedGpuIds != null);
   // Tri-state on purpose: an inconclusive probe stays undefined so onRun hands
   // "unknown" to the selection. Collapsing it to false would tell a compare pane
   // this is an ordinary GGUF, letting it inherit another model's split (#7574).
@@ -879,13 +872,22 @@ export function ModelConfigPage({
     stagedDims,
   );
   const resolvedIsDiffusion = classifiedIsDiffusion === true;
+  const config = reconcileConfigGpuSelection(
+    configState,
+    resolvedIsDiffusion,
+    gpuDevices,
+  );
+  const stagedMetadataPending =
+    contextFetchKey != null &&
+    stagedDims == null &&
+    (config.gpuMemoryMode === "manual" || config.selectedGpuIds != null);
   const gpuIndexKind =
     pinnableGpuContext(gpuDevices, resolvedIsDiffusion).indexKind ?? null;
-  useEffect(() => {
-    setConfig((current) =>
-      reconcileConfigGpuSelection(current, resolvedIsDiffusion, gpuDevices),
-    );
-  }, [gpuDevices, resolvedIsDiffusion]);
+  const update = (patch: Partial<PerModelConfig>) =>
+    setConfig((current) => ({
+      ...reconcileConfigGpuSelection(current, resolvedIsDiffusion, gpuDevices),
+      ...patch,
+    }));
 
   const isMtp =
     config.speculativeType != null &&
