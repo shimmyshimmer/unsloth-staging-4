@@ -120,6 +120,7 @@ import {
   isMobileVariant,
   isRecommendableFormat,
   matchesFormatFilter,
+  orderRecommendedRows,
   paramsFromId,
 } from "./recommended-fit";
 import {
@@ -149,7 +150,11 @@ import type {
   ModelOption,
   ModelSelectorChangeMeta,
 } from "./types";
-import { type CatalogGroup, artifactForRepoId } from "./model-catalog";
+import {
+  type CatalogGroup,
+  artifactForRepoId,
+  curatedSizeBytesFor,
+} from "./model-catalog";
 import { describeVariantListingError } from "./variant-listing-error";
 import {
   shouldMountVariantExpander,
@@ -2351,39 +2356,67 @@ export function HubModelPicker({
   const hubRowsShowSize =
     formatFilter === "mlx" || formatFilter === "safetensors";
 
+  // Paint curated rows before any request, so a task-scoped picker whose models
+  // are already in memory does not sit on a spinner for a round trip.
+  const catalogSeedRows = useMemo<HfModelResult[]>(() => {
+    if (!task) return [];
+    return dedupe(models.map((model) => model.id))
+      .filter((id) => !isHiddenModelId(id))
+      .filter((id) => !isMobileVariant(id))
+      .filter((id) => !isImageEditModel(id))
+      .filter((id) => {
+        const isG = isKnownGgufRepo(id);
+        return formatFilter === "all"
+          ? isRecommendableFormat(id, isG, isMac)
+          : matchesFormatFilter(id, isG, formatFilter);
+      })
+      .map((id) => ({
+        id,
+        downloads: 0,
+        likes: 0,
+        isGguf: isKnownGgufRepo(id),
+        // Size from the catalog, not an id "<n>B" guess: the guess is missing
+        // for most curated ids and wrong for others (Wan2.2-TI2V-5B is 30 GB,
+        // not 2), and Recommended lists unsloth repos only, so the 26 outsiders
+        // never get a listing row to correct it.
+        curatedSizeBytes: catalog ? curatedSizeBytesFor(id, catalog) : undefined,
+      }));
+  }, [catalog, models, formatFilter, isKnownGgufRepo, isMac, task]);
+
   // Recommended suggests GGUF anywhere; on Mac also MLX and safetensors. The
   // "recommended" sort also drops models too big for the device. Already-
   // downloaded models stay visible (badged), never hidden.
   const recommendedRows = useMemo(() => {
-    // Never list mobile-targeted builds in the Unsloth section.
-    let rows = recommendedSearch.results
-      .filter((r) => !isHiddenModelId(r.id))
-      .filter((r) => !isMobileVariant(r.id));
-    // Drop models Unsloth can't run for chat (diffusion / image / video / etc.).
-    rows = rows.filter(isChatSupported);
-    // With no explicit format, show the device-recommended formats (GGUF, plus
-    // MLX on Mac). When the user picks a format, honor it instead so Safetensors
-    // is not dropped by the recommendation default.
-    rows =
-      formatFilter === "all"
-        ? rows.filter((r) => isRecommendableFormat(r.id, r.isGguf, isMac))
-        : rows.filter((r) => matchesFormatFilter(r.id, r.isGguf, formatFilter));
-    // Task-scoped pages load single-file GGUF only. As with recommendedIds, a curated artifact is loadable whatever its format, so GGUF-only here hid the catalog's bf16 / bnb-4bit / fp8 models from Hub search.
-    if (task) {
-      rows = rows.filter(
-        (r) => r.isGguf || Boolean(catalog && artifactForRepoId(r.id, catalog)),
-      );
-    }
-    // Members would render under their canonical group row, which does not exist yet (see recommendedIds): filtering here removed curated models from Hub
-    // search too. The "recommended" sort always applies the device-fit filter; the shared "Fits on device" tick extends it to the other sorts.
-    if (recommendedSort !== "recommended" && !fitOnDeviceOnly) return rows;
-    return rows.filter((r) => {
-      // Downloaded models always show, regardless of device fit.
-      if (downloadedSet.has(r.id.toLowerCase())) return true;
-      return hfModelFitsDevice(r, r.isGguf ? inferenceGpu : gpu);
+    const keep = (r: HfModelResult) =>
+      !isHiddenModelId(r.id) &&
+      !isMobileVariant(r.id) &&
+      isChatSupported(r) &&
+      // No pick: device-recommended formats (GGUF, plus MLX on Mac). A pick wins,
+      // so Safetensors is not dropped.
+      (formatFilter === "all"
+        ? isRecommendableFormat(r.id, r.isGguf, isMac)
+        : matchesFormatFilter(r.id, r.isGguf, formatFilter)) &&
+      // Task pages load single-file GGUF, plus curated artifacts in any format.
+      (!task || r.isGguf || Boolean(catalog && artifactForRepoId(r.id, catalog)));
+    // Members are not filtered here (see recommendedIds): it dropped them from
+    // Hub search too. "recommended" always device-filters; the "Fits on device"
+    // tick extends that to the other sorts.
+    const deviceFiltered = recommendedSort === "recommended" || fitOnDeviceOnly;
+    const fits = (r: HfModelResult) =>
+      // Downloaded models show regardless of fit.
+      downloadedSet.has(r.id.toLowerCase()) ||
+      hfModelFitsDevice(r, r.isGguf ? inferenceGpu : gpu);
+    // Curated rows lead in catalog order, so the list does not reshuffle.
+    return orderRecommendedRows({
+      seeds: catalogSeedRows,
+      results: recommendedSearch.results,
+      keep,
+      deviceFiltered,
+      fits,
     });
   }, [
     recommendedSearch.results,
+    catalogSeedRows,
     downloadedSet,
     recommendedSort,
     fitOnDeviceOnly,
@@ -4769,9 +4802,12 @@ export function HubModelPicker({
                     {recommendedSearch.hasMore && (
                       <>
                         <div ref={recommendedSentinelRef} className="h-px" />
-                        <div className="flex items-center justify-center py-2">
-                          <Spinner className="size-3.5 text-muted-foreground" />
-                        </div>
+                        {/* Only while a page is in flight; on hasMore it sat under a usable list. */}
+                        {recommendedSearch.isLoadingMore ? (
+                          <div className="flex items-center justify-center py-2">
+                            <Spinner className="size-3.5 text-muted-foreground" />
+                          </div>
+                        ) : null}
                       </>
                     )}
                   </>
