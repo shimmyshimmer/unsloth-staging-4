@@ -11,7 +11,7 @@ import {
   useChatModelRuntime,
   useChatRuntimeStore,
 } from "@/features/chat";
-import { useOnlineStatus } from "@/features/hub";
+import { useHubAvailability } from "@/features/hub/hooks/use-online-status";
 import { useHubInfiniteScroll } from "@/features/hub";
 import {
   type ModelPickTarget,
@@ -372,7 +372,13 @@ export function ModelsPage() {
   const navigate = useNavigate();
   const gpu = useGpuInfo();
   const inferenceGpu = useInferenceGpuInfo();
-  const online = useOnlineStatus();
+  // Content availability, not browser reachability: a proxied feed is usable
+  // even while the browser itself cannot reach the Hub.
+  const hubPhase = useHubAvailability().phase;
+  const online = hubPhase === "available";
+  // The Discover footer renders on hasMore, so it outlives the failed page and
+  // its button must too: auto-fill stays off while probing, a click still runs.
+  const canProbe = online || hubPhase === "probing";
   const deviceType = usePlatformStore((s) => s.deviceType);
   const hubSearch = useSearch({ from: "/hub" });
   const urlModel = hubSearch.model ?? null;
@@ -750,6 +756,7 @@ export function ModelsPage() {
     hasMore,
     fetchMore,
     searchError,
+    searchFailure,
     handleRetrySearch,
   } = useDiscoverSearch({
     debouncedQuery,
@@ -1104,6 +1111,7 @@ export function ModelsPage() {
     scannedCount,
     {
       enabled: online && isDiscoverTab && hasMore,
+      manualEnabled: canProbe && isDiscoverTab && hasMore,
       isFetching: isLoading || isLoadingMore,
       resultCount: filteredDiscoverRows.length,
       maxAutoFillFetches: 5,
@@ -1669,6 +1677,7 @@ export function ModelsPage() {
       activeCheckpoint,
       activeGgufVariant,
       searchError,
+      searchFailure,
       online,
       isDataset: isDatasetMode,
       inventoryTokens,
@@ -1698,6 +1707,7 @@ export function ModelsPage() {
     activeCheckpoint,
     activeGgufVariant,
     searchError,
+    searchFailure,
     online,
     isDatasetMode,
     inventoryTokens,
