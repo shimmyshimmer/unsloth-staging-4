@@ -131,8 +131,12 @@ def main() -> int:
                 kw["channel"] = CHANNEL
             browser = getattr(p, ENGINE).launch(**kw)
             print("  browser launched", flush=True)
-            ctx = browser.new_context(viewport={"width": 1000, "height": 800},
-                                      reduced_motion="reduce")
+            # reduced_motion is an emulation override, and WebKit on a real macOS
+            # host never returns from new_context with it set. Nothing here animates.
+            ctx_kw = {"viewport": {"width": 1000, "height": 800}}
+            if not (ENGINE == "webkit" and sys.platform == "darwin"):
+                ctx_kw["reduced_motion"] = "reduce"
+            ctx = browser.new_context(**ctx_kw)
             page = ctx.new_page()
             print("  page open", flush=True)
 
