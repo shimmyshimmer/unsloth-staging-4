@@ -89,10 +89,22 @@ CHROME_JS = r"""
 """
 
 
+# Two frames, or 300ms, whichever comes first. WebKit on a real macOS runner
+# suspends rAF in a headless window, so an unbounded wait for it hangs the job
+# instead of failing it.
+SETTLE_JS = r"""
+() => new Promise((resolve) => {
+  const done = () => { clearTimeout(t); resolve(); };
+  const t = setTimeout(resolve, 300);
+  requestAnimationFrame(() => requestAnimationFrame(done));
+})
+"""
+
+
 def settle(page, w):
     page.set_viewport_size({"width": w, "height": 800})
     page.wait_for_function("w => window.innerWidth === w", arg=w, timeout=20000)
-    page.evaluate("() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
+    page.evaluate(SETTLE_JS)
 
 
 def main() -> int:

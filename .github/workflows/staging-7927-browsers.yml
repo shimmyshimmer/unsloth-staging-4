@@ -71,6 +71,7 @@ jobs:
           fi
 
       - name: PR 7927 browser gate
+        timeout-minutes: 15
         working-directory: studio/frontend/__h3harness__
         env:
           H3_ENGINE: ${{ matrix.engine }}
