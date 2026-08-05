@@ -284,18 +284,62 @@ def test_notes_say_where_commands_run(monkeypatch):
         r'cmd //c start /d C:/tmp "" powershell -Command ls',
     ],
 )
-def test_cmd_shellout_is_screened_through_mangled_switches(monkeypatch, command):
+@pytest.mark.parametrize("bash", [r"C:\Program Files\Git\bin\bash.exe", None])
+def test_cmd_shellout_is_screened_through_mangled_switches(monkeypatch, bash, command):
     # Git Bash turns a lone /c into a path, so a model writes //c. That spelling
     # skipped the nested scan, making `cmd //c powershell` reachable where
     # `cmd /c powershell` was blocked, and `start` launches its argument too.
-    # _BLOCKED_COMMANDS resolves the Windows names at import, so patching
-    # sys.platform is too late; fake the resolved set instead.
-    monkeypatch.setattr(
-        tools,
-        "_BLOCKED_COMMANDS",
-        tools._BLOCKED_COMMANDS_COMMON | tools._BLOCKED_COMMANDS_WIN,
-    )
+    #
+    # Pinned to win32 like the rest of this file: powershell and pwsh are hard
+    # blocks only there (off Windows they are a prompt, see test_permission_mode),
+    # so on a Linux runner this asserted nothing about the nested scan at all.
+    #
+    # Both shells, because the presence of Git Bash decides which lexer runs and
+    # the two disagree about quotes: without it the title in `start ""` arrives
+    # as a literal `""` and every start form here went unscreened.
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(tools, "_windows_bash", lambda: bash)
     assert tools._find_blocked_commands(command)
+
+
+@pytest.mark.parametrize("bash", [r"C:\Program Files\Git\bin\bash.exe", None])
+@pytest.mark.parametrize(
+    "command",
+    [
+        'start "My Title" powershell -Command ls',
+        'cmd /c start "t" pwsh -c ls',
+        'cmd //c start /min "win" powershell -Command ls',
+    ],
+)
+def test_start_screens_the_program_behind_a_window_title(monkeypatch, bash, command):
+    # `start "title" prog` is the documented form. The title was read as the
+    # program, so anything after it launched unscreened -- on both lexers, which
+    # made this the wider of the two holes.
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(tools, "_windows_bash", lambda: bash)
+    assert tools._find_blocked_commands(command)
+
+
+@pytest.mark.parametrize("bash", [r"C:\Program Files\Git\bin\bash.exe", None])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "start notepad rm.txt",
+        "start excel curl.csv",
+        'start "" notepad rm.txt',
+        'start "rm.txt" notepad',
+    ],
+)
+def test_start_arguments_are_not_screened_as_commands(monkeypatch, bash, command):
+    # An unquoted first token is the program and the rest are its arguments, so
+    # only a quoted title moves the scan along. Screening an argument is not
+    # harmless: the recursive scan re-anchors its command-boundary regex at the
+    # start of the token, so `rm.txt` reported `rm` where the same word in the
+    # same place on a full line does not match. A quoted title is data too, and
+    # is not screened either.
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(tools, "_windows_bash", lambda: bash)
+    assert not tools._find_blocked_commands(command)
 
 
 @pytest.mark.parametrize(
@@ -307,7 +351,48 @@ def test_cmd_shellout_is_screened_through_mangled_switches(monkeypatch, command)
         "start notepad",
     ],
 )
-def test_detached_windows_stay_launchable(command):
+@pytest.mark.parametrize("bash", [r"C:\Program Files\Git\bin\bash.exe", None])
+def test_detached_windows_stay_launchable(monkeypatch, bash, command):
     # `start` is the only route to a window on the user's desktop, which the
     # terminal description promises, so screening must not blanket-block cmd.
+    #
+    # Pinned like the rest: unpinned this ran the POSIX lexer with the non-Windows
+    # block set, so it never saw the posture it exists to protect.
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(tools, "_windows_bash", lambda: bash)
+    assert not tools._find_blocked_commands(command)
+
+
+@pytest.mark.parametrize("bash", [r"C:\Program Files\Git\bin\bash.exe", None])
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A separator before the start is the whole point: the second lex has to
+        # be built like the first, or the two stop lining up and the title is
+        # screened in the program's place.
+        'cd /c/proj; cmd //c start "" pwsh -Command ls',
+        'echo done; cmd //c start "" powershell -Command ls',
+        'cmd //c start "" pwsh -Command ls; echo ok',
+        '(cmd //c start "" pwsh -Command ls)',
+        'ls; cmd //c start "Build" powershell -Command "Remove-Item x"',
+        'start "t" powershell -c ls # note',
+        # Microsoft documents the switches after the title, not before it.
+        'start "" /min powershell -c ls',
+        'start "t" /wait /b pwsh -c ls',
+        'cmd /c start "" /min powershell -c ls',
+    ],
+)
+def test_start_screening_survives_separators_and_switch_order(monkeypatch, bash, command):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(tools, "_windows_bash", lambda: bash)
+    assert tools._find_blocked_commands(command)
+
+
+@pytest.mark.parametrize("command", ["pwsh -Command ls", "powershell -c ls", "rmdir x", "runas /u:a b"])
+def test_windows_only_names_are_not_hard_blocked_off_windows(monkeypatch, command):
+    # The Windows set is a hard refusal; off Windows these stay a prompt instead
+    # (tests/test_permission_mode.py). Nothing asserted that, so dropping the
+    # platform gate entirely -- blocking them on Linux and macOS too -- passed
+    # the whole suite.
+    monkeypatch.setattr(sys, "platform", "linux")
     assert not tools._find_blocked_commands(command)
