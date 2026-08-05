@@ -1653,13 +1653,41 @@ export function ModelsPage() {
     ],
   );
 
-  const catalogState = useMemo<ModelsCatalogState>(() => {
-    const typeFilterActive = !isDatasetMode && inventoryTypeFilter !== "all";
-    return {
+  const catalogState = useMemo<ModelsCatalogState>(
+    () => {
+      const typeFilterActive =
+        !isDatasetMode && inventoryTypeFilter !== "all";
+      return {
+        tab,
+        discoverRows: listRows,
+        cachedRows: filteredCachedRows,
+        localRows: filteredLocalRows,
+        selectedId,
+        isLoading,
+        downloadedReady,
+        inventoryError,
+        inventoryWarning,
+        query,
+        activeCheckpoint,
+        activeGgufVariant,
+        searchError,
+        online,
+        isDataset: isDatasetMode,
+        inventoryTokens,
+        scannedCount,
+        loadingIntentCount: discoverFetchIntent,
+        hasMore,
+        manualFetchAvailable: discoverManualFetchAvailable,
+        hasActiveFilters:
+          !isFeedMode &&
+          (deferredFormatFilter !== "all" ||
+            deferredCapabilityFilter !== "all" ||
+            (tab === "downloaded" && typeFilterActive)),
+        typeFilterActive,
+      };
+    },
+    [
       tab,
-      discoverRows: listRows,
-      cachedRows: filteredCachedRows,
-      localRows: filteredLocalRows,
       selectedId,
       isLoading,
       downloadedReady,
@@ -1670,45 +1698,21 @@ export function ModelsPage() {
       activeGgufVariant,
       searchError,
       online,
-      isDataset: isDatasetMode,
       inventoryTokens,
       scannedCount,
-      loadingIntentCount: discoverFetchIntent,
       hasMore,
-      manualFetchAvailable: discoverManualFetchAvailable,
-      hasActiveFilters:
-        !isFeedMode &&
-        (deferredFormatFilter !== "all" ||
-          deferredCapabilityFilter !== "all" ||
-          (tab === "downloaded" && typeFilterActive)),
-      typeFilterActive,
-    };
-  }, [
-    tab,
-    isFeedMode,
-    listRows,
-    filteredCachedRows,
-    filteredLocalRows,
-    selectedId,
-    isLoading,
-    downloadedReady,
-    inventoryError,
-    inventoryWarning,
-    query,
-    activeCheckpoint,
-    activeGgufVariant,
-    searchError,
-    online,
-    isDatasetMode,
-    inventoryTokens,
-    scannedCount,
-    discoverFetchIntent,
-    hasMore,
-    discoverManualFetchAvailable,
-    deferredFormatFilter,
-    deferredCapabilityFilter,
-    inventoryTypeFilter,
-  ]);
+      isFeedMode,
+      listRows,
+      filteredCachedRows,
+      filteredLocalRows,
+      isDatasetMode,
+      discoverFetchIntent,
+      discoverManualFetchAvailable,
+      deferredFormatFilter,
+      deferredCapabilityFilter,
+      inventoryTypeFilter,
+    ],
+  );
 
   const catalogPagination = useMemo<ModelsCatalogPagination>(
     () => ({

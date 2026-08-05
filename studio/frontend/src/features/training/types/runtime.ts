@@ -17,11 +17,14 @@ export type TrainingPhase =
 
 export interface TrainingStatusResponse {
   job_id: string;
+  start_request_id?: string | null;
+  start_request_state?: "pending" | "accepted" | "rejected" | null;
   phase: TrainingPhase;
   is_training_running: boolean;
   eval_enabled: boolean;
   message: string;
   error: string | null;
+  warnings?: string[];
   details?: {
     epoch?: number;
     step?: number;
@@ -43,6 +46,7 @@ export interface TrainingStatusResponse {
 }
 
 export interface TrainingMetricsResponse {
+  job_id: string;
   loss_history: number[];
   lr_history: number[];
   step_history: number[];
@@ -80,9 +84,11 @@ export interface TrainingRuntimeState {
   evalEnabled: boolean;
   message: string;
   error: string | null;
+  warnings: string[];
   isHydrating: boolean;
   hasHydrated: boolean;
   isStarting: boolean;
+  startRequestId: string | null;
   startError: string | null;
   startModelName: string | null;
   startDatasetName: string | null;
@@ -119,6 +125,7 @@ export interface TrainingRuntimeActions {
   setStopRequested: (value: boolean) => void;
   setHydrating: (value: boolean) => void;
   setHasHydrated: (value: boolean) => void;
+  tryBeginStarting: (startRequestId: string) => boolean;
   setStarting: (value: boolean) => void;
   setStartError: (value: string | null) => void;
   setStartResources: (
@@ -133,13 +140,18 @@ export interface TrainingRuntimeActions {
   applyStatus: (payload: TrainingStatusResponse) => void;
   applyMetrics: (payload: TrainingMetricsResponse) => void;
   applyProgress: (payload: TrainingProgressPayload, eventId?: number) => void;
-  setStartQueued: (jobId: string, message: string) => void;
+  setStartPending: (
+    jobId: string | null,
+    message: string,
+    startRequestId?: string | null,
+  ) => void;
   setRuntimeError: (message: string) => void;
   setSelectedHistoryRunId: (id: string | null) => void;
   setCurrentRunViewActive: (value: boolean) => void;
 }
 
-export type TrainingRuntimeStore = TrainingRuntimeState & TrainingRuntimeActions;
+export type TrainingRuntimeStore = TrainingRuntimeState &
+  TrainingRuntimeActions;
 
 export interface TrainingViewData {
   // Current metrics (for ProgressSection)
@@ -161,6 +173,7 @@ export interface TrainingViewData {
   evalEnabled: boolean;
   message: string;
   error: string | null;
+  warnings: string[];
   isTrainingRunning: boolean;
 
   // Config summary
