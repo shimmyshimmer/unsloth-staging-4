@@ -76,4 +76,4 @@ jobs:
           H3_ENGINE: ${{ matrix.engine }}
           H3_CHANNEL: ${{ matrix.channel }}
           H3_DIST: dist
-        run: python ci_browser_check.py
+        run: python -u ci_browser_check.py
