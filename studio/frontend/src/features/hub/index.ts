@@ -43,6 +43,7 @@ export {
 export { useInventoryVersion } from "./stores/inventory-events";
 export { looksLikeLocalPath } from "./lib/local-path";
 export { hubTokenHeader } from "./lib/hub-token-header";
+export { setHubProxyAuthFetch } from "./lib/network";
 export {
   ggufVariantsMatch,
   isOllamaLinkPath,
@@ -62,4 +63,7 @@ export { DotTag } from "./catalog/dot-tag";
 export { TransportConflictDialog } from "./catalog/transport-conflict-dialog";
 export { TrainIcon } from "./components/train-icon";
 export { isHiddenModelId } from "./lib/hidden-models";
-export { classifyUnslothSupport, studioPageForTask } from "./lib/unsloth-support";
+export {
+  classifyUnslothSupport,
+  studioPageForTask,
+} from "./lib/unsloth-support";
