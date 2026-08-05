@@ -108,6 +108,7 @@ from .diffusion_precision import normalize_te_quant, quantize_text_encoders
 from .diffusion_te_prequant import te_prequant_pipe_kwargs
 from .diffusion_prequant import (
     load_prequantized_transformer,
+    prequant_checkpoint_cached,
     resolve_prequant_source,
     usable_prequant_source,
 )
@@ -429,6 +430,148 @@ def _assert_local_base_is_pipeline(base_repo: str) -> None:
         )
 
 
+def _repo_access_message(repo: str, *, gated: bool) -> str:
+    """The repo id AND its licence page. The worker's own 401/403 names neither, and the base is
+    resolved from a card tag, so the user never even saw which repo it is."""
+    url = f"https://huggingface.co/{repo}"
+    if gated:
+        return (
+            f"'{repo}' is gated on Hugging Face and this model cannot be downloaded without it. "
+            f"Accept its licence at {url}, then add a Hugging Face token that has access in "
+            "Studio settings and try again."
+        )
+    return (
+        f"'{repo}' could not be read from Hugging Face (private, renamed or removed) and this "
+        f"model cannot be downloaded without it. Check {url}, then add a Hugging Face token that "
+        "has access in Studio settings and try again."
+    )
+
+
+def _assert_base_repo_accessible(
+    base_repo: str,
+    hf_token: Optional[str],
+    probe_file: str = "model_index.json",
+) -> None:
+    """Fail up front, with the licence URL, when a companion base cannot be read.
+
+    The Hub gates the BYTE endpoint only, so ``model_info`` answers anonymously for gated FLUX /
+    Krea / Ideogram repos and a plan built from it dies mid-download with a bare token error.
+    Probes a file the load fetches anyway, and only when ``gated`` is set ("auto"/"manual", a
+    truthy STRING, never True), so an open repo costs one metadata call. Fails open on any
+    non-access error: offline/transient must not block a load.
+
+    ``probe_file`` is that file: the pipeline manifest for a diffusers base, but the native plan
+    passes its own asset name, since a repo it reads only for a VAE has no manifest cached and
+    would be refused for a load that works today."""
+    repo = (base_repo or "").strip()
+    # Only a remote 'org/name' can be gated; a local base is already on disk.
+    if not repo or repo.count("/") != 1:
+        return
+    # Blank to None, as load_pipeline does later. build_hf_headers sends any str verbatim, so ""
+    # becomes a literal "Bearer " that answers 401 invalid-credentials, and the 401 handling below
+    # would turn an open base into a hard access error. None means "use the cached login".
+    hf_token = (hf_token.strip() if isinstance(hf_token, str) else hf_token) or None
+    try:
+        if Path(repo).expanduser().exists():
+            return
+    # OSError: invalid path characters -> a remote id, not a local path.
+    # RuntimeError: pathlib raises it, NOT an OSError, when expanduser() cannot resolve the home
+    # directory -- '~someoneelse/models' on any OS, and plain '~/models' under a Windows service
+    # account with no USERPROFILE or a daemon with no HOME. Exactly one forward slash, so both
+    # reach here rather than short-circuiting above, and an escape turns this fail-open probe into
+    # a 500 on a load that has not even started.
+    except (OSError, RuntimeError, ValueError):
+        pass
+    try:
+        from huggingface_hub import HfApi, get_hf_file_metadata, hf_hub_url
+        from huggingface_hub.errors import (
+            GatedRepoError,
+            HfHubHTTPError,
+            RepositoryNotFoundError,
+        )
+    except Exception:  # noqa: BLE001 — an unexpected hub layout leaves today's behaviour
+        return
+
+    # A base already on disk needs no Hub access, so refusing one can only block a load that works
+    # today: hf_hub_download catches the gated/401 HEAD and returns the cached pointer ("let's
+    # switch to 'local_files_only=True' to check if the files are already cached",
+    # file_download._get_metadata_or_catch_error), which is how a downloaded gated base still loads
+    # once the token is cleared or expires. It excuses an ACCESS verdict only, never a 404: a
+    # renamed or removed repo cannot be un-renamed by a stale copy on disk, and the size estimate
+    # swallows that 404 into a zero-byte plan.
+    def _already_downloaded() -> bool:
+        """True when ``probe_file`` is on disk under either root. Both roots, as the pre-quant
+        lookup does: the prefetch downloads under huggingface_hub's import-time constant while
+        Studio pins its live setting. Never raises.
+
+        Exact for the native plan, which probes an asset it stages, and a proxy for the diffusers
+        plan, which probes the manifest: a base whose manifest is cached but whose shards are not
+        now passes the preflight and dies mid-download on the bare token error. That is the
+        pre-preflight behaviour, so the excuse costs a better message in a partial-download case
+        and never blocks a load -- the opposite trade of refusing every cached base outright."""
+        try:
+            from huggingface_hub import try_to_load_from_cache
+            for root in (hub_cache_dir(), None):
+                # Only a str is a cached path; a miss is None and an absent file is a sentinel.
+                if isinstance(try_to_load_from_cache(repo, probe_file, cache_dir = root), str):
+                    return True
+        except Exception:  # noqa: BLE001 — a cache we cannot read is not an access verdict
+            pass
+        return False
+
+    def _is_auth_error(exc: Any) -> bool:
+        """A 401/403 that hf_raise_for_status did not classify.
+
+        An expired or malformed token answers 401 "Invalid credentials in Authorization header",
+        which _http.py excludes from its RepoNotFound branch by name, and a token without the right
+        permission answers a bare 403. Both arrive as plain HfHubHTTPError, so catching only the
+        classified errors fails open on exactly the case this probe exists to catch."""
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        return status in (401, 403)
+
+    try:
+        gated = getattr(HfApi().model_info(repo, token = hf_token), "gated", None)
+    except GatedRepoError:  # a gated repo can also withhold its metadata
+        if _already_downloaded():
+            return
+        raise ValueError(_repo_access_message(repo, gated = True)) from None
+    except RepositoryNotFoundError as exc:
+        # 401 and 404 both arrive here: hf_raise_for_status folds "private and gated repos if user
+        # is not authenticated" in with a missing repo, because "401 is misleading" (_http.py), so
+        # the status has to be re-read to tell them apart. A 401/403 is an ACCESS verdict and earns
+        # the same cache escape as the other access branches -- a private companion already on disk
+        # still loads once the token is cleared or expires, since hf_hub_download serves it from
+        # the cache. A genuine 404 is never excused: a renamed or removed repo cannot be
+        # un-renamed by a stale copy on disk, and the size estimate swallows that 404 into a
+        # zero-byte plan. An error carrying no response reads as neither, so it raises: fail safe.
+        if _is_auth_error(exc) and _already_downloaded():
+            return
+        raise ValueError(_repo_access_message(repo, gated = False)) from None
+    except HfHubHTTPError as exc:
+        if not _is_auth_error(exc):
+            return  # a 5xx or rate limit is not an access verdict
+        if _already_downloaded():
+            return
+        raise ValueError(_repo_access_message(repo, gated = False)) from None
+    except Exception:  # noqa: BLE001 — offline / transient: the download surfaces any real error
+        return
+    if not gated or _already_downloaded():
+        return
+    try:
+        # A metadata HEAD, never hf_hub_download: a cached manifest makes the download return the
+        # cached pointer (the 401 HEAD is kept as head_call_error), so a stale token would pass the
+        # probe and 401 again mid-prefetch. The HEAD hits the same /resolve/ URL the shards do.
+        get_hf_file_metadata(hf_hub_url(repo, probe_file), token = hf_token)
+    except GatedRepoError:
+        raise ValueError(_repo_access_message(repo, gated = True)) from None
+    except HfHubHTTPError as exc:
+        if not _is_auth_error(exc):
+            return
+        raise ValueError(_repo_access_message(repo, gated = True)) from None
+    except Exception:  # noqa: BLE001 — no manifest / offline / transient is not an access verdict
+        return
+
+
 @dataclass(frozen = True)
 class _LoadState:
     """Everything about the currently-loaded pipeline, swapped as one unit."""
@@ -564,6 +707,66 @@ def _install_gguf_prefix_strip(transformer_cls: Any, logger: Any) -> None:
         logger.warning("diffusion.gguf: prefix-strip shim not installed: %s", exc)
 
 
+_NO_WEIGHT = object()
+
+
+def _has_active_lora(loras: Any) -> bool:
+    """True when any adapter would actually be baked, for either shape the callers pass.
+
+    Weight 0 means disabled everywhere else in this file, but the two entry points disagree on
+    shape: /images/load hands over ``(id, weight)`` tuples while /images/download-plan passes the
+    ``LoraSpec`` models through untouched. Unpacking a pydantic model yields its ``(field, value)``
+    pairs, so ``(_lid, w)`` would bind ``w`` to ``("weight", 0.0)`` and read a disabled adapter as
+    active. Reading the attribute first and only then falling back to unpacking covers both."""
+    for entry in loras or ():
+        weight = getattr(entry, "weight", _NO_WEIGHT)
+        if weight is _NO_WEIGHT:
+            try:
+                _lid, weight = entry
+            except (TypeError, ValueError):  # an unrecognised shape is not a disabled adapter
+                return True
+        try:
+            if float(weight) != 0:
+                return True
+        except (TypeError, ValueError):  # likewise: an unreadable weight must not skip the bake
+            return True
+    return False
+
+
+def _uncached_prequant_repo(
+    fam: Optional[DiffusionFamily],
+    target: Any,
+    requested: Optional[str],
+    *,
+    base_repo: Optional[str],
+    prequant_path: Optional[str],
+) -> Optional[str]:
+    """The hosted pre-quant repo an AUTO-derived quant would have to DOWNLOAD for this pick, or
+    None when it costs no extra bytes (no hosted source, a local override, or already cached).
+
+    Otherwise an auto pick of ``unsloth/Z-Image-GGUF`` fetches the GGUF and then a second 6.29 GB
+    denoiser it uses instead, which is not what "auto" may spend on the user's behalf. Shared by
+    ``load_pipeline`` and ``_dense_quant_prefetch_needed`` so the load and the download plan
+    decline together. Cheap (a refs read + stat) and never raises."""
+    try:
+        scheme = select_transformer_quant_scheme(
+            target, requested, family = getattr(fam, "name", None)
+        )
+        if scheme is None:
+            return None
+        source = usable_prequant_source(
+            fam, scheme, path_override = prequant_path, base_repo = base_repo
+        )
+        # A local override is the operator's own file, so it never downloads.
+        if source is None or source.kind != "repo":
+            return None
+        if prequant_checkpoint_cached(source, cache_dir = hub_cache_dir()):
+            return None
+        return source.location
+    except Exception:  # noqa: BLE001 — a probe that cannot answer keeps the prequant shortcut
+        return None
+
+
 class DiffusionBackend:
     """Holds at most one loaded diffusers pipeline. All mutations are serialised."""
 
@@ -623,9 +826,29 @@ class DiffusionBackend:
         local_root = Path(repo_id).expanduser()
         if local_root.exists():
             return str(resolve_local_gguf_child(local_root, gguf_filename))
-        from huggingface_hub import hf_hub_download
+        from huggingface_hub import hf_hub_download, try_to_load_from_cache
 
-        return hf_hub_download(repo_id, gguf_filename, token = hf_token)
+        # Pin the LIVE root, as the prefetch does (hf_hub_download_with_xet_fallback defaults to
+        # it). Unpinned, this resolves against huggingface_hub's import-time constant, so a
+        # mid-session cache change misses the GGUF the prefetch just staged and pulls the whole
+        # multi-GB file again -- inside the load lock, after eviction, where unload cannot preempt
+        # it and progress already reported 100%.
+        cache_dir = hub_cache_dir()
+        if not isinstance(try_to_load_from_cache(repo_id, gguf_filename, cache_dir = cache_dir), str):
+            # Same other-root reuse as the pre-quant checkpoint: a copy under the import-time root
+            # is one hf_hub_download will not look for, and re-fetching it is the download this
+            # pins the root to avoid. Reached THROUGH that root rather than returned raw, so the
+            # ref is still resolved and a republished GGUF under the same name is picked up; the
+            # blob is reused, so nothing is re-fetched when it has not changed, and offline the
+            # HEAD failure is swallowed and the cached pointer comes back anyway. Any other
+            # failure falls back to the path already found, so this cannot break a working load.
+            elsewhere = try_to_load_from_cache(repo_id, gguf_filename, cache_dir = None)
+            if isinstance(elsewhere, str) and Path(elsewhere).is_file():
+                try:
+                    return hf_hub_download(repo_id, gguf_filename, token = hf_token, cache_dir = None)
+                except Exception:  # noqa: BLE001 — revalidation is a bonus, never a new failure
+                    return elsewhere
+        return hf_hub_download(repo_id, gguf_filename, token = hf_token, cache_dir = cache_dir)
 
     def _dense_quant_prefetch_needed(self, fam: DiffusionFamily, kwargs: dict) -> bool:
         """True when ``load_pipeline`` may take the dense transformer-quant path, so
@@ -637,10 +860,12 @@ class DiffusionBackend:
         "finalizing", after the previous pipeline was already evicted, where
         unload/cancellation cannot preempt the download. Mirrors the dense-path
         gates in ``load_pipeline``: quant requested and supported for this device,
-        and no pre-quantized checkpoint that would shortcut the dense build."""
+        and no pre-quantized checkpoint that would shortcut the dense build. Callers only ask for
+        a ``kind == "gguf"`` pick, so the auto-quant decline below applies as written."""
         raw = kwargs.get("transformer_quant")
         # Unset defaults to the hardware ladder (mirrors load_pipeline's tri-state).
-        if raw is None or str(raw).strip().lower() in ("", "auto"):
+        auto = raw is None or str(raw).strip().lower() in ("", "auto")
+        if auto:
             mode = TQ_AUTO
         else:
             mode = normalize_transformer_quant(raw)
@@ -658,6 +883,23 @@ class DiffusionBackend:
             if mm is None and kwargs.get("cpu_offload"):
                 return False
             target = self._resolve_device_target(fam)
+            # Same decline as load_pipeline: an uncached hosted pre-quant keeps the GGUF, so the
+            # plan must not stage the base transformer/ shards either.
+            if (
+                auto
+                # Active weights, as load_pipeline reads them: an all-zero list is not a bake, and
+                # disagreeing here stages the base transformer/ shards for a load that runs the GGUF.
+                and not _has_active_lora(kwargs.get("loras"))
+                and _uncached_prequant_repo(
+                    fam,
+                    target,
+                    mode,
+                    base_repo = kwargs.get("base_repo"),
+                    prequant_path = kwargs.get("transformer_prequant_path"),
+                )
+                is not None
+            ):
+                return False
             # Only widen when the loader would take the dense path; same candidate load_pipeline re-plans against.
             candidate = resolve_dense_quant_candidate(
                 fam = fam,
@@ -665,7 +907,9 @@ class DiffusionBackend:
                 requested = mode,
                 base_repo = kwargs.get("base_repo"),
                 prequant_path = kwargs.get("transformer_prequant_path"),
-                force_dense = bool(kwargs.get("loras")),
+                # Same rule as the decline above it: an all-zero list bakes nothing, so sizing
+                # it as a dense bake stages transformer/ shards the load will not read.
+                force_dense = _has_active_lora(kwargs.get("loras")),
                 logger = None,
             )
             # A prequant loads a small checkpoint, so widening defeats the savings and can disk-full.
@@ -712,16 +956,27 @@ class DiffusionBackend:
 
         # Callers without a per-load event (tests, direct use) fall back to the current one.
         cancel = cancel_event if cancel_event is not None else self._cancel_event
+        # A file cached only under huggingface_hub's import-time root resolves through that root
+        # instead of being pulled again into the live one. The preflight clears a base found under
+        # EITHER root, so without this a cache-folder change turns an already-downloaded gated or
+        # private base into the bare Hub token error mid-prefetch (and every other moved asset
+        # into a needless multi-GB re-download) on a load the preflight just accepted.
         # GGUF transformer (hub repos only; a local path is already on disk).
         if gguf_filename and not Path(repo_id).expanduser().exists():
-            hf_hub_download_with_xet_fallback(repo_id, gguf_filename, hf_token, cancel_event = cancel)
+            hf_hub_download_with_xet_fallback(
+                repo_id,
+                gguf_filename,
+                hf_token,
+                cancel_event = cancel,
+                reuse_other_cache_root = True,
+            )
         # Base repo (VAE / text-encoder / scheduler); list comes from the estimate.
         snapshot_root: Optional[str] = None
         for rfilename in base_files:
             if cancel.is_set():
                 raise RuntimeError("Cancelled")
             local = hf_hub_download_with_xet_fallback(
-                base, rfilename, hf_token, cancel_event = cancel
+                base, rfilename, hf_token, cancel_event = cancel, reuse_other_cache_root = True
             )
             if rfilename == "model_index.json":
                 snapshot_root = str(Path(local).parent)
@@ -926,6 +1181,8 @@ class DiffusionBackend:
                 base = _resolve_base_repo(
                     kwargs["repo_id"], kwargs.get("base_repo"), fam, kwargs.get("hf_token")
                 )
+            # Same preflight the plan runs: catch a gated base here, not 15 GiB into the prefetch.
+            _assert_base_repo_accessible(base, kwargs.get("hf_token"))
             kwargs["base_repo"] = base
             # The pre-cast encoder replaces these weights, so skip their dense shards. Same resolver as the injection.
             te_prequant_files = self._te_prequant_plan_files(
@@ -1169,6 +1426,9 @@ class DiffusionBackend:
             base = repo_id  # the full pipeline IS the repo
         else:
             base = _resolve_base_repo(repo_id, base_repo, fam, hf_token)
+        # A gated base answers model_info anonymously, so the plan below would be confident and the
+        # 401 land mid-download. The route maps ValueError -> 400.
+        _assert_base_repo_accessible(base, hf_token)
         # Only a checkpoint that really resolves on the Hub earns the right to drop dense shards.
         te_files = self._te_prequant_plan_files(fam, text_encoder_quant, hf_token)
         sizes: dict[str, int] = {}
@@ -1179,8 +1439,10 @@ class DiffusionBackend:
             hf_token,
             kind = kind,
             single_file_is_pipeline = bool(fam and fam.single_file_is_pipeline),
+            # With the RESOLVED base, as the load passes it: a variant base picks its own pre-quant
+            # repo, so the caller's raw one would answer a different question than the loader.
             include_transformer = kind == "gguf"
-            and self._dense_quant_prefetch_needed(fam, load_kwargs),
+            and self._dense_quant_prefetch_needed(fam, {**load_kwargs, "base_repo": base}),
             sizes_out = sizes,
             skip_te_components = tuple(te_files),
         )
@@ -1443,10 +1705,10 @@ class DiffusionBackend:
                 )
 
                 # Dtype tri-state: unset/"auto" -> hardware ladder; "none"/"off" pins GGUF-as-is; an explicit scheme pins it.
-                if transformer_quant is None or str(transformer_quant).strip().lower() in (
-                    "",
-                    "auto",
-                ):
+                transformer_quant_auto = transformer_quant is None or str(
+                    transformer_quant
+                ).strip().lower() in ("", "auto")
+                if transformer_quant_auto:
                     # An explicit Speed="off" stays GGUF-as-is: auto-quant would break the bit-exact request.
                     speed_off = (
                         speed_mode is not None and str(speed_mode).strip().lower() == SPEED_OFF
@@ -1457,17 +1719,42 @@ class DiffusionBackend:
                 pipe = None
                 transformer_quant_engaged = None
                 quant_plan = None
-                # The GGUF-size plan can mis-budget the fast path, so preflight the real footprint pre-eviction.
+                # The GGUF-size plan can mis-budget the fast path, so preflight the real footprint pre-eviction. Also set below when an auto quant declines a hosted pre-quant.
                 dense_declined = False
                 # False when the plan only holds a PREQUANT-sized build: a failed prequant load must raise, not materialise the
                 # unbudgeted dense bf16 transformer. Also false when the prefetch skipped the base repo's transformer/ shards, since
                 # the fallback would pull them HERE, inside the load lock, after eviction, where unload cannot preempt it and
                 # progress already reported 100%.
                 dense_fallback_allowed = bool(_transformer_prefetched)
+                # The user picked a GGUF and left the scheme to us, so the hosted pre-quant is free
+                # only while already cached: fetching it means a SECOND multi-GB denoiser and the
+                # GGUF never runs. An explicit fp8/int8 request, a LoRA bake (dense by construction)
+                # and every non-GGUF kind keep today's behaviour, where the prequant IS the point.
+                # An all-zero-weight list is not a bake: LoraSpec and every sibling check read
+                # weight 0 as disabled, so plain truthiness here would skip the decline and fetch
+                # the dense companion for a request that applies no adapter at all.
+                baking_loras = _has_active_lora(loras)
+                if kind == "gguf" and transformer_quant_auto and not baking_loras:
+                    uncached_prequant = _uncached_prequant_repo(
+                        fam,
+                        target,
+                        transformer_quant,
+                        base_repo = base,
+                        prequant_path = transformer_prequant_path,
+                    )
+                    if uncached_prequant is not None:
+                        logger.info(
+                            "diffusion.transformer_quant_declined: pre-quant checkpoint in %s is "
+                            "not cached (an auto quant never downloads a second transformer for a "
+                            "GGUF pick); loading the GGUF",
+                            uncached_prequant,
+                        )
+                        dense_declined = True
                 if (
                     kind == "gguf"
                     and normalize_transformer_quant(transformer_quant) is not None
                     and dense_transformer_supported(target)
+                    and not dense_declined
                 ):
                     if plan.offload_policy != OFFLOAD_NONE:
                         # The GGUF plan picked offload but the quantised artifact is smaller, so re-plan: a resident quant build wins.
@@ -1478,7 +1765,7 @@ class DiffusionBackend:
                             base_repo = base,
                             prequant_path = transformer_prequant_path,
                             # A LoRA bake skips the prequant shortcut, so size for the dense build it will run.
-                            force_dense = bool(loras),
+                            force_dense = _has_active_lora(loras),
                             logger = logger,
                         )
                         if candidate is not None:
@@ -1536,7 +1823,7 @@ class DiffusionBackend:
                         prequant = (
                             # A LoRA bake skips the prequant shortcut, so gate the fast path as if no prequant existed.
                             None
-                            if loras
+                            if _has_active_lora(loras)
                             else usable_prequant_source(
                                 fam,
                                 scheme,
@@ -1612,7 +1899,7 @@ class DiffusionBackend:
                     pipe is None
                     and kind == "gguf"
                     and normalize_transformer_quant(transformer_quant) is not None
-                    and any(w != 0 for (_lid, w) in (loras or ()))
+                    and _has_active_lora(loras)
                 ):
                     # Adapters were requested BAKED but that build failed, and the GGUF fallback cannot carry them; fail loudly.
                     raise RuntimeError(
@@ -2085,8 +2372,10 @@ class DiffusionBackend:
             # Bail BEFORE the multi-GB dense download: an unsupported scheme (fp8 on Ampere, nvfp4 off Blackwell) would
             # materialise the transformer only to fail at quantize, after eviction. load_pipeline falls back to GGUF.
             raise RuntimeError("transformer quant unsupported for this device/scheme")
-        if fam is not None and not lora_specs:
-            # A LoRA bake needs the DENSE transformer (adapters attach before quantize_), so skip prequant.
+        if fam is not None and not _has_active_lora(lora_specs):
+            # A LoRA bake needs the DENSE transformer (adapters attach before quantize_), so skip
+            # prequant. Active weights only: an all-zero list bakes nothing, so it must not cost the
+            # caller the dense build the decline above already declined to pay for.
             source = resolve_prequant_source(
                 fam, scheme, path_override = prequant_path, base_repo = base
             )
@@ -2103,6 +2392,9 @@ class DiffusionBackend:
                     min_features = DEFAULT_MIN_LINEAR_FEATURES,
                     # Only enforced when the caller forces fp8 fast-accum; a checkpoint that baked the other choice falls to the dense path.
                     fast_accum = fast_accum,
+                    # The root _uncached_prequant_repo cleared this load against, so its hit is
+                    # reused instead of re-downloaded under the import-time constant.
+                    cache_dir = hub_cache_dir(),
                     logger = logger,
                 )
                 if transformer is not None:
@@ -2145,7 +2437,7 @@ class DiffusionBackend:
             te_quant_mode = text_encoder_quant,
             target = target,
         )
-        if lora_specs:
+        if _has_active_lora(lora_specs):
             # Bake the adapters BEFORE quantize_: peft wraps the dense Linears (post-quant torchao dispatch would TypeError),
             # then quantize_ converts only each wrapper's frozen base_layer while the "lora_" side path stays high precision.
             baked = self._resolve_lora_set(
@@ -2822,7 +3114,7 @@ class DiffusionBackend:
 
                 # Deferred speed auto: engage the compile profile on the 3rd image. Best-effort; a failure stays eager and never retries.
                 # NOT when a LoRA is requested: a compiled transformer rejects LoRA, breaking every LoRA generation on this load.
-                lora_requested = any(w != 0 for (_id, w) in (loras or []))
+                lora_requested = _has_active_lora(loras)
                 # Also stay eager while a PRIOR generation's adapters are attached: compiling would bake them in permanently.
                 loras_attached = bool(getattr(state.pipe, "_unsloth_loras", ()))
                 if (
