@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>7927 layout harness</title>
+    <script>
+      // Must run BEFORE the bundle: `isTauri` is computed at module-eval time in
+      // lib/api-base.ts, and getClientPlatform() reads userAgentData first. This
+      // is what makes shouldUseCustomWindowTitlebar() true, i.e. it puts the app
+      // on the Windows/Linux custom-titlebar path the PR is about.
+      (function () {
+        var params = new URLSearchParams(location.search);
+        if (params.get("tauri") !== "0") {
+          Object.defineProperty(window, "__TAURI_INTERNALS__", {
+            value: {},
+            configurable: true,
+          });
+        }
+        var platform = params.get("platform") || "Windows";
+        Object.defineProperty(navigator, "userAgentData", {
+          value: { platform: platform },
+          configurable: true,
+        });
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>

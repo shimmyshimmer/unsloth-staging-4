@@ -1,0 +1,79 @@
+name: "staging-7927 browsers"
+on:
+  push:
+    branches: ["pr-7927-xplat-ci"]
+    paths:
+      - 'studio/frontend/**'
+      - '.github/workflows/staging-7927-browsers.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  browsers:
+    name: "${{ matrix.os }} / ${{ matrix.channel && 'msedge (real Edge)' || matrix.engine }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: the three engines.
+          - { os: ubuntu-latest, engine: chromium, channel: "" }
+          - { os: ubuntu-latest, engine: firefox,  channel: "" }
+          - { os: ubuntu-latest, engine: webkit,   channel: "" }
+          # Windows: the three engines plus the REAL Edge, which is preinstalled
+          # on the runner. Chromium-the-engine is not the same artifact as the
+          # shipping Edge, so this is the only place that claim gets measured.
+          - { os: windows-latest, engine: chromium, channel: "" }
+          - { os: windows-latest, engine: firefox,  channel: "" }
+          - { os: windows-latest, engine: webkit,   channel: "" }
+          - { os: windows-latest, engine: chromium, channel: "msedge" }
+          # macOS: WebKit on macOS is the closest CI gets to real Safari.
+          - { os: macos-14, engine: chromium, channel: "" }
+          - { os: macos-14, engine: firefox,  channel: "" }
+          - { os: macos-14, engine: webkit,   channel: "" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build the layout harness
+        working-directory: studio/frontend
+        run: |
+          npm ci --no-fund --no-audit
+          ./node_modules/.bin/vite build --config __h3harness__/vite.config.ts
+          test -f __h3harness__/dist/__h3harness__/index.html
+
+      # The harness only measures geometry, so it never touches the Web Crypto
+      # path that makes Studio itself Chromium-only.
+      - name: Install Playwright ${{ matrix.engine }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'playwright>=1.55'
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            python -m playwright install --with-deps ${{ matrix.engine }}
+          else
+            python -m playwright install ${{ matrix.engine }}
+          fi
+
+      - name: PR 7927 browser gate
+        working-directory: studio/frontend/__h3harness__
+        env:
+          H3_ENGINE: ${{ matrix.engine }}
+          H3_CHANNEL: ${{ matrix.channel }}
+          H3_DIST: dist
+        run: python ci_browser_check.py

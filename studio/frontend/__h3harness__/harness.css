@@ -1,0 +1,6 @@
+/* Native relative import inside the app root, so Tailwind's source detection
+   sees src/ and this directory exactly as it does for the real app build. */
+@import "../src/index.css";
+
+/* The pre-PR copies live here rather than under src/, so declare them. */
+@source "./**/*.{ts,tsx}";
