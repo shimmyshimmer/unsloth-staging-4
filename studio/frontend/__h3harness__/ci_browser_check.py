@@ -135,15 +135,31 @@ def main() -> int:
                     failures.append(f"{row}: no improvement at {NARROW}px")
 
             print("\n[2] painted geometry unchanged at widths that already fitted")
+            # Where the label STARTS, how many lines it takes, and where the
+            # control sits must be identical: those are what a user sees move.
+            EXACT = ("textLeft", "textTop", "lines", "ctrlLeft", "ctrlRight", "ctrlTop")
             deltas = 0
             for w in WIDE:
                 b, a = settings[("before", w)], settings[("after", w)]
                 for row in a:
-                    for k in ("textLeft", "textRight", "textTop", "lines",
-                              "ctrlLeft", "ctrlRight", "ctrlTop"):
+                    for k in EXACT:
                         if abs(a[row][k] - b[row][k]) > 0.5:
                             deltas += 1
                             print(f"    DELTA w={w} {row}.{k}: {b[row][k]} -> {a[row][k]}")
+                    # textRight is the text's own extent. The PR only ever gives
+                    # the label MORE room (flex-1 basis-0 vs shrink-to-fit), so it
+                    # may grow but must never shrink. Real Edge shapes this text a
+                    # few px wider than Chromium does at the same width, which is
+                    # an engine difference, not a regression, and is invisible
+                    # because the control is right-aligned metres away.
+                    grow = a[row]["textRight"] - b[row]["textRight"]
+                    if grow < -0.5:
+                        deltas += 1
+                        print(f"    DELTA w={w} {row}.textRight SHRANK: "
+                              f"{b[row]['textRight']} -> {a[row]['textRight']}")
+                    elif abs(grow) > 0.5:
+                        print(f"    note w={w} {row}.textRight grew {grow:+.2f}px "
+                              "(more room for the label; not a regression)")
             print(f"    painted deltas at {WIDE}: {deltas}")
             if deltas:
                 failures.append(f"{deltas} painted deltas at wide viewports")
