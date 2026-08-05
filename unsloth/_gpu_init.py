@@ -169,6 +169,7 @@ from unsloth_zoo.device_type import (
 
 # Fix other issues
 from .import_fixes import (
+    fix_transformers5_bare_annotation_configs,
     fix_xformers_performance_issue,
     fix_vllm_aimv2_issue,
     fix_vllm_lora_tokenizer_module,
@@ -198,6 +199,11 @@ from .import_fixes import (
     patch_accelerate_recursively_apply,
 )
 
+# Runs early: installs the PretrainedConfig guard before anything imports
+# vLLM's config modules. `import vllm` is lazy, so those classes are only
+# defined on demand, but once they are, transformers 5.4.0 to 5.5.0 raise
+# TypeError at class-definition time and take `import unsloth` down.
+fix_transformers5_bare_annotation_configs()
 fix_xformers_performance_issue()
 fix_vllm_aimv2_issue()
 fix_vllm_lora_tokenizer_module()
@@ -233,6 +239,7 @@ fix_peft_transformers_weight_conversion_import()
 patch_peft_weight_converter_compatibility()
 patch_accelerate_recursively_apply()
 
+del fix_transformers5_bare_annotation_configs
 del fix_xformers_performance_issue
 del fix_vllm_aimv2_issue
 del fix_vllm_lora_tokenizer_module
