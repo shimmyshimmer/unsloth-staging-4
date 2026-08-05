@@ -19,6 +19,7 @@ Asserts, for this engine:
 
 from __future__ import annotations
 
+import faulthandler
 import http.server
 import os
 import socketserver
@@ -118,16 +119,22 @@ def main() -> int:
 
     label = f"{ENGINE}" + (f" (channel={CHANNEL})" if CHANNEL else "")
     print(f"=== PR 7927 browser gate: {label} on {sys.platform} ===")
+    # Not every Playwright call is timeout-bounded, and a wedged browser process
+    # would otherwise burn the whole job with no output. Dump where we are and die.
+    faulthandler.dump_traceback_later(300, exit=True)
     failures = []
     try:
         with sync_playwright() as p:
+            print("  playwright driver up", flush=True)
             kw = {"headless": True}
             if CHANNEL:
                 kw["channel"] = CHANNEL
             browser = getattr(p, ENGINE).launch(**kw)
+            print("  browser launched", flush=True)
             ctx = browser.new_context(viewport={"width": 1000, "height": 800},
                                       reduced_motion="reduce")
             page = ctx.new_page()
+            print("  page open", flush=True)
 
             settings = {}
             for variant in ("before", "after"):
