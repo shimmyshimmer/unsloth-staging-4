@@ -5,11 +5,13 @@
 
 The gate reads HF's security scan (model_info securityStatus) metadata-only and never
 downloads flagged files; only the Hub call is stubbed. Policy: block a non-"safe" level
-(unknown levels fail closed), fail open when the scan is unavailable, skip local paths
-only, no first-party exemption. The block is scoped to the load-path RCE vector (a
-root-level code-executing file), so flagged safetensors and subdir pickles do not block.
+(unknown levels fail closed), inspect exact cached snapshots when the scan is unavailable,
+skip other local paths, and apply no first-party exemption. The block is scoped to the
+load-path RCE vector, so flagged inert files and unrelated subdir pickles do not block.
 """
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -180,6 +182,132 @@ def test_scans_inactive_hf_cache_snapshot_path(tmp_path):
     assert d.blocked is True
     assert model_info.call_args.args[0] == "evil/repo"
     assert model_info.call_args.kwargs["revision"] == "deadbeef"
+
+
+def test_local_only_scan_inspects_exact_inactive_snapshot(tmp_path):
+    repo = tmp_path / "models--evil--repo"
+    selected = repo / "snapshots" / "commit-old"
+    active = repo / "snapshots" / "commit-new"
+    selected.mkdir(parents = True)
+    active.mkdir(parents = True)
+    (selected / "pytorch_model.bin").write_bytes(b"pickle")
+    (active / "model.safetensors").write_bytes(b"safe")
+    (repo / "refs").mkdir()
+    (repo / "refs" / "main").write_text("commit-new")
+
+    with patch("utils.utils.hf_cache_snapshot_dir", return_value = active):
+        decision = evaluate_file_security(str(selected), local_only_load = True)
+
+    assert decision.blocked is True
+    assert decision.unsafe_files == [{"path": "pytorch_model.bin", "level": "unscanned"}]
+
+
+def test_local_only_scan_allows_exact_safetensors_snapshot(tmp_path):
+    snapshot = tmp_path / "models--good--repo" / "snapshots" / "deadbeef"
+    snapshot.mkdir(parents = True)
+    (snapshot / "model.safetensors").write_bytes(b"safe")
+
+    with patch(
+        "utils.security.file_security._fetch_security_status",
+        side_effect = AssertionError("local-only scan must not contact the Hub"),
+    ):
+        decision = evaluate_file_security(str(snapshot), local_only_load = True)
+
+    assert decision.blocked is False
+    assert "inert" in decision.reason
+
+
+def test_unavailable_hub_scan_falls_back_to_exact_snapshot(tmp_path):
+    snapshot = tmp_path / "models--evil--repo" / "snapshots" / "deadbeef"
+    snapshot.mkdir(parents = True)
+    (snapshot / "pytorch_model.bin").write_bytes(b"pickle")
+
+    with patch(
+        "utils.security.file_security._fetch_security_status",
+        return_value = None,
+    ):
+        decision = evaluate_file_security(str(snapshot))
+
+    assert decision.blocked is True
+    assert "Hub scan unavailable" in decision.reason
+    assert decision.unsafe_files == [{"path": "pytorch_model.bin", "level": "unscanned"}]
+
+
+def test_unavailable_hub_scan_inspects_explicit_load_subdirs(tmp_path):
+    snapshot = tmp_path / "models--evil--repo" / "snapshots" / "deadbeef"
+    llm = snapshot / "LLM"
+    llm.mkdir(parents = True)
+    (llm / "pytorch_model.bin").write_bytes(b"pickle")
+
+    with patch(
+        "utils.security.file_security._fetch_security_status",
+        return_value = None,
+    ):
+        decision = evaluate_file_security(
+            str(snapshot),
+            load_subdirs = ("LLM",),
+        )
+
+    assert decision.blocked is True
+    assert decision.unsafe_files == [{"path": "LLM/pytorch_model.bin", "level": "unscanned"}]
+
+
+def test_local_fallback_preserves_native_sentence_transformer_module_path(tmp_path):
+    snapshot = tmp_path / "models--evil--repo" / "snapshots" / "deadbeef"
+    module_path = r"encoder\pooling"
+    module = snapshot / Path(module_path)
+    module.mkdir(parents = True)
+    pickle = module / "pytorch_model.bin"
+    pickle.write_bytes(b"pickle")
+    (snapshot / "modules.json").write_text(
+        json.dumps([{"path": module_path}]),
+        encoding = "utf-8",
+    )
+
+    decision = evaluate_file_security(str(snapshot), local_only_load = True)
+
+    assert decision.blocked is True
+    assert decision.unsafe_files == [
+        {"path": pickle.relative_to(snapshot).as_posix(), "level": "unscanned"}
+    ]
+
+
+def test_local_fallback_blocks_traversing_sentence_transformer_module_path(tmp_path):
+    snapshot = tmp_path / "models--evil--repo" / "snapshots" / "deadbeef"
+    snapshot.mkdir(parents = True)
+    (snapshot / "modules.json").write_text(
+        json.dumps([{"path": "../payload"}]),
+        encoding = "utf-8",
+    )
+
+    decision = evaluate_file_security(str(snapshot), local_only_load = True)
+
+    assert decision.blocked is True
+    assert "could not read" in decision.reason
+
+
+def test_online_exact_scan_blocks_sentence_transformer_module_weight(tmp_path):
+    snapshot = tmp_path / "models--evil--repo" / "snapshots" / "deadbeef"
+    snapshot.mkdir(parents = True)
+    (snapshot / "modules.json").write_text(
+        json.dumps([{"path": "0_Transformer"}]),
+        encoding = "utf-8",
+    )
+    status = {
+        "scansDone": True,
+        "filesWithIssues": [
+            {
+                "path": "0_Transformer/pytorch_model.bin",
+                "level": "unsafe",
+            }
+        ],
+    }
+
+    with _patch_status(status):
+        decision = evaluate_file_security(str(snapshot))
+
+    assert decision.blocked is True
+    assert decision.unsafe_files == [{"path": "0_Transformer/pytorch_model.bin", "level": "unsafe"}]
 
 
 def test_remote_gguf_named_repo_is_still_scanned():

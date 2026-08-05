@@ -12,6 +12,10 @@ interface ConfirmArgs {
   modelName: string;
   // Resolves the same findings + fingerprint for gated/private repos.
   hfToken?: string | null;
+  preferLocalCache?: boolean;
+  modelLocalPath?: string | null;
+  modelSnapshotPath?: string | null;
+  modelSnapshotRepoId?: string | null;
   // Coarse fallback when the scan endpoint is unreachable.
   requiresTrustRemoteCode?: boolean;
   // Called on approval with the pinning fingerprint.
@@ -23,13 +27,25 @@ interface ConfirmArgs {
 export async function confirmRemoteCodeIfNeeded({
   modelName,
   hfToken,
+  preferLocalCache,
+  modelLocalPath,
+  modelSnapshotPath,
+  modelSnapshotRepoId,
   requiresTrustRemoteCode,
   onApprove,
 }: ConfirmArgs): Promise<boolean> {
   let scan: RemoteCodeScan;
   try {
-    scan = await getRemoteCodeScan(modelName, hfToken);
-  } catch {
+    scan = await getRemoteCodeScan(modelName, hfToken, {
+      preferLocalCache,
+      modelLocalPath,
+      modelSnapshotPath,
+      modelSnapshotRepoId,
+    });
+  } catch (error) {
+    if (modelSnapshotPath) {
+      throw error;
+    }
     scan = {
       requiresTrustRemoteCode: Boolean(requiresTrustRemoteCode),
       approvable: true,
@@ -54,7 +70,11 @@ export async function confirmRemoteCodeIfNeeded({
   }
 
   // Already approved this exact code and nothing unsafe flagged: reuse without re-prompting.
-  if (scan.alreadyApproved && scan.unsafeFiles.length === 0 && !scan.securityBlocked) {
+  if (
+    scan.alreadyApproved &&
+    scan.unsafeFiles.length === 0 &&
+    !scan.securityBlocked
+  ) {
     onApprove(scan.fingerprint);
     return true;
   }

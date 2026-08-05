@@ -8,20 +8,41 @@ import { fileURLToPath } from "node:url";
 
 import ts from "typescript";
 
+const DATASET_LISTS_PATH = fileURLToPath(
+  new URL(
+    "../src/features/dataset-picker/components/dataset-selector-lists.tsx",
+    import.meta.url,
+  ),
+);
+const DATASET_SELECTOR_PATH = fileURLToPath(
+  new URL(
+    "../src/features/dataset-picker/components/dataset-selector.tsx",
+    import.meta.url,
+  ),
+);
 const DATASET_SECTION_PATH = fileURLToPath(
   new URL(
     "../src/features/studio/sections/dataset-section.tsx",
     import.meta.url,
   ),
 );
-const sourceText = readFileSync(DATASET_SECTION_PATH, "utf8");
+const sourceText = readFileSync(DATASET_LISTS_PATH, "utf8");
 const sourceFile = ts.createSourceFile(
-  DATASET_SECTION_PATH,
+  DATASET_LISTS_PATH,
   sourceText,
   ts.ScriptTarget.ESNext,
   true,
   ts.ScriptKind.TSX,
 );
+const selectorText = readFileSync(DATASET_SELECTOR_PATH, "utf8");
+const selectorFile = ts.createSourceFile(
+  DATASET_SELECTOR_PATH,
+  selectorText,
+  ts.ScriptTarget.ESNext,
+  true,
+  ts.ScriptKind.TSX,
+);
+const sectionText = readFileSync(DATASET_SECTION_PATH, "utf8");
 
 function findOpenDataRecipesButton(): ts.JsxElement | null {
   let result: ts.JsxElement | null = null;
@@ -29,7 +50,9 @@ function findOpenDataRecipesButton(): ts.JsxElement | null {
     if (
       ts.isJsxElement(node) &&
       node.openingElement.tagName.getText(sourceFile) === "Button" &&
-      node.getText(sourceFile).includes('t("studio.dataset.openDataRecipes")')
+      node
+        .getText(sourceFile)
+        .includes('t("studio.datasetPicker.openDataRecipes")')
     ) {
       result = node;
       return;
@@ -55,7 +78,9 @@ function attribute(
   return null;
 }
 
-function findVariableDeclaration(name: string): ts.VariableDeclaration | null {
+function findSelectorVariableDeclaration(
+  name: string,
+): ts.VariableDeclaration | null {
   let result: ts.VariableDeclaration | null = null;
   const visit = (node: ts.Node): void => {
     if (
@@ -68,7 +93,7 @@ function findVariableDeclaration(name: string): ts.VariableDeclaration | null {
     }
     node.forEachChild(visit);
   };
-  sourceFile.forEachChild(visit);
+  selectorFile.forEachChild(visit);
   return result;
 }
 
@@ -79,7 +104,7 @@ test("the empty local-dataset action uses side-effect-free SPA navigation", () =
   const onClick = attribute(button.openingElement, "onClick");
   assert.equal(
     onClick?.initializer?.getText(sourceFile),
-    "{handleOpenDataRecipes}",
+    "{onOpenDataRecipes}",
   );
   assert.equal(
     attribute(button.openingElement, "type")?.initializer?.getText(sourceFile),
@@ -92,9 +117,9 @@ test("the empty local-dataset action uses side-effect-free SPA navigation", () =
     "the action must not fall back to a full-document anchor",
   );
 
-  const handler = findVariableDeclaration("handleOpenDataRecipes");
+  const handler = findSelectorVariableDeclaration("openDataRecipes");
   assert.ok(handler, "Open Data Recipes must have a dedicated SPA handler");
-  const handlerText = handler.getText(sourceFile);
+  const handlerText = handler.getText(selectorFile);
   assert.match(
     handlerText,
     /navigate\s*\(\s*\{\s*to:\s*["']\/data-recipes["']/,
@@ -107,5 +132,7 @@ test("the empty local-dataset action uses side-effect-free SPA navigation", () =
 });
 
 test("the dataset section has no raw Data Recipes document navigation", () => {
+  assert.doesNotMatch(sectionText, /href\s*=\s*["']\/data-recipes["']/);
   assert.doesNotMatch(sourceText, /href\s*=\s*["']\/data-recipes["']/);
+  assert.doesNotMatch(selectorText, /href\s*=\s*["']\/data-recipes["']/);
 });

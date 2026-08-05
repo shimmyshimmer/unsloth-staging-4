@@ -17,6 +17,15 @@ from hub.services import resolve_destructive_repo_ids
 from hub.services.datasets import downloads
 from hub.utils import download_manifest
 from hub.utils import inventory_scan as hf_cache_scan
+from hub.utils.dataset_cache import (
+    hf_datasets_cache_roots,
+    processed_dataset_cache_has_artifacts,
+)
+from hub.utils.dataset_processed_cache import (
+    app_processed_dataset_cache_from_path,
+    delete_app_processed_dataset_caches,
+    iter_app_processed_dataset_caches,
+)
 from hub.utils.hf_cache_state import (
     purge_partial_repo,
     purge_repo_cache_dirs,
@@ -81,6 +90,17 @@ def _prefer_dataset_cache_row(candidate: dict, existing: Optional[dict]) -> bool
     return int(candidate.get("size_bytes") or 0) > int(existing.get("size_bytes") or 0)
 
 
+def _raw_row_hub_cache(row: dict) -> Optional[Path]:
+    cache_path = row.get("cache_path")
+    if not isinstance(cache_path, str):
+        return None
+    try:
+        path = Path(cache_path).expanduser().resolve(strict = False)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return path.parent if path.name.lower().startswith("datasets--") else None
+
+
 def _hub_dataset_snapshot_count(path: Path) -> int:
     snapshots = path / "snapshots"
     try:
@@ -134,38 +154,7 @@ def _scan_hub_dataset_cache_dirs() -> list[dict]:
 
 
 def _hf_datasets_cache_roots() -> list[Path]:
-    roots: list[Path] = []
-    seen: set[str] = set()
-
-    def _add(path: Optional[Path]) -> None:
-        if path is None or not path.is_dir():
-            return
-        try:
-            resolved = str(path.resolve())
-        except OSError:
-            return
-        if resolved in seen:
-            return
-        seen.add(resolved)
-        roots.append(path)
-
-    env_cache = os.environ.get("HF_DATASETS_CACHE")
-    if env_cache:
-        _add(Path(env_cache).expanduser())
-
-    try:
-        from datasets import config as datasets_config
-        _add(Path(datasets_config.HF_DATASETS_CACHE))
-    except Exception:
-        pass
-
-    hf_home = os.environ.get("HF_HOME")
-    if hf_home:
-        _add(Path(hf_home).expanduser() / "datasets")
-
-    xdg_cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")).expanduser()
-    _add(xdg_cache / "huggingface" / "datasets")
-    return roots
+    return hf_datasets_cache_roots()
 
 
 def _repo_id_from_datasets_cache_dir(name: str) -> str | None:
@@ -194,29 +183,19 @@ def _is_processed_dataset_cache_path(repo_id: str, cache_path: str) -> bool:
 def _processed_dataset_cache_size(path: Path) -> int:
     total = 0
     try:
-        for entry in path.rglob("*"):
-            try:
-                if entry.is_file():
-                    total += entry.stat().st_size
-            except OSError:
-                continue
+        for directory, dirnames, filenames in os.walk(path, followlinks = False):
+            base = Path(directory)
+            dirnames[:] = [name for name in dirnames if not (base / name).is_symlink()]
+            for filename in filenames:
+                entry = base / filename
+                try:
+                    if entry.is_file() and not entry.is_symlink():
+                        total += entry.stat().st_size
+                except OSError:
+                    continue
     except OSError:
         return 0
     return total
-
-
-def _looks_like_processed_dataset_cache(path: Path) -> bool:
-    try:
-        for entry in path.rglob("*"):
-            if not entry.is_file():
-                continue
-            if entry.name in {"dataset_info.json", "state.json"}:
-                return True
-            if entry.suffix == ".arrow":
-                return True
-    except OSError:
-        return False
-    return False
 
 
 def _scan_processed_dataset_caches() -> list[dict]:
@@ -231,7 +210,7 @@ def _scan_processed_dataset_caches() -> list[dict]:
             repo_id = _repo_id_from_datasets_cache_dir(entry.name)
             if repo_id is None:
                 continue
-            if not _looks_like_processed_dataset_cache(entry):
+            if not processed_dataset_cache_has_artifacts(entry):
                 continue
             size_bytes = _processed_dataset_cache_size(entry)
             if size_bytes <= 0:
@@ -247,6 +226,33 @@ def _scan_processed_dataset_caches() -> list[dict]:
                     "partial": False,
                 }
     return sorted(seen_lower.values(), key = lambda c: c["repo_id"])
+
+
+def _scan_app_processed_dataset_caches() -> list[dict]:
+    grouped: dict[tuple[str, str], dict] = {}
+    for entry in iter_app_processed_dataset_caches():
+        size_bytes = _processed_dataset_cache_size(entry.path)
+        key = (
+            entry.repo_id.casefold(),
+            os.path.normcase(str(entry.hub_cache)),
+        )
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = {
+                "repo_id": entry.repo_id,
+                "size_bytes": size_bytes,
+                "cache_path": str(entry.path),
+                "processed_cache": True,
+                "app_processed_cache": True,
+                "app_processed_hub_cache": str(entry.hub_cache),
+                "partial": True,
+            }
+        else:
+            existing["size_bytes"] += size_bytes
+    return sorted(
+        grouped.values(),
+        key = lambda row: (row["repo_id"].casefold(), row["app_processed_hub_cache"]),
+    )
 
 
 def _scan_hf_dataset_caches() -> list[dict]:
@@ -320,10 +326,28 @@ def _scan_hf_dataset_caches() -> list[dict]:
             seen_lower[key] = row
         else:
             existing["size_bytes"] = max(existing["size_bytes"], row["size_bytes"])
-            # Keep the processed-cache marker when a repo is both snapshot and
-            # processed Arrow cache; merging by size alone dropped it.
+            # Preserve the raw path for scoped deletion and expose the processed
+            # Arrow path separately for loading.
             if row.get("processed_cache"):
                 existing["processed_cache"] = True
+                existing["load_cache_path"] = row.get("cache_path")
+    for row in _scan_app_processed_dataset_caches():
+        key = row["repo_id"].lower()
+        existing = seen_lower.get(key)
+        if existing is None:
+            seen_lower[key] = row
+            continue
+        raw_hub_cache = _raw_row_hub_cache(existing)
+        try:
+            app_hub_cache = Path(row["app_processed_hub_cache"]).resolve(strict = False)
+        except (OSError, RuntimeError, ValueError):
+            app_hub_cache = None
+        if raw_hub_cache is not None and raw_hub_cache == app_hub_cache:
+            existing["size_bytes"] = int(existing.get("size_bytes") or 0) + int(
+                row.get("size_bytes") or 0
+            )
+            existing["processed_cache"] = True
+            existing["app_processed_cache"] = True
     logger.info(
         "Cached dataset scan: roots=%d inspected=%d returned=%d",
         len(seen_roots) or len(scans),
@@ -365,6 +389,7 @@ async def delete_cached_dataset_response(repo_id: str, cache_path: Optional[str]
 
 def _delete_cached_dataset_blocking(repo_id: str, cache_path: Optional[str] = None) -> dict:
     scans, _seen_roots = _collect_hf_cache_scans()
+    app_entry = app_processed_dataset_cache_from_path(repo_id, cache_path) if cache_path else None
 
     # Group this dataset's copies by owning cache root, then target exactly one
     # cache so a delete never removes copies in other, previously selected caches.
@@ -387,7 +412,8 @@ def _delete_cached_dataset_blocking(repo_id: str, cache_path: Optional[str] = No
     # resolve_delete_target_root returns None. Accept it and fall through to the
     # processed-cache delete rather than rejecting a legitimate row.
     if target_root is None and not (
-        cache_path and _is_processed_dataset_cache_path(repo_id, cache_path)
+        cache_path
+        and (_is_processed_dataset_cache_path(repo_id, cache_path) or app_entry is not None)
     ):
         raise HTTPException(status_code = 400, detail = "Invalid cache_path")
     candidate_entries = owners.get(target_root, []) if target_root is not None else []
@@ -437,6 +463,17 @@ def _delete_cached_dataset_blocking(repo_id: str, cache_path: Optional[str] = No
         repo_id, only_roots = processed_roots
     )
     failures.extend(processed_failures)
+    delete_app_cache = not cache_path or app_entry is not None or target_root is not None
+    app_hub_cache = app_entry.hub_cache if app_entry is not None else target_root
+    app_deleted, app_failures = (
+        _delete_app_processed_dataset_cache(
+            repo_id,
+            hub_cache = app_hub_cache,
+        )
+        if delete_app_cache
+        else (False, [])
+    )
+    failures.extend(app_failures)
     if failures:
         raise HTTPException(
             status_code = 500,
@@ -457,7 +494,14 @@ def _delete_cached_dataset_blocking(repo_id: str, cache_path: Optional[str] = No
             download_manifest.purge_all_state_for_repo("dataset", repo_id, hub_cache = target_root)
             > 0
         )
-    if not (deleted or processed_deleted or cache_purged or partial_purged or state_purged):
+    if not (
+        deleted
+        or processed_deleted
+        or app_deleted
+        or cache_purged
+        or partial_purged
+        or state_purged
+    ):
         raise HTTPException(status_code = 404, detail = "Dataset not found in cache")
     return {"status": "deleted", "repo_id": repo_id}
 
@@ -504,4 +548,20 @@ def _delete_processed_dataset_cache(
                     exc,
                     exc_info = True,
                 )
+    return deleted, failures
+
+
+def _delete_app_processed_dataset_cache(
+    repo_id: str, *, hub_cache: Optional[Path] = None
+) -> tuple[bool, list[str]]:
+    deleted, failures = delete_app_processed_dataset_caches(
+        repo_id,
+        hub_cache = hub_cache,
+    )
+    for failure in failures:
+        logger.error(
+            "Failed deleting processed dataset cache %s: %s",
+            repo_id,
+            failure,
+        )
     return deleted, failures
