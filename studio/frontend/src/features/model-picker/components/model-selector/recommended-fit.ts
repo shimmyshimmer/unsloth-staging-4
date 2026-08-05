@@ -127,14 +127,16 @@ export function fitsDevice(opts: {
  * MLX repos: always the params-based smallest-quant estimate, matching the
  * VRAM badge's quantized-load assumption; their estimatedSizeBytes is the
  * full-precision checkpoint and would wrongly hide models the quantized load
- * path can run. Anything unsizable is hidden (requireKnown) so over-budget
- * models with no metadata don't slip through. An unknown device budget keeps
- * everything. */
+ * path can run. `curatedSizeBytes`, the catalog's own size for that exact
+ * artifact, outranks both: real data over estimates. Anything still unsizable
+ * is hidden (requireKnown) so over-budget models with no metadata don't slip
+ * through. An unknown device budget keeps everything. */
 export function hfModelFitsDevice(
   model: {
     id: string;
     totalParams?: number;
     estimatedSizeBytes?: number;
+    curatedSizeBytes?: number;
     isGguf?: boolean;
   },
   gpu: {
@@ -151,9 +153,11 @@ export function hfModelFitsDevice(
     return true;
   const params = model.totalParams ?? paramsFromId(model.id);
   const quantBytes = params ? estimateQuantBytes(params) : undefined;
-  const sizeBytes = isGgufId(model.id, model.isGguf)
-    ? (model.estimatedSizeBytes ?? quantBytes)
-    : (quantBytes ?? model.estimatedSizeBytes);
+  const sizeBytes =
+    model.curatedSizeBytes ??
+    (isGgufId(model.id, model.isGguf)
+      ? (model.estimatedSizeBytes ?? quantBytes)
+      : (quantBytes ?? model.estimatedSizeBytes));
   return fitsDevice({
     sizeBytes,
     gpuGb: gpu.memoryTotalGb,
@@ -161,4 +165,31 @@ export function hfModelFitsDevice(
     budgetKnown: gpu.budgetKnown,
     requireKnown: true,
   });
+}
+
+/** Order Recommended: curated seeds first in catalog order, then the rest of the
+ * listing, each id once. A seed hands off only to a row that survived `keep`
+ * (the metadata filters), so a painted curated row does not vanish when the
+ * listing reports its id with metadata those filters reject. Device fit is
+ * judged on whichever row renders. */
+export function orderRecommendedRows<T extends { id: string }>(opts: {
+  seeds: readonly T[];
+  results: readonly T[];
+  keep: (row: T) => boolean;
+  deviceFiltered: boolean;
+  fits: (row: T) => boolean;
+}): T[] {
+  const { seeds, results, keep, deviceFiltered, fits } = opts;
+  const rows = results.filter(keep);
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const curated: T[] = [];
+  for (const seed of seeds) {
+    const row = byId.get(seed.id) ?? seed;
+    if (!deviceFiltered || fits(row)) curated.push(row);
+  }
+  const curatedIds = new Set(curated.map((r) => r.id));
+  const rest = (deviceFiltered ? rows.filter(fits) : rows).filter(
+    (r) => !curatedIds.has(r.id),
+  );
+  return [...curated, ...rest];
 }
