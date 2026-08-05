@@ -35,6 +35,7 @@ function clearAuthTokensIfCurrent(refreshToken: string | null): void {
 async function fetchWithTauriNetworkRetry(
   input: RequestInfo | URL,
   init?: RequestInit,
+  retryNetworkErrors = true,
 ): Promise<Response> {
   for (let attempt = 0; ; attempt++) {
     try {
@@ -42,6 +43,7 @@ async function fetchWithTauriNetworkRetry(
     } catch (error) {
       if (
         !isTauri ||
+        !retryNetworkErrors ||
         !(error instanceof TypeError) ||
         attempt >= TAURI_FETCH_RETRY_DELAYS_MS.length
       ) {
@@ -110,6 +112,7 @@ function asTransportFailure(err: unknown): unknown {
 async function retryWithCurrentToken(
   input: RequestInfo | URL,
   init?: RequestInit,
+  retryNetworkErrors = true,
 ): Promise<Response> {
   const retryHeaders = new Headers(init?.headers);
   const token = getAuthToken();
@@ -117,7 +120,11 @@ async function retryWithCurrentToken(
   // Retries are tagged like the first attempt; an untagged TypeError reads as a rejection and
   // lets auto-load fall through to the default download.
   try {
-    return await fetchWithTauriNetworkRetry(input, { ...init, headers: retryHeaders });
+    return await fetchWithTauriNetworkRetry(
+      input,
+      { ...init, headers: retryHeaders },
+      retryNetworkErrors,
+    );
   } catch (err) {
     throw asTransportFailure(err);
   }
@@ -126,10 +133,13 @@ async function retryWithCurrentToken(
 async function retryWithTauriAutoAuth(
   input: RequestInfo | URL,
   init?: RequestInit,
+  retryNetworkErrors = true,
 ): Promise<Response | null> {
   clearAuthTokens();
   const { tauriAutoAuth } = await import("./tauri-auto-auth");
-  if (await tauriAutoAuth()) return retryWithCurrentToken(input, init);
+  if (await tauriAutoAuth()) {
+    return retryWithCurrentToken(input, init, retryNetworkErrors);
+  }
   return null;
 }
 
@@ -180,6 +190,7 @@ export async function refreshSession(): Promise<boolean> {
 export async function authFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
+  options?: { retryNetworkErrors?: boolean },
 ): Promise<Response> {
   const resolvedInput = typeof input === 'string' ? apiUrl(input) : input;
   const headers = new Headers(init?.headers);
@@ -190,17 +201,27 @@ export async function authFetch(
 
   let response: Response;
   try {
-    response = await fetchWithTauriNetworkRetry(resolvedInput, {
-      ...init,
-      headers,
-    });
+    response = await fetchWithTauriNetworkRetry(
+      resolvedInput,
+      {
+        ...init,
+        headers,
+      },
+      options?.retryNetworkErrors ?? true,
+    );
   } catch (err) {
     throw asTransportFailure(err);
   }
 
   if (await isPasswordChangeRequiredResponse(response)) {
     if (isTauri) {
-      return (await retryWithTauriAutoAuth(resolvedInput, init)) ?? response;
+      return (
+        (await retryWithTauriAutoAuth(
+          resolvedInput,
+          init,
+          options?.retryNetworkErrors ?? true,
+        )) ?? response
+      );
     }
     void redirectToAuth();
     return response;
@@ -211,7 +232,13 @@ export async function authFetch(
   const refreshed = await refreshSession();
   if (!refreshed) {
     if (isTauri) {
-      return (await retryWithTauriAutoAuth(resolvedInput, init)) ?? response;
+      return (
+        (await retryWithTauriAutoAuth(
+          resolvedInput,
+          init,
+          options?.retryNetworkErrors ?? true,
+        )) ?? response
+      );
     }
     clearAuthTokensIfCurrent(refreshToken);
     void redirectToAuth();
@@ -220,14 +247,24 @@ export async function authFetch(
 
   if (mustChangePassword()) {
     if (isTauri) {
-      return (await retryWithTauriAutoAuth(resolvedInput, init)) ?? response;
+      return (
+        (await retryWithTauriAutoAuth(
+          resolvedInput,
+          init,
+          options?.retryNetworkErrors ?? true,
+        )) ?? response
+      );
     }
     void redirectToAuth();
     return response;
   }
 
   if (!getAuthToken()) clearAuthTokens();
-  return retryWithCurrentToken(resolvedInput, init);
+  return retryWithCurrentToken(
+    resolvedInput,
+    init,
+    options?.retryNetworkErrors ?? true,
+  );
 }
 
 async function postLogout(accessToken: string | null): Promise<Response | null> {

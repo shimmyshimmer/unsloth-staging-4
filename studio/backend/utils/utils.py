@@ -40,6 +40,11 @@ def hf_env_offline() -> bool:
     return False
 
 
+def canonical_model_repo_id(model_name: str) -> str:
+    """Normalize a Hugging Face model repository ID selected in Studio."""
+    return model_name.strip()
+
+
 def hf_endpoint_url() -> str:
     """Configured hub endpoint, scheme-normalised. Mirror users point this elsewhere."""
     endpoint = (os.environ.get("HF_ENDPOINT") or "").strip() or "https://huggingface.co"

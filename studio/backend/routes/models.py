@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import structlog
 from loggers import get_logger
-from utils.utils import log_and_http_error
+from utils.utils import canonical_model_repo_id, log_and_http_error
 
 import re as _re
 
@@ -145,6 +145,7 @@ try:
     from core.inference import get_inference_backend
     from utils.paths import (
         is_local_path,
+        normalize_path,
         outputs_root,
         exports_root,
         resolve_cached_repo_id_case,
@@ -178,6 +179,7 @@ except ImportError:
     from core.inference import get_inference_backend
     from utils.paths import (
         is_local_path,
+        normalize_path,
         outputs_root,
         exports_root,
         resolve_cached_repo_id_case,
@@ -1909,6 +1911,9 @@ def _get_max_position_embeddings(config) -> Optional[int]:
     return None
 
 
+_MODEL_WEIGHT_EXTENSIONS = (".safetensors", ".bin", ".pt", ".pth", ".gguf")
+
+
 def _get_model_size_bytes(model_name: str, hf_token: Optional[str] = None) -> Optional[int]:
     """Total size of model weight files from HF Hub."""
     try:
@@ -1919,10 +1924,9 @@ def _get_model_size_bytes(model_name: str, hf_token: Optional[str] = None) -> Op
         if not info.siblings:
             return None
 
-        weight_exts = (".safetensors", ".bin", ".pt", ".pth", ".gguf")
         total = 0
         for sibling in info.siblings:
-            if sibling.rfilename and any(sibling.rfilename.endswith(ext) for ext in weight_exts):
+            if sibling.rfilename and sibling.rfilename.endswith(_MODEL_WEIGHT_EXTENSIONS):
                 if sibling.size is not None:
                     total += sibling.size
 
@@ -1932,10 +1936,82 @@ def _get_model_size_bytes(model_name: str, hf_token: Optional[str] = None) -> Op
         return None
 
 
+def _get_snapshot_model_size_bytes(snapshot_path: str) -> Optional[int]:
+    try:
+        snapshot = Path(snapshot_path).resolve(strict = True)
+        snapshots_dir = snapshot.parent.resolve(strict = True)
+        repo_dir = snapshots_dir.parent.resolve(strict = True)
+        if not snapshot.is_dir() or snapshots_dir.name != "snapshots" or not repo_dir.is_dir():
+            return None
+        blobs_dir = repo_dir / "blobs"
+        resolved_blobs_dir = blobs_dir.resolve(strict = True) if blobs_dir.is_dir() else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+    total = 0
+    scan_failed = False
+
+    def _record_walk_error(_error: OSError) -> None:
+        nonlocal scan_failed
+        scan_failed = True
+
+    try:
+        for root, _, filenames in os.walk(
+            snapshot,
+            followlinks = False,
+            onerror = _record_walk_error,
+        ):
+            root_path = Path(root)
+            for filename in filenames:
+                if not filename.endswith(_MODEL_WEIGHT_EXTENSIONS):
+                    continue
+                try:
+                    candidate = (root_path / filename).resolve(strict = True)
+                    if not candidate.is_file():
+                        continue
+                    if not candidate.is_relative_to(snapshot) and not (
+                        resolved_blobs_dir is not None
+                        and candidate.is_relative_to(resolved_blobs_dir)
+                    ):
+                        continue
+                    total += candidate.stat().st_size
+                except (OSError, RuntimeError, ValueError):
+                    scan_failed = True
+    except OSError:
+        return None
+    return total if total > 0 and not scan_failed else None
+
+
+def _model_config_inspection_target(
+    model_name: str, prefer_local_cache: bool, local_path: Optional[str]
+) -> str:
+    if not prefer_local_cache or is_local_path(model_name):
+        return model_name
+    from hub.utils.hf_cache_state import (
+        latest_snapshot_from_cache_path,
+        with_load_subdirs,
+    )
+
+    snapshot = latest_snapshot_from_cache_path(
+        local_path,
+        "model",
+        canonical_model_repo_id(model_name),
+        with_load_subdirs(model_name, ("config.json", "adapter_config.json")),
+    )
+    if snapshot is None:
+        raise HTTPException(
+            status_code = 404,
+            detail = "Selected cached model is no longer available.",
+        )
+    return snapshot
+
+
 @router.get("/config/{model_name:path}")
 async def get_model_config(
     model_name: str,
     hf_token: Optional[str] = Query(None),
+    prefer_local_cache: bool = False,
+    local_path: Optional[str] = None,
     header_hf_token: Optional[str] = Depends(get_hf_token),
     current_subject: str = Depends(get_current_subject),
 ):
@@ -1961,18 +2037,34 @@ async def get_model_config(
             logger.info(f"Getting model config for: {model_name}")
             from utils.models.model_config import detect_audio_type
 
+            inspection_target = _model_config_inspection_target(
+                model_name,
+                prefer_local_cache,
+                local_path,
+            )
             config_dict = load_model_defaults(model_name)
 
             # Detect capabilities (HF token for gated models).
-            is_vision = is_vision_model(model_name, hf_token = hf_token)
-            is_embedding = is_embedding_model(model_name, hf_token = hf_token)
-            audio_type = detect_audio_type(model_name, hf_token = hf_token)
+            is_vision = is_vision_model(
+                inspection_target,
+                hf_token = hf_token,
+                local_files_only = prefer_local_cache,
+            )
+            is_embedding = is_embedding_model(inspection_target, hf_token = hf_token)
+            audio_type = detect_audio_type(
+                inspection_target,
+                hf_token = hf_token,
+                local_files_only = prefer_local_cache,
+            )
 
             is_lora = False
             base_model = None
             max_position_embeddings = None
             try:
-                model_config = ModelConfig.from_identifier(model_name)
+                model_config = ModelConfig.from_identifier(
+                    inspection_target,
+                    hf_token = hf_token,
+                )
                 is_lora = model_config.is_lora
                 base_model = model_config.base_model if is_lora else None
                 max_position_embeddings = _get_max_position_embeddings(model_config)
@@ -1986,7 +2078,7 @@ async def get_model_config(
                     from utils.transformers_version import _load_config_json
                     from types import SimpleNamespace
 
-                    _cfg = _load_config_json(model_name, hf_token = hf_token)
+                    _cfg = _load_config_json(inspection_target, hf_token = hf_token)
                     if _cfg is not None:
 
                         def _to_ns(d):
@@ -2014,7 +2106,11 @@ async def get_model_config(
                 model_type = derive_model_type(is_vision, audio_type, is_embedding),
                 base_model = base_model,
                 max_position_embeddings = max_position_embeddings,
-                model_size_bytes = _get_model_size_bytes(model_name, hf_token),
+                model_size_bytes = (
+                    _get_snapshot_model_size_bytes(inspection_target)
+                    if prefer_local_cache
+                    else _get_model_size_bytes(model_name, hf_token)
+                ),
             )
 
     try:
@@ -2022,6 +2118,8 @@ async def get_model_config(
         # other request for the whole handler.
         return await asyncio.to_thread(_resolve, model_name)
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise log_and_http_error(
             e,
@@ -2053,6 +2151,10 @@ def _consent_provider(
 async def scan_model_remote_code(
     model_name: str = Body(..., embed = True),
     hf_token: Optional[str] = Body(None, embed = True),
+    prefer_local_cache: bool = Body(False, embed = True),
+    model_local_path: Optional[str] = Body(None, embed = True),
+    model_snapshot_path: Optional[str] = Body(None, embed = True),
+    model_snapshot_repo_id: Optional[str] = Body(None, embed = True),
     current_subject: str = Depends(get_current_subject),
 ):
     """Scan a model's ``auto_map`` custom code so the UI can show findings before
@@ -2066,8 +2168,46 @@ async def scan_model_remote_code(
     try:
         from utils.security import preflight_remote_code_consent_for_targets
 
-        if not is_local_path(model_name):
+        local_model = is_local_path(model_name)
+        if not local_model:
             model_name = resolve_cached_repo_id_case(model_name)
+        scan_target = model_name
+        exact_snapshot_path = (
+            model_snapshot_path.strip()
+            if isinstance(model_snapshot_path, str) and model_snapshot_path.strip()
+            else None
+        )
+        exact_snapshot_repo_id = model_name
+        if isinstance(model_snapshot_repo_id, str):
+            snapshot_repo_id = model_snapshot_repo_id.strip()
+            # Namespace-less Hub ids such as "gpt2" are valid and the picker offers
+            # them, so use the shared validator rather than the owner/repo-only regex.
+            from hub.utils.paths import is_valid_repo_id as _shared_is_valid_repo_id
+
+            if snapshot_repo_id and not _shared_is_valid_repo_id(snapshot_repo_id):
+                raise HTTPException(
+                    status_code = 400,
+                    detail = "Invalid model snapshot repository ID.",
+                )
+            if snapshot_repo_id:
+                exact_snapshot_repo_id = snapshot_repo_id
+        if local_model:
+            normalized_model_name = normalize_path(model_name)
+            try:
+                scan_target = str(Path(normalized_model_name).expanduser().resolve(strict = False))
+            except (OSError, RuntimeError, ValueError):
+                scan_target = normalized_model_name
+        if exact_snapshot_path and not local_model:
+            exact_snapshot_repo_id = resolve_cached_repo_id_case(exact_snapshot_repo_id)
+            scan_target = _model_config_inspection_target(
+                exact_snapshot_repo_id,
+                True,
+                normalize_path(exact_snapshot_path),
+            )
+        elif prefer_local_cache is True and not local_model:
+            from core.training.training import _resolve_model_snapshot
+            local_path = normalize_path(model_local_path) if model_local_path else None
+            scan_target = _resolve_model_snapshot(model_name, local_path) or model_name
         # Scan the adapter AND the base together (a LoRA runs both repos' code; a pickle
         # can live in either), pinned by one combined fingerprint. Snapshot the primary's
         # cache state BEFORE resolving the base: for a remote adapter that resolve
@@ -2077,12 +2217,12 @@ async def scan_model_remote_code(
             _primary_preexisting = is_local_path(model_name) or _repo_in_any_hf_cache(model_name)
         except Exception:
             _primary_preexisting = True
-        security_targets = [model_name]
+        security_targets = [scan_target]
         try:
             from utils.models.model_config import get_base_model_from_lora_identifier
 
             # Resolve a LOCAL or REMOTE adapter's base so its code/weights are scanned too.
-            _base = get_base_model_from_lora_identifier(model_name, hf_token)
+            _base = get_base_model_from_lora_identifier(scan_target, hf_token)
             if _base:
                 security_targets.append(_base)
         except Exception:
@@ -2125,6 +2265,7 @@ async def scan_model_remote_code(
             security_targets, hf_token = hf_token, subject = current_subject
         )
         payload = decision.response_payload()
+        payload["model_name"] = exact_snapshot_repo_id if exact_snapshot_path else model_name
         payload["requires_trust_remote_code"] = decision.has_remote_code
         # Prior approval for the unchanged repo lets the dialog be skipped; the scan still
         # ran, so this is a real fingerprint match under the current ruleset.
@@ -2137,7 +2278,11 @@ async def scan_model_remote_code(
         payload["created_by_scan"] = model_name in scan_created_repos
         payload["scan_created_repos"] = scan_created_repos
         # Provider tag decided here, where locality/scan scope/external refs are known.
-        payload["provider"] = _consent_provider(model_name, security_targets, external_refs)
+        payload["provider"] = _consent_provider(
+            exact_snapshot_repo_id if exact_snapshot_path else model_name,
+            security_targets,
+            external_refs,
+        )
 
         # Malware gate (metadata-only): surface HF-flagged unsafe files so the dialog can
         # hard-block. Orthogonal to remote code -- a poisoned pickle needs no auto_map.
@@ -2160,6 +2305,8 @@ async def scan_model_remote_code(
             payload["requires_trust_remote_code"] = True
             payload["error_kind"] = "malware_blocked"
         return payload
+    except HTTPException:
+        raise
     except Exception as e:
         raise log_and_http_error(
             e,
@@ -2585,8 +2732,7 @@ async def delete_finetuned_model(
                 raise HTTPException(
                     status_code = 409,
                     detail = (
-                        "Cannot delete trained models while diffusion (Images) training is "
-                        "running"
+                        "Cannot delete trained models while diffusion (Images) training is running"
                     ),
                 )
         except HTTPException:
