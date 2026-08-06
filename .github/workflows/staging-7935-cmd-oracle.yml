@@ -4,6 +4,7 @@ on:
     branches: ["pr-7935-xplat-ci"]
     paths:
       - 'tests/oracle/cmd_oracle.py'
+      - 'tests/oracle/cmd_oracle2.py'
       - '.github/workflows/staging-7935-cmd-oracle.yml'
   workflow_dispatch:
 concurrency:
@@ -25,8 +26,13 @@ jobs:
       - name: Ask cmd.exe what actually launches
         shell: cmd
         run: python tests\oracle\cmd_oracle.py
+      - name: Round 2
+        shell: cmd
+        run: python tests\oracle\cmd_oracle2.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: cmd-oracle-results
-          path: oracle_results.json
+          path: |
+            oracle_results.json
+            oracle2_results.json
