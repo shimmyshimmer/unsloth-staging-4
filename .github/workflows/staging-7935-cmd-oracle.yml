@@ -1,0 +1,32 @@
+name: staging-7935 cmd oracle
+on:
+  push:
+    branches: ["pr-7935-xplat-ci"]
+    paths:
+      - 'tests/oracle/cmd_oracle.py'
+      - '.github/workflows/staging-7935-cmd-oracle.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  oracle:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Ask cmd.exe what actually launches
+        shell: cmd
+        run: python tests\oracle\cmd_oracle.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cmd-oracle-results
+          path: oracle_results.json
