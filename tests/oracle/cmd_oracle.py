@@ -71,11 +71,17 @@ def run_case(raw):
     # Pass the command line to CreateProcess verbatim so cmd sees exactly these
     # bytes; subprocess list-quoting would rewrite the punctuation under test.
     line = 'cmd.exe /c ' + text
+    # DEVNULL, not a pipe: `start` detaches a child that inherits the handles, so a
+    # pipe is not closed until that child exits and a `/k` case would deadlock the
+    # read even after the timeout kills cmd itself.
+    proc = subprocess.Popen(line, env=env, cwd=str(HOME),
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
     try:
-        proc = subprocess.run(line, env=env, cwd=str(HOME), timeout=25,
-                              capture_output=True, text=True)
-        rc, err = proc.returncode, (proc.stderr or "")[:120]
+        rc, err = proc.wait(timeout=20), ""
     except subprocess.TimeoutExpired:
+        proc.kill()
         rc, err = None, "TIMEOUT"
     # `start` returns immediately; give the detached marker time to write.
     for _ in range(30):
