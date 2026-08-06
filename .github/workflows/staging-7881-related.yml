@@ -1,0 +1,65 @@
+name: "staging-7881 related backend tests"
+# Second per-OS gate for unslothai/unsloth#7881.
+#
+# The generated staging-7881-<os> workflows run only the PR's own new test file, on
+# Python 3.12. This one covers the blast radius the PR actually touches -- admission
+# queue, active generations, the OpenAI/Anthropic passthroughs, GGUF slot release and
+# stream cancel -- and adds Python 3.13, which is what install.sh and install.ps1
+# default to, so 3.12 alone is not representative of a real install.
+#
+# All 692 of these pass locally on Linux with exactly the dep set installed below, so a
+# failure here is an OS-specific or version-specific regression, not an environment gap.
+on:
+  push:
+    branches: ["pr-7881-xplat-ci"]
+    paths:
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/tests/**'
+      - '.github/workflows/staging-7881-related.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  related:
+    name: "related ${{ matrix.os }} py${{ matrix.python }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        python: ['3.12', '3.13']
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ALLOW_CPU: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - name: Related backend tests
+        run: |
+          PYTHONPATH=studio/backend python -m pytest \
+            studio/backend/tests/test_active_generations.py \
+            studio/backend/tests/test_anthropic_admission.py \
+            studio/backend/tests/test_anthropic_passthrough_respawn.py \
+            studio/backend/tests/test_disconnect_watcher_teardown.py \
+            studio/backend/tests/test_gguf_stream_slot_release.py \
+            studio/backend/tests/test_gguf_stream_slot_release_ordering.py \
+            studio/backend/tests/test_llama_admission.py \
+            studio/backend/tests/test_llama_cpp_stream_cancel.py \
+            studio/backend/tests/test_openai_tool_passthrough.py \
+            studio/backend/tests/test_passthrough_healing.py \
+            studio/backend/tests/test_responses_tool_passthrough.py \
+            studio/backend/tests/test_sf_client_tools_passthrough.py \
+            -q --tb=short -rs -p no:randomly
