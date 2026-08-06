@@ -1,0 +1,69 @@
+name: "staging-7881 windows bisect"
+# The related-tests matrix went red on windows-latest only (both 3.12 and 3.13), on two
+# pre-existing preheader tests in test_openai_tool_passthrough.py. This isolates whether
+# that is caused by unslothai/unsloth#7881 or is pre-existing on Windows, by running the
+# same two tests at the merge base and at the PR head on the same runner.
+#
+#   207cf4a2a = merge base (unfixed)
+#   526512e7d = PR head
+#
+# Same job, same OS, same Python: the only variable is the commit.
+on:
+  push:
+    branches: ["pr-7881-xplat-ci"]
+    paths:
+      - '.github/workflows/staging-7881-winbisect.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  bisect:
+    name: "winbisect ${{ matrix.label }}"
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: base-207cf4a2a
+            ref: 207cf4a2a00e309e822a054394b049dfd2845271
+          - label: prhead-526512e7d
+            ref: 526512e7dc769a0db00908ed60c2d4c6249b93b0
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ALLOW_CPU: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ matrix.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - name: The two preheader tests, repeated to expose flakiness
+        run: |
+          set +e
+          fails=0
+          for i in 1 2 3; do
+            echo "::group::attempt $i"
+            PYTHONPATH=studio/backend python -m pytest \
+              studio/backend/tests/test_openai_tool_passthrough.py \
+              -q --tb=line -p no:randomly \
+              -k 'test_passthrough_stream_keepalive_while_upstream_headers_are_pending or test_passthrough_stream_preheader_immediate_context_retry_adopts_delayed_response'
+            rc=$?
+            echo "attempt $i rc=$rc"
+            [ "$rc" != "0" ] && fails=$((fails+1))
+            echo "::endgroup::"
+          done
+          echo "RESULT ${{ matrix.label }}: $fails of 3 attempts failed"
+          # never fail the job -- this is a measurement, read the RESULT lines
+          exit 0
