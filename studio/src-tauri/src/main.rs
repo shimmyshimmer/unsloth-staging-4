@@ -462,6 +462,89 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// Root shared by the WebView profile and the version stamp below.
+fn webview_profile_root(bundle_id: &str) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let from_env = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    #[cfg(target_os = "windows")]
+    {
+        from_env("LOCALAPPDATA").map(|d| d.join(bundle_id))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        from_env("HOME").map(|h| h.join("Library/Application Support").join(bundle_id))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Tauri points the WebView at LocalData/<bid>, and wry keys the
+        // WebKitGTK base-cache dir to that same dir.
+        from_env("XDG_DATA_HOME")
+            .or_else(|| from_env("HOME").map(|h| h.join(".local/share")))
+            .map(|d| d.join(bundle_id))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (bundle_id, from_env);
+        None
+    }
+}
+
+// Clear WebView caches after an update, before the webview initializes: the
+// in-app update runs setup.sh/setup.ps1 while the old WebView still holds these
+// files, so its clear fails and a relaunch can serve the previous frontend.
+//
+// Version-stamped, because this runs before the single-instance plugin. Ungated,
+// a duplicate launch would delete a live instance's profile, and every ordinary
+// launch would discard the Windows compiled-JS cache for nothing.
+//
+// Cache-only; LocalStorage, IndexedDB, cookies and app data are kept.
+// Mirrors setup.sh _clear_webview_caches / setup.ps1.
+fn clear_webview_caches(bundle_id: &str, version: &str) {
+    let Some(root) = webview_profile_root(bundle_id) else {
+        return;
+    };
+    let stamp = root.join(".webview-cache-cleared");
+    if fs::read_to_string(&stamp).is_ok_and(|v| v.trim() == version) {
+        return;
+    }
+
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        let profile = root.join("EBWebView").join("Default");
+        for sub in ["Cache", "Code Cache", "GPUCache", "Service Worker"] {
+            paths.push(profile.join(sub));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(home) = std::env::var("HOME") {
+        // WKWebView keeps every cache-typed store under Library/Caches/<bid>;
+        // Library/WebKit/<bid> is user storage and is left alone.
+        paths.push(std::path::PathBuf::from(home).join("Library/Caches").join(bundle_id));
+    }
+    #[cfg(target_os = "linux")]
+    for sub in ["WebKitCache", "CacheStorage", "serviceworkers"] {
+        paths.push(root.join(sub));
+    }
+
+    for p in &paths {
+        // Absent is normal; anything else is worth logging, since a silent
+        // failure here is what the stale frontend looked like.
+        if let Err(e) = fs::remove_dir_all(p) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("could not clear WebView cache {}: {e}", p.display());
+            }
+        }
+    }
+    let _ = fs::create_dir_all(&root);
+    let _ = fs::write(&stamp, version);
+}
+
 fn main() {
     // Fix PATH for GUI apps (macOS .app bundles, Linux AppImage, Windows)
     // GUI apps don't inherit shell dotfile PATH — this spawns the user's
@@ -471,6 +554,14 @@ fn main() {
     setup_logging();
     info!("Unsloth desktop app starting");
     windows_job::initialize();
+
+    // Must run before the Builder: the config-defined window (and its
+    // WebView, which locks these files) exists by the time setup hooks run.
+    let context = tauri::generate_context!();
+    clear_webview_caches(
+        &context.config().identifier,
+        context.package_info().version.to_string().as_str(),
+    );
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -575,7 +666,7 @@ fn main() {
                 }
             }
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application")
         .run(|app, event| match event {
             #[cfg(target_os = "macos")]

@@ -1578,6 +1578,28 @@ if ($script:StudioVtOk -and -not $env:NO_COLOR) {
     Write-Host "  $Rule" -ForegroundColor DarkGray
 }
 
+# WebView2 caches keyed by the app bundle id hold copies of the previous
+# frontend and can keep serving it after an update (old styles linger).
+# Cache-only paths: Local Storage, IndexedDB, cookies, settings, models,
+# and the studio database are untouched.
+if ($env:LOCALAPPDATA) {
+    $wvDefault = Join-Path $env:LOCALAPPDATA "ai.unsloth.studio\EBWebView\Default"
+    $wvCleared = $false
+    foreach ($wvSub in @("Cache", "Code Cache", "GPUCache", "Service Worker")) {
+        $wvPath = Join-Path $wvDefault $wvSub
+        # Get-Item -Force, not Test-Path: the probe throws on an ACL denial under
+        # "Stop", and a reparse point must be unlinked, not recursed into.
+        $wvItem = Get-Item -LiteralPath $wvPath -Force -ErrorAction SilentlyContinue
+        if (-not $wvItem) { continue }
+        try {
+            if ($wvItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { $wvItem.Delete() }
+            else { Remove-Item -LiteralPath $wvPath -Recurse -Force -ErrorAction Stop }
+            $wvCleared = $true
+        } catch { }
+    }
+    if ($wvCleared) { substep "cleared stale WebView caches (ai.unsloth.studio); settings and data kept" }
+}
+
 # Back up User PATH under HKCU\Software\Unsloth before any modifications.
 try {
     $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $false)

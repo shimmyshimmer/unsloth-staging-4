@@ -533,6 +533,47 @@ rm -rf "$REPO_ROOT/unsloth_compiled_cache"
 rm -rf "$SCRIPT_DIR/backend/unsloth_compiled_cache"
 rm -rf "$SCRIPT_DIR/tmp/unsloth_compiled_cache"
 
+# WebView caches keyed by the app bundle id hold copies of the previous
+# frontend and can keep serving it after an update (old styles linger).
+# Cache-only paths: LocalStorage, IndexedDB, cookies, settings, models,
+# and the studio database are untouched.
+_clear_webview_caches() {
+    # No HOME: bail rather than let `set -u` abort the install or "" expand
+    # to /Library and /.cache.
+    [ -n "${HOME:-}" ] || return 0
+    _wvc_bid="ai.unsloth.studio"
+    _wvc_paths=()
+    case "$(uname -s 2>/dev/null)" in
+        Darwin)
+            # WKWebView keeps every cache-typed store under Library/Caches/<bid>;
+            # Library/WebKit/<bid> is user storage and is left alone.
+            _wvc_paths=("$HOME/Library/Caches/$_wvc_bid")
+            ;;
+        Linux)
+            # wry points WebKitGTK's base-cache dir at the app data dir, so the
+            # caches sit beside localstorage/, databases/ and cookies, which stay.
+            _wvc_data="${XDG_DATA_HOME:-$HOME/.local/share}/$_wvc_bid"
+            _wvc_paths=(
+                "$_wvc_data/WebKitCache"
+                "$_wvc_data/CacheStorage"
+                "$_wvc_data/serviceworkers"
+            )
+            ;;
+        *) return 0 ;;
+    esac
+    _wvc_cleared=false
+    for _wvc_p in "${_wvc_paths[@]}"; do
+        # -L too: a dangling symlink still occupies the path.
+        [ -e "$_wvc_p" ] || [ -L "$_wvc_p" ] || continue
+        rm -rf "$_wvc_p" 2>/dev/null && _wvc_cleared=true || true
+    done
+    if [ "$_wvc_cleared" = true ]; then
+        substep "cleared stale WebView caches ($_wvc_bid); settings and data kept"
+    fi
+    return 0
+}
+_clear_webview_caches
+
 # ── Detect Colab ──
 IS_COLAB=false
 keynames=$'\n'$(printenv | cut -d= -f1)
