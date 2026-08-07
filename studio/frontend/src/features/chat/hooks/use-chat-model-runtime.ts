@@ -1390,22 +1390,26 @@ export function useChatModelRuntime() {
               (loadResponse.is_gguf || isGguf || ggufVariant) &&
                 !isExternalModelId(modelId),
             );
+            // Indexed on-device picks are remembered so auto-load re-picks
+            // what the user ran, not the smallest model it finds. Native
+            // file-picker paths stay out: they need a signed, expiring lease.
+            const indexedLocalPick =
+              typeof selection !== "string" && selection.source === "local";
             if (
               !isLora &&
               !(loadResponse.is_lora ?? false) &&
               !nativePathToken &&
-              !isLocalModelPath(modelId) &&
-              !isExternalModelId(modelId)
+              !isExternalModelId(modelId) &&
+              (indexedLocalPick || !isLocalModelPath(modelId))
             ) {
-              if (loadResponse.is_gguf || isGguf || ggufVariant) {
-                recordLastLocalModelLoad({
-                  id: modelId,
-                  kind: "gguf",
-                  ggufVariant: ggufVariant ?? null,
-                });
-              } else {
-                recordLastLocalModelLoad({ id: modelId, kind: "model" });
-              }
+              recordLastLocalModelLoad({
+                id: modelId,
+                kind:
+                  loadResponse.is_gguf || isGguf || ggufVariant
+                    ? "gguf"
+                    : "model",
+                ggufVariant: ggufVariant ?? null,
+              });
             }
           } catch (error) {
             // Skip rollback if user cancelled -- model is already being unloaded.
