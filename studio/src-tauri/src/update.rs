@@ -52,7 +52,12 @@ fn build_update_command(bin: &std::path::Path) -> Result<Command, String> {
         let mut cmd = Command::new(python);
         // Isolated mode prevents a project-local unsloth_cli module or an
         // inherited Python search path from shadowing the managed package.
-        cmd.args(["-I", "-c", WINDOWS_CLI_ENTRYPOINT, "studio", "update"]);
+        //
+        // -X utf8, not PYTHONUTF8: -I implies -E, so this process ignores every
+        // PYTHON* variable. Without the switch its own non-ASCII output reaches
+        // read_lossy_lines in the locale encoding and lands as U+FFFD. The env
+        // vars set in spawn_update still apply to descendants.
+        cmd.args(["-X", "utf8", "-I", "-c", WINDOWS_CLI_ENTRYPOINT, "studio", "update"]);
         cmd.env_remove("PYTHONHOME");
         cmd.env_remove("PYTHONPATH");
         Ok(cmd)
@@ -93,6 +98,14 @@ fn spawn_update(
     // desktop bundle so it skips re-creating CLI launchers/.app/.desktop
     // shortcuts (Tauri owns its own bundle entries).
     cmd.env("UNSLOTH_TAURI_UPDATE", "1");
+
+    // read_lossy_lines decodes as UTF-8, and here the child is Python itself,
+    // which otherwise encodes redirected streams with the locale code page.
+    #[cfg(windows)]
+    {
+        cmd.env("PYTHONUTF8", "1");
+        cmd.env("PYTHONIOENCODING", "utf-8");
+    }
 
     #[cfg(windows)]
     let mut child: Box<dyn ChildWrapper + Send> = {

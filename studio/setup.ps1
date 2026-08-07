@@ -61,6 +61,42 @@ if ($PSVersionTable.PSEdition -ne 'Core' -and $env:SystemRoot) {
     }
 }
 
+# UTF-8 output invariant. 5.1 encodes redirected output with the OEM code page,
+# but the desktop app decodes the pipe as UTF-8 (from_utf8_lossy, install.rs):
+# U+1F9A5 has no OEM form so it prints '??', U+2500 has one so it becomes a bare
+# 0xC4 and arrives as U+FFFD. Must precede the first write, since assigning
+# OutputEncoding rebuilds [Console]::Out. Only the console setter is wrapped: it
+# throws when there is no console (CREATE_NO_WINDOW). ASCII-only, because 5.1
+# parses these BOM-less files as ANSI.
+$_UnslothUtf8NoBom = New-Object System.Text.UTF8Encoding $false
+try {
+    [Console]::OutputEncoding = $_UnslothUtf8NoBom
+} catch {
+    # No console to set a code page on, which is how the desktop app spawns us
+    # (CREATE_NO_WINDOW). The setter P/Invokes SetConsoleOutputCP and drops the
+    # cached writer BEFORE it throws, while assigning OutputEncoding only after,
+    # so [Console]::Out would rebuild on the OLD code page. Bind an explicit
+    # UTF-8 writer instead: redirected step/substep use it as their only sink.
+    try {
+        $_UnslothStdout = New-Object System.IO.StreamWriter -ArgumentList ([Console]::OpenStandardOutput()), $_UnslothUtf8NoBom
+        $_UnslothStdout.AutoFlush = $true
+        [Console]::SetOut($_UnslothStdout)
+        # Tauri pipes and decodes stderr the same way and folds it into the same
+        # log, and failure text is built from those lines, so it needs it too.
+        $_UnslothStderr = New-Object System.IO.StreamWriter -ArgumentList ([Console]::OpenStandardError()), $_UnslothUtf8NoBom
+        $_UnslothStderr.AutoFlush = $true
+        [Console]::SetError($_UnslothStderr)
+    } catch { }
+}
+$OutputEncoding = $_UnslothUtf8NoBom
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
+
+# Resolved once: it picks the output sink in step/substep and must not change
+# mid-run. See Write-StudioStdoutMirror.
+$script:StudioStdoutRedirected = $false
+try { $script:StudioStdoutRedirected = [Console]::IsOutputRedirected } catch { }
+
 # --------------------------------------------------------------------------
 #  Maintainer-editable defaults
 #  Change these in the GitHub-hosted script so users get updated defaults.
@@ -148,6 +184,10 @@ function Refresh-Environment {
             # (which loads Microsoft.PowerShell.Security), so the module path
             # would be broken again exactly where it has to be right.
             if ($key -eq 'Path' -or $key -eq 'PSModulePath') { continue }
+            # Same exception, for the UTF-8 invariant at the top. This runs
+            # repeatedly, so a registry PYTHONUTF8=0 would otherwise reload over
+            # ours and every later Python child would go back to mojibake.
+            if ($key -eq 'PYTHONUTF8' -or $key -eq 'PYTHONIOENCODING') { continue }
             Set-Item -Path "Env:$key" -Value $vars[$key] -ErrorAction SilentlyContinue
         }
     }
@@ -1457,20 +1497,20 @@ function Write-LlamaFailureLog {
         Write-Host "   | $line" -ForegroundColor DarkGray
     }
 }
-# Mirror the plain (no ANSI) form of step/substep messages to the
-# OS-level stdout handle when a parent is consuming our stdout via
-# a pipe (CI `tee`, Python subprocess.PIPE, CREATE_NO_WINDOW grandchild).
-# Write-Host on PS 5.1 routes through $Host.UI / the Information
-# stream, neither of which propagates reliably across the
-# install.ps1 -> unsloth.exe -> python -> powershell.exe ->
-# setup.ps1 process chain. [Console]::Out always lands on the OS
-# stdout file handle. Gated on IsOutputRedirected so the
-# interactive-console path keeps the colorized Write-Host output
-# only (no double-print).
+# Plain (no ANSI) form of a step/substep message, written straight to the OS
+# stdout handle. Write-Host on 5.1 goes through $Host.UI / the Information
+# stream, which does not survive every install.ps1 -> unsloth.exe -> python ->
+# powershell.exe -> setup.ps1 chain; [Console]::Out always does.
+#
+# One half of an either/or: when redirected this is the ONLY sink and
+# step/substep skip Write-Host. It used to run in ADDITION to Write-Host, on the
+# assumption that Write-Host never reached the pipe. It does, because the CLI
+# spawns us as `-Command "& 'setup.ps1' *>&1"` (unsloth_cli/commands/studio.py),
+# so every step printed twice.
 function Write-StudioStdoutMirror {
     param([Parameter(Mandatory = $true)][string]$Line)
     try {
-        if ([Console]::IsOutputRedirected) {
+        if ($script:StudioStdoutRedirected) {
             [Console]::Out.WriteLine($Line)
             [Console]::Out.Flush()
         }
@@ -1484,6 +1524,12 @@ function step {
         [string]$Color = "Green"
     )
     $padded = if ($Label.Length -ge 15) { $Label.Substring(0, 15) } else { $Label.PadRight(15) }
+    # Exactly one sink: the console handle when redirected, Write-Host (the only
+    # one that colorizes) when interactive.
+    if ($script:StudioStdoutRedirected) {
+        Write-StudioStdoutMirror ("  {0}{1}" -f $padded, $Value)
+        return
+    }
     if ($script:StudioVtOk -and -not $env:NO_COLOR) {
         $dim = Get-StudioAnsi Dim
         $rst = Get-StudioAnsi Reset
@@ -1496,7 +1542,6 @@ function step {
         }
         Write-Host ("  {0}{1}{2}{3}{4}{2}" -f $dim, $padded, $rst, $val, $Value)
     } else {
-        Write-Host ("  {0}" -f $padded) -NoNewline -ForegroundColor DarkGray
         $fc = switch ($Color) {
             'Green' { 'DarkGreen' }
             'Yellow' { 'Yellow' }
@@ -1504,9 +1549,11 @@ function step {
             'DarkGray' { 'DarkGray' }
             default { 'DarkGreen' }
         }
-        Write-Host $Value -ForegroundColor $fc
+        # One composed record, not `-NoNewline` label + value: two Write-Host
+        # calls are two Information records, and a redirected consumer turns each
+        # boundary into a line break. Costs the dimmed label on no-VT consoles.
+        Write-Host ("  {0}{1}" -f $padded, $Value) -ForegroundColor $fc
     }
-    Write-StudioStdoutMirror ("  {0}{1}" -f $padded, $Value)
 }
 
 function substep {
@@ -1514,6 +1561,11 @@ function substep {
         [Parameter(Mandatory = $true)][string]$Message,
         [string]$Color = "DarkGray"
     )
+    # Exactly one sink, as in `step` above.
+    if ($script:StudioStdoutRedirected) {
+        Write-StudioStdoutMirror ("  {0,-15}{1}" -f "", $Message)
+        return
+    }
     if ($script:StudioVtOk -and -not $env:NO_COLOR) {
         $msgCol = switch ($Color) {
             'Yellow' { (Get-StudioAnsi Warn) }
@@ -1528,7 +1580,6 @@ function substep {
         }
         Write-Host ("  {0,-15}{1}" -f "", $Message) -ForegroundColor $fc
     }
-    Write-StudioStdoutMirror ("  {0,-15}{1}" -f "", $Message)
 }
 
 function Show-NpmRegistryHint {
