@@ -442,7 +442,10 @@ class MtmdSttSidecar:
 
     @property
     def device(self) -> Optional[str]:
-        return "llama.cpp" if self._process_alive() else None
+        # Derived from loaded_model, not a second probe: two independent
+        # _process_alive() calls can straddle the publish, and the status route
+        # would then ship device "llama.cpp" with a null model.
+        return "llama.cpp" if self.loaded_model else None
 
     def is_loading(self) -> bool:
         # Bare bool read, for the same reason as loaded_model.
@@ -595,20 +598,35 @@ class MtmdSttSidecar:
                 if self._gpu_disabled == training or self._active_requests:
                     self._schedule_idle_unload_locked()
                     return
-            # Before the release: a 409 for a model that is not downloaded
-            # must not cost the user the server they were already using.
-            model_path, mmproj_path = self._ensure_model_downloaded(model_id)
-            # Only when there is a live server to protect: a request against a
-            # server that already died must not block recovery.
-            if self._active_requests and self._process_alive():
-                raise SttModelBusyError(
-                    "A transcription is still running on the current dictation model. "
-                    "Try again in a moment."
-                )
-            self._release_locked()
+            # Announce the load before anything slow, and while _lock is still
+            # held: the probe below and the reap in _release_locked() take
+            # seconds, and is_loading() is read without the lock, so a training
+            # start landing in that window would otherwise see False, skip the
+            # cancel and wait out the whole startup in unload() instead.
             cancel_event = threading.Event()
             self._load_cancel_event = cancel_event
             self._loading = True
+            released = False
+            try:
+                # Before the release: a 409 for a model that is not downloaded
+                # must not cost the user the server they were already using.
+                model_path, mmproj_path = self._ensure_model_downloaded(model_id)
+                # Only when there is a live server to protect: a request against
+                # a server that already died must not block recovery.
+                if self._active_requests and self._process_alive():
+                    raise SttModelBusyError(
+                        "A transcription is still running on the current dictation model. "
+                        "Try again in a moment."
+                    )
+                self._release_locked()
+                released = True
+            finally:
+                # Nothing was started, so the announcement has to be taken back;
+                # the startup below owns it from here and clears it in its own
+                # finally.
+                if not released:
+                    self._loading = False
+                    self._load_cancel_event = None
             # Re-read last: _release_locked() reaps the old server, which can
             # take seconds, and training admission that already passed its own
             # check cannot come back to cancel this load. Publishing _loading
