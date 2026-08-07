@@ -1,7 +1,7 @@
 name: "staging-8017 macos-14"
 on:
   push:
-    branches: ["pr-8017-xplat-ci"]
+    branches: ["pr-8017-xplat-ci", "pr-8017-fix-ci"]
     paths:
       - 'studio/backend/core/inference/stt_ggml_sidecar.py'
       - 'studio/backend/core/inference/stt_mtmd_sidecar.py'
