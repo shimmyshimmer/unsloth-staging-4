@@ -1,0 +1,54 @@
+name: staging-7360 windows uninstall.ps1
+# scripts/uninstall.ps1 is not in cross-platform-parity-ci.yml's paths filter, so the
+# PowerShell half of PR #7360 has no Windows job upstream. This runs it for real.
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  windows-uninstall:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PowerShell versions on this runner
+        shell: pwsh
+        run: |
+          Write-Host "pwsh: $($PSVersionTable.PSVersion)"
+          powershell -NoProfile -Command "Write-Host ('Windows PowerShell: ' + `$PSVersionTable.PSVersion)"
+
+      # Both engines, because the documented install path is `irm ... | iex` in whichever
+      # shell the user has open, and 5.1 is what ships with Windows.
+      - name: AST parse under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $e = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts\uninstall.ps1), [ref]$null, [ref]$e)
+          if ($e) { $e | ForEach-Object { $_.Message }; exit 1 }
+          Write-Host "uninstall.ps1 parses under Windows PowerShell 5.1"
+
+      - name: AST parse setup.ps1 under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $e = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path studio\setup.ps1), [ref]$null, [ref]$e)
+          if ($e) { $e | ForEach-Object { $_.Message }; exit 1 }
+          Write-Host "setup.ps1 parses under Windows PowerShell 5.1"
+
+      - name: Run the uninstaller against a sandboxed profile
+        shell: pwsh
+        run: pwsh -NoProfile -File .github/staging/win_uninstall_probe.ps1
+
+      - name: Existing PowerShell uninstall tests
+        shell: pwsh
+        run: |
+          $failed = @()
+          Get-ChildItem tests/studio -Filter 'test_uninstall*.ps1' | ForEach-Object {
+            Write-Host "=== $($_.Name) ==="
+            pwsh -NoProfile -File $_.FullName
+            if ($LASTEXITCODE -ne 0) { $failed += $_.Name }
+          }
+          if ($failed.Count -gt 0) { Write-Host "FAILED: $($failed -join ', ')"; exit 1 }
+          Write-Host "all uninstall .ps1 suites passed"
