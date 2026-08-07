@@ -1853,6 +1853,12 @@ export function ImagesPage({ active = true }: { active?: boolean }) {
       pendingStagedLoad.current = null;
       if (pending) void handleLoadRef.current(pending.repoId, pending.opts, pending.advanced);
     },
+    onCancelled: () => {
+      // The selected model is only an intent until every dependency is ready. A cancelled
+      // companion must not leave that intent behind for a late completion/deferred effect to load.
+      pendingStagedLoad.current = null;
+      stagedLoadDeferred.current = false;
+    },
   });
 
   useEffect(() => {
@@ -1863,32 +1869,44 @@ export function ImagesPage({ active = true }: { active?: boolean }) {
     if (pending) void handleLoadRef.current(pending.repoId, pending.opts, pending.advanced);
   }, [active]);
 
-  // Stage a not-yet-downloaded hub pick, else load it directly. Returns true when the pick was accepted either way.
+  // Ask for a cache-aware plan for every Hub pick. The picker only knows whether the selected
+  // checkpoint is cached; image models can still need a separate text encoder/VAE repository.
+  // Returns true when the pick was accepted either way.
+  const requestDownloadPlan = useCallback(
+    (
+      repoId: string,
+      opts: { kind: "gguf" | "single_file" | "pipeline"; filename?: string },
+      advanced: LoadAdvanced,
+    ) =>
+      getDiffusionDownloadPlan({
+        model_path: repoId,
+        gguf_filename: opts.filename,
+        model_kind: opts.kind,
+        // The same token and Advanced values handleLoad sends, so the plan describes the load that will actually run. Without the
+        // token a gated base plans no companion entry; without the memory/quant controls it stages shards the load never opens.
+        hf_token: hfApiToken(getHfToken()),
+        cpu_offload: advanced.cpu_offload,
+        speed_mode: advanced.speed_mode,
+        transformer_quant: advanced.transformer_quant,
+        memory_mode: advanced.memory_mode,
+        // The backend prefetch decision reads the adapter selection too: a baked LoRA always runs the dense build path. Omitting it
+        // planned a quantized file set and staged too little. Same list handleLoad bakes.
+        loras: advanced.loras,
+      }),
+    [],
+  );
+
   const loadOrStage = useCallback(
     async (
       repoId: string,
       opts: { kind: "gguf" | "single_file" | "pipeline"; filename?: string },
-      isDownloaded?: boolean,
+      source: ModelSelectorChangeMeta["source"] = "hub",
     ): Promise<boolean> => {
-      if (isDownloaded !== false) return handleLoadRef.current(repoId, opts);
+      if (source !== "hub") return handleLoadRef.current(repoId, opts);
       // ONE snapshot for the plan and the load it fires: the download runs for minutes without setting `busy`.
       const advanced = currentLoadAdvanced(repoId);
       try {
-        const plan = await getDiffusionDownloadPlan({
-          model_path: repoId,
-          gguf_filename: opts.filename,
-          model_kind: opts.kind,
-          // The same token and Advanced values handleLoad sends, so the plan describes the load that will actually run. Without the
-          // token a gated base plans no companion entry; without the memory/quant controls it stages shards the load never opens.
-          hf_token: hfApiToken(getHfToken()),
-          cpu_offload: advanced.cpu_offload,
-          speed_mode: advanced.speed_mode,
-          transformer_quant: advanced.transformer_quant,
-          memory_mode: advanced.memory_mode,
-          // The backend prefetch decision reads the adapter selection too: a baked LoRA always runs the dense build path. Omitting it
-          // planned a quantized file set and staged too little. Same list handleLoad bakes.
-          loras: advanced.loras,
-        });
+        const plan = await requestDownloadPlan(repoId, opts, advanced);
         if (plan.entries.length > 0) {
           pendingStagedLoad.current = { repoId, opts, advanced };
           stage(
@@ -1906,7 +1924,26 @@ export function ImagesPage({ active = true }: { active?: boolean }) {
       }
       return handleLoadRef.current(repoId, opts);
     },
-    [stage, currentLoadAdvanced],
+    [stage, currentLoadAdvanced, requestDownloadPlan],
+  );
+
+  const resolveDownloadFootprint = useCallback(
+    async (repoId: string, meta: ModelSelectorChangeMeta) => {
+      if (!meta.ggufFilename) return null;
+      const plan = await requestDownloadPlan(
+        repoId,
+        { kind: "gguf", filename: meta.ggufFilename },
+        currentLoadAdvanced(repoId),
+      );
+      const requiredBytes = plan.required_bytes ?? 0;
+      if (requiredBytes <= 0) return null;
+      return {
+        requiredBytes,
+        checkpointBytes:
+          plan.checkpoint_bytes ?? meta.expectedBytes ?? 0,
+      };
+    },
+    [currentLoadAdvanced, requestDownloadPlan],
   );
 
   // A diffusion model picked from the chat picker arrives as ?model= on this route. Load it once, then clear the params.
@@ -1937,7 +1974,7 @@ export function ImagesPage({ active = true }: { active?: boolean }) {
       routeSearch.quant,
       loadSpecFor(wanted, IMAGE_CATALOG),
     );
-    void loadOrStage(pick.repoId, pick.opts, false);
+    void loadOrStage(pick.repoId, pick.opts, "hub");
   }, [active, routeSearch.model, routeSearch.quant, loadOrStage, navigateSelf]);
 
   // Reload the current model with the current advanced options.
@@ -1958,7 +1995,7 @@ export function ImagesPage({ active = true }: { active?: boolean }) {
         const d = defaultsFor(id);
         setSteps(d.steps);
         setGuidance(d.guidance);
-        void loadOrStage(id, { kind: spec.kind, filename: spec.filename }, meta.isDownloaded);
+        void loadOrStage(id, { kind: spec.kind, filename: spec.filename }, meta.source);
         return;
       }
       // GGUF quant pick from the variant expander. Optimistic for instant picker feedback, but revert if the load fails to START
@@ -1973,7 +2010,7 @@ export function ImagesPage({ active = true }: { active?: boolean }) {
         void loadOrStage(
           id,
           { kind: "gguf", filename: meta.ggufFilename },
-          meta.isDownloaded,
+          meta.source,
         ).then((started) => {
           if (!started) {
             setQuant(prevQuant);
@@ -2042,7 +2079,7 @@ export function ImagesPage({ active = true }: { active?: boolean }) {
       const d = defaultsFor(id);
       setSteps(d.steps);
       setGuidance(d.guidance);
-      void loadOrStage(id, { kind: "pipeline" }, meta.isDownloaded).then((started) => {
+      void loadOrStage(id, { kind: "pipeline" }, meta.source).then((started) => {
         if (!started) {
           setQuant(prevQuant);
           quantRevert.current = null;
@@ -2477,6 +2514,7 @@ export function ImagesPage({ active = true }: { active?: boolean }) {
               value={status?.loaded ? status.repo_id ?? undefined : undefined}
               activeGgufVariant={quant}
               onValueChange={handleModelSelect}
+              resolveDownloadFootprint={resolveDownloadFootprint}
               onEject={status?.loaded ? handleUnload : undefined}
               variant="ghost"
               className="!h-[34px]"
