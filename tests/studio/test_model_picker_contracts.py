@@ -1103,9 +1103,9 @@ def test_diffusion_pages_never_drop_a_gguf_pick_silently():
 
 
 def test_diffusion_pages_stage_downloads_through_the_manager():
-    """Images/Video must not download inside the load: an undownloaded hub pick goes to
-    the Hub download manager first, so it shares the panel, progress, cancel/resume,
-    disk preflight and manifest verification with every other model."""
+    """Images/Video must not download inside the load: a Hub pick with missing files goes
+    to the download manager first, so it shares progress, cancel/resume, disk preflight,
+    and manifest verification with every other model."""
     for rel in ("features/images/images-page.tsx", "features/video/video-page.tsx"):
         src = _read(rel)
         assert "useStagedDownload" in src, f"{rel}: not wired to the download manager"
@@ -1114,10 +1114,40 @@ def test_diffusion_pages_stage_downloads_through_the_manager():
         stage_fn = re.search(r"const loadOrStage = useCallback\(.*?\n  \);", src, re.S)
         assert stage_fn, f"{rel}: loadOrStage not found"
         body = stage_fn.group(0)
-        # Already-downloaded (and local) picks must skip staging and load straight away.
-        assert "isDownloaded !== false" in body, f"{rel}: cached picks would re-stage"
+        # A cached GGUF can still be missing a separate text encoder or VAE, and only the plan
+        # sees that, so every Hub pick is planned and only local picks bypass it. Safe on both
+        # pages because both planners filter against the cache: a fully cached pick returns no
+        # entries. Flipping this on a planner that does not filter would re-stage a whole model.
+        assert 'source !== "hub"' in body, f"{rel}: local picks would be planned"
+        assert (
+            "isDownloaded !== false" not in body
+        ), f"{rel}: cached checkpoint would hide missing companion assets"
         # A missing plan must still load rather than dead-end.
         assert "catch" in body, f"{rel}: no fallback when the plan is unavailable"
+
+
+def test_every_diffusion_planner_filters_the_cache_before_staging():
+    """Planning every Hub pick is only safe on a planner that skips files already on disk;
+    without that an unchanged, fully cached model stages its whole footprint again. The two
+    move together, so pin them together rather than leaving it to a comment."""
+    root = WORKDIR / "studio" / "backend" / "core" / "inference"
+    for name in ("diffusion.py", "sd_cpp_backend.py", "video.py"):
+        src = (root / name).read_text(encoding = "utf-8")
+        plan = re.search(r"def download_plan\(.*?\n    (?=@|def )", src, re.S)
+        assert plan, f"{name}: download_plan not found"
+        assert "_hub_file_is_cached" in plan.group(0), (
+            f"{name}: download_plan stages files without checking the cache"
+        )
+
+
+def test_image_load_fallback_names_requirements_instead_of_only_the_model():
+    """If planning fails and the backend has to fetch files inside the load, its toast must
+    not call companion text encoders and VAEs the selected model. The normal path stages
+    them through Downloads; this wording keeps the defensive fallback honest too."""
+    src = _read("features/images/images-page.tsx")
+    assert '"Downloading model requirements…"' in src
+    assert '"Downloading model…"' not in src
+    assert '"Downloading the files required to load this model."' in src
 
 
 def test_a_hidden_diffusion_page_does_not_load_when_its_download_lands():
@@ -1153,6 +1183,23 @@ def test_staged_downloads_always_scope_their_files():
     assert "scopeId," in body and "files: current.files," in body
     assert "? null" not in body and "? undefined" not in body
     assert "const activeVariant = current ? scopedVariant(scopeId) : null;" in src
+
+
+def test_staged_downloads_use_one_actionable_download_surface():
+    """The Downloads panel owns progress and cancellation. A second informational toast
+    duplicates the same state and gives users another X that only dismisses copy."""
+    staged = _read("features/hub/download-manager/use-staged-download.ts")
+    stage_fn = re.search(
+        r"const stage = useCallback\(\(entries: StagedDownloadEntry\[\]\) => \{.*?\n  \}, \[\]\);",
+        staged,
+        re.S,
+    )
+    assert stage_fn, "staged-download stage callback not found"
+    assert "toast.info" not in stage_fn.group(0)
+
+    panel = _read("features/hub/download-manager/download-manager-panel.tsx")
+    assert 'job.variant?.startsWith("@")' in panel
+    assert '"Model file" : "Required assets"' in panel
 
 
 def test_local_model_sections_respect_the_task_filter():
@@ -1252,13 +1299,20 @@ def test_local_diffusion_routing_is_keyed_by_the_id_the_row_selects():
 
 
 def test_a_staged_download_that_never_starts_clears_the_queue():
-    """requestStart can answer "error" (network failure, rejected scoped request, worker refused).
-    Nothing completes after that, so leaving the head in place stranded the pick: the effect never
-    re-ran and onReady never fired."""
+    """requestStart can answer "error" (network failure, rejected scoped request, worker refused),
+    "conflict" or "busy". Nothing completes after any of them, so leaving the head in place strands
+    the pick: the effect never re-runs and onReady never fires. The consumer's pending auto-load
+    has to go with it, or a later completion loads a model nobody asked for.
+
+    Asserted over the whole non-started region rather than a fixed window after the first branch,
+    so one shared clean-up for all three outcomes passes and three copies would too."""
     src = _read("features/hub/download-manager/use-staged-download.ts")
-    assert 'if (outcome === "error") {' in src
-    branch = src[src.index('if (outcome === "error") {') :][:400]
-    assert "setQueue(null)" in branch
+    assert 'if (outcome === "started") return;' in src
+    region = src[src.index('if (outcome === "started") return;') : src.index("return () => {")]
+    for outcome in ("error", "conflict", "busy"):
+        assert f'outcome === "{outcome}"' in region
+    assert "setQueue(null)" in region
+    assert "onCancelledRef.current?.()" in region
 
 
 def test_staged_download_callbacks_are_bound_to_the_started_file_set():
