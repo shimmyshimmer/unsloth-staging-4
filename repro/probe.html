@@ -1,0 +1,151 @@
+<!doctype html>
+<!--
+  PR 8031 cross-OS repro page.
+
+  Reproduces the model picker's shape: an overflowing scroller whose rows carry
+  a 20px settings gear flush to the right edge. Reports, as window.__RESULT:
+
+    layoutScrollbarPx   how much width the scrollbar takes from layout
+    gearBefore          gear pixel columns that hit-test to the gear, unpatched
+    measuredGutter      what the PR's probe measures
+    gearAfter           the same count once .overlay-scrollbar-gutter is applied
+    gearStable          the same count in a scrollbar-gutter:stable scroller
+
+  The bug reproduces when layoutScrollbarPx == 0 and gearBefore.hit < gearBefore.total.
+  overlay-scrollbar.js is generated in CI by esbuild from the real
+  studio/frontend/src/lib/overlay-scrollbar.ts (iife, global OVL).
+-->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      /* Studio's global scrollbar chrome, copied from studio/frontend/src/index.css */
+      * {
+        scrollbar-width: thin;
+        scrollbar-color: oklch(0.5 0 0 / 0.54) transparent;
+      }
+      ::-webkit-scrollbar { width: 8px; height: 8px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-track-piece { background: transparent; }
+      ::-webkit-scrollbar-corner { background: transparent; }
+      ::-webkit-scrollbar-thumb {
+        background: oklch(0.5 0 0 / 0.54);
+        border-radius: 9999px;
+      }
+      ::-webkit-scrollbar-button { display: none; }
+
+      /* The utility the PR adds. */
+      .overlay-scrollbar-gutter { padding-right: var(--overlay-scrollbar-gutter, 0px); }
+
+      body { margin: 0; font: 13px system-ui, sans-serif; background: #fff; }
+      .scroller { width: 320px; max-height: 160px; overflow-y: auto; }
+      #stable { scrollbar-gutter: stable; }
+      .row { display: flex; align-items: center; gap: 8px; padding: 6px 4px; }
+      .row span { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .gear { flex: 0 0 auto; width: 20px; height: 20px; padding: 0; border: 0; background: #48c; }
+    </style>
+  </head>
+  <body>
+    <div id="scroller" class="scroller"><div id="inner"></div></div>
+    <div id="stable" class="scroller"><div id="stableinner"></div></div>
+    <pre id="out"></pre>
+
+    <script src="./overlay-scrollbar.js"></script>
+    <script>
+      function fill(host, prefix) {
+        for (var i = 0; i < 14; i++) {
+          var row = document.createElement("div");
+          row.className = "row";
+          row.innerHTML =
+            "<span>Qwen3.6-35B-A3B-GGUF-" + i + "</span>" +
+            '<button class="gear" id="' + prefix + i + '"></button>';
+          host.appendChild(row);
+        }
+      }
+
+      /* How many of the element's pixel columns actually hit-test to it. */
+      function clickableColumns(el) {
+        var r = el.getBoundingClientRect();
+        var y = Math.round(r.top + r.height / 2);
+        var total = Math.round(r.width);
+        var hit = 0;
+        var blockedBy = null;
+        for (var i = 0; i < total; i++) {
+          var x = Math.round(r.left) + i + 0.5;
+          var got = document.elementFromPoint(x, y);
+          if (got === el || el.contains(got)) {
+            hit++;
+          } else if (!blockedBy) {
+            blockedBy = got ? (got.id || got.tagName + "." + got.className) : "null";
+          }
+        }
+        return { hit: hit, total: total, blockedBy: blockedBy };
+      }
+
+      /* Sweep inward from the scroller's right edge, recording what is on top. */
+      function sweep(sc, rowEl) {
+        var scR = sc.getBoundingClientRect();
+        var y = Math.round(rowEl.getBoundingClientRect().top + rowEl.getBoundingClientRect().height / 2);
+        var seq = [];
+        for (var off = 1; off <= 32; off++) {
+          var got = document.elementFromPoint(Math.round(scR.right) - off, y);
+          seq.push(got ? (got.id || got.tagName.toLowerCase() + (got.className ? "." + got.className : "")) : "null");
+        }
+        return seq;
+      }
+
+      function run() {
+        var sc = document.getElementById("scroller");
+        var inner = document.getElementById("inner");
+        var stable = document.getElementById("stable");
+        fill(inner, "gear-");
+        fill(document.getElementById("stableinner"), "stablegear-");
+
+        var res = {};
+        res.userAgent = navigator.userAgent;
+        res.devicePixelRatio = window.devicePixelRatio;
+        res.innerWidth = window.innerWidth;
+
+        res.scrollerOffsetWidth = sc.offsetWidth;
+        res.scrollerClientWidth = sc.clientWidth;
+        res.layoutScrollbarPx = sc.offsetWidth - sc.clientWidth;
+        res.overflowing = sc.scrollHeight > sc.clientHeight;
+        res.stableLayoutScrollbarPx = stable.offsetWidth - stable.clientWidth;
+
+        // Reveal scrollbars that only paint while scrolling, exactly as the
+        // PR's probe does, so the hit strip is in its steady state.
+        sc.scrollTop = 1;
+        stable.scrollTop = 1;
+
+        var gear = document.getElementById("gear-2");
+        res.gearBefore = clickableColumns(gear);
+        res.sweepBefore = sweep(sc, gear);
+        res.gearStable = clickableColumns(document.getElementById("stablegear-2"));
+
+        res.measuredGutter = OVL.measureOverlayScrollbarGutter(document);
+        res.applied = OVL.applyOverlayScrollbarGutter(document);
+        res.cssVar =
+          document.documentElement.style.getPropertyValue("--overlay-scrollbar-gutter") || null;
+
+        inner.classList.add("overlay-scrollbar-gutter");
+        res.innerPaddingRight = getComputedStyle(inner).paddingRight;
+        res.gearAfter = clickableColumns(gear);
+        res.sweepAfter = sweep(sc, gear);
+
+        res.reproduced = res.layoutScrollbarPx === 0 && res.gearBefore.hit < res.gearBefore.total;
+        res.fixed = res.reproduced && res.gearAfter.hit === res.gearAfter.total;
+
+        window.__RESULT = res;
+        document.getElementById("out").textContent = JSON.stringify(res, null, 2);
+        return res;
+      }
+
+      // Give the engine a paint before hit testing.
+      if (document.readyState === "complete") {
+        setTimeout(run, 250);
+      } else {
+        window.addEventListener("load", function () { setTimeout(run, 250); });
+      }
+    </script>
+  </body>
+</html>
