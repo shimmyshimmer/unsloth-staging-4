@@ -108,15 +108,22 @@ def test_compiled_cache_default_is_cwd_relative():
     assert resolved.parent == Path.cwd()
 
 
-def test_cache_cleanup_only_knows_repo_relative_dirs():
+def test_cache_cleanup_only_knows_repo_relative_dirs(tmp_path, monkeypatch):
     from utils import cache_cleanup
+
+    # Studio is launched with CWD = user profile on Windows (install.ps1), so
+    # stand somewhere that is not the source tree.
+    monkeypatch.chdir(tmp_path)
 
     dirs = [str(d) for d in cache_cleanup._CACHE_DIRS]
     print("\ncache_cleanup dirs:")
     for d in dirs:
         print("   ", d)
-    home = str(Path.home())
-    assert all(not d.startswith(home) or "unsloth_main" in d for d in dirs), dirs
+    # Every candidate is derived from the source tree location, so a cache
+    # created in the launcher's CWD (the user profile on Windows) is invisible.
+    repo_root = Path(cache_cleanup.__file__).resolve().parents[3]
+    assert all(str(repo_root) in d for d in dirs), dirs
+    assert all(Path(os.path.abspath("unsloth_compiled_cache")) != Path(d) for d in dirs)
     src = Path(cache_cleanup.__file__).read_text(encoding="utf-8")
     assert "UNSLOTH_COMPILE_LOCATION" not in src, (
         "cleanup now honours the env var -- update this repro"
