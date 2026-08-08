@@ -247,3 +247,5 @@ llama.cpp/
 async_task_outputs/
 temp/
 logs/
+repro/overlay-scrollbar.js
+repro-out-*.json

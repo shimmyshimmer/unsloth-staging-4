@@ -1,0 +1,62 @@
+name: "PR-8031 repro macos-15 (WKWebView)"
+on:
+  push:
+    branches: [pr-8031-ci]
+    paths:
+      - 'repro/**'
+      - 'studio/frontend/src/lib/overlay-scrollbar.ts'
+      - '.github/workflows/repro-macos.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  wkwebview:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Build the PR's measurement module
+        run: npx --yes esbuild@0.24.2 studio/frontend/src/lib/overlay-scrollbar.ts --bundle --format=iife --global-name=OVL --outfile=repro/overlay-scrollbar.js
+
+      - name: Build the WKWebView probe
+        run: swiftc -O repro/wkwebview_probe.swift -o "$RUNNER_TEMP/wkprobe"
+
+      - name: WKWebView, overlay scrollbars (macOS default)
+        env:
+          REPRO_OUT: repro-out-wkwebview-overlay.json
+        run: |
+          defaults write -g AppleShowScrollBars -string WhenScrolling
+          "$RUNNER_TEMP/wkprobe" "$PWD/repro/probe.html"
+
+      - name: WKWebView, always-on scrollbars (control)
+        if: always()
+        env:
+          REPRO_OUT: repro-out-wkwebview-always.json
+        run: |
+          defaults write -g AppleShowScrollBars -string Always
+          "$RUNNER_TEMP/wkprobe" "$PWD/repro/probe.html"
+
+      - name: Playwright cross-check (webkit + chromium)
+        if: always()
+        env:
+          REPRO_OUT: repro-out-macos-playwright.json
+        run: |
+          python3 -m pip install --break-system-packages --quiet playwright
+          python3 -m playwright install webkit chromium
+          python3 repro/pw_probe.py webkit chromium
+
+      - name: Summary
+        if: always()
+        run: python3 repro/summarize.py macos-15 repro-out-*.json | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: repro-macos
+          path: repro-out-*.json

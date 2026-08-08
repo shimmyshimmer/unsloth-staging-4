@@ -1,0 +1,55 @@
+name: "PR-8031 repro windows-latest (WebView2)"
+on:
+  push:
+    branches: [pr-8031-ci]
+    paths:
+      - 'repro/**'
+      - 'studio/frontend/src/lib/overlay-scrollbar.ts'
+      - '.github/workflows/repro-windows.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  webview2:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Build the PR's measurement module
+        run: npx --yes esbuild@0.24.2 studio/frontend/src/lib/overlay-scrollbar.ts --bundle --format=iife --global-name=OVL --outfile=repro/overlay-scrollbar.js
+
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: '8.0.x' }
+
+      - name: WebView2 probe (the engine Tauri embeds on Windows)
+        env:
+          REPRO_OUT: repro-out-webview2.json
+        run: dotnet run --project repro/webview2 -c Release -- "$PWD/repro/probe.html"
+
+      - name: Playwright cross-check (msedge + chromium)
+        if: always()
+        env:
+          REPRO_OUT: repro-out-windows-playwright.json
+        run: |
+          python -m pip install --quiet playwright
+          python -m playwright install chromium msedge
+          python repro/pw_probe.py chromium:msedge chromium
+
+      - name: Summary
+        if: always()
+        run: python repro/summarize.py windows-latest repro-out-*.json | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: repro-windows
+          path: repro-out-*.json
