@@ -335,3 +335,5 @@ mod tests {
         Ok(())
     }
 }
+
+// Re-checked after the frontendDist fix.

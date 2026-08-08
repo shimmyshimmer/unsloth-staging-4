@@ -70,11 +70,12 @@ def _record_job_status(ok: bool, detail: str, last_error: int = 0) -> None:
 
         logger = logging.getLogger(__name__)
         if ok:
-            logger.info("Windows process lifetime: %s", detail)
+            logger.info("Child-process cleanup on abnormal exit: %s", detail)
         else:
             logger.warning(
-                "Windows process lifetime NOT guaranteed: %s. Children may survive a crash "
-                "or End Task and hold the install open against an update.",
+                "Child-process cleanup on abnormal exit is NOT guaranteed: %s. Children may "
+                "survive a crash or a force quit; the startup sweep reaps them on the next "
+                "launch.",
                 detail,
             )
     except Exception:
