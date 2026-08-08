@@ -28,3 +28,8 @@ jobs:
         run: |
           cd studio/backend
           PYTHONPATH=. python -m pytest tests/test_repro_discord_storage.py -q -s
+      - name: shutdown / orphan repro
+        shell: bash
+        run: |
+          cd studio/backend
+          PYTHONPATH=.:${{ github.workspace }} python -m pytest tests/test_repro_discord_shutdown.py -q -s
