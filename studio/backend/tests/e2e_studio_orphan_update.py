@@ -143,8 +143,20 @@ with httpx.Client(timeout=30) as c:
     for name in ("chart.png", "results.csv"):
         r = c.get(f"{BASE}/api/inference/sandbox/{session}/{name}", headers=H)
         fetched[name] = r.status_code
-    listing = c.get(f"{BASE}/api/inference/sandbox/{session}", headers=H).status_code
+    listing_response = c.get(f"{BASE}/api/inference/sandbox/{session}", headers=H)
+    listing = listing_response.status_code
+    # The server's own answer to "where did my file go" -- authoritative, unlike
+    # the path this script computes, which falls back when the backend deps are
+    # not importable from the runner's interpreter.
+    if listing == 200:
+        body = listing_response.json()
+        results["server_sandbox_path"] = body.get("path")
+        results["server_sandbox_files"] = [f["name"] for f in body.get("files", [])]
+        results["server_sandbox_under_studio_home"] = (
+            str(HOME).lower() in str(body.get("path", "")).lower()
+        )
 print("fetch:", fetched, "listing route:", listing)
+print("server says the files are in:", results.get("server_sandbox_path"))
 results["sandbox_fetch"] = fetched
 results["sandbox_listing_status"] = listing
 
