@@ -183,10 +183,12 @@ results["survivors"] = survivors
 # kill; the fix is that the NEXT Studio reaps them before spawning anything.
 if survivors:
     say("relaunching Studio -- the startup sweep should reap the orphans")
+    # The password is already set by now, and passing it again is a hard error.
+    restart_env = {k: v for k, v in env.items() if k != "UNSLOTH_STUDIO_PASSWORD"}
     with open(str(LOG) + ".restart", "wb") as log:
         second = subprocess.Popen(
             [BIN, "studio", "-H", "127.0.0.1", "-p", str(PORT + 1)],
-            env=env, cwd=str(launch_cwd), stdout=log, stderr=subprocess.STDOUT,
+            env=restart_env, cwd=str(launch_cwd), stdout=log, stderr=subprocess.STDOUT,
         )
     deadline = time.time() + 600
     while time.time() < deadline:
