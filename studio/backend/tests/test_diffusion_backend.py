@@ -5038,8 +5038,13 @@ class _FakeSibling:
 
 
 class _FakeInfo:
-    def __init__(self, siblings):
+    def __init__(
+        self,
+        siblings,
+        sha = None,
+    ):
         self.siblings = siblings
+        self.sha = sha
 
 
 GB = 1024**3
@@ -5056,7 +5061,11 @@ _FLUX_BASE_SIBLINGS = [
 ]
 
 
-def _fake_hf_api(monkeypatch, repos):
+def _fake_hf_api(
+    monkeypatch,
+    repos,
+    shas = None,
+):
     """Point HfApi.model_info at a canned sibling list per repo id."""
 
     class _Api:
@@ -5066,9 +5075,16 @@ def _fake_hf_api(monkeypatch, repos):
             files_metadata = False,
             token = None,
         ):
-            return _FakeInfo(repos[repo_id])
+            return _FakeInfo(repos[repo_id], (shas or {}).get(repo_id))
 
     monkeypatch.setattr("huggingface_hub.HfApi", lambda *a, **k: _Api())
+    # Download-plan tests describe their cache state explicitly. Never let a developer's real
+    # Studio cache make an entry disappear from these otherwise hermetic tests.
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_hub_file_is_cached",
+        staticmethod(lambda repo_id, filename, revision = None, expected_size = None: False),
+    )
 
 
 def test_download_plan_scopes_the_base_repo_files(monkeypatch):
@@ -5110,6 +5126,197 @@ def test_download_plan_scopes_the_base_repo_files(monkeypatch):
     # Sized per repo, so each download job gets its own expected bytes.
     assert base["bytes"] < 24 * GB
     assert plan["total_bytes"] == checkpoint["bytes"] + base["bytes"]
+    assert plan["required_bytes"] == plan["total_bytes"]
+    assert plan["checkpoint_bytes"] == 7 * GB
+
+
+def test_download_plan_omits_a_cached_gguf_but_keeps_missing_companions(monkeypatch):
+    _fake_hf_api(
+        monkeypatch,
+        {
+            "unsloth/FLUX.1-dev-GGUF": [_FakeSibling("flux1-dev-Q4_K_M.gguf", 7 * GB)],
+            "black-forest-labs/FLUX.1-dev": _FLUX_BASE_SIBLINGS,
+        },
+    )
+    monkeypatch.setattr(
+        "core.inference.diffusion._resolve_base_repo",
+        lambda *a, **k: "black-forest-labs/FLUX.1-dev",
+    )
+    monkeypatch.setattr(
+        DiffusionBackend, "_dense_quant_prefetch_needed", lambda self, fam, kwargs: False
+    )
+    _no_cache(monkeypatch)
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_hub_file_is_cached",
+        staticmethod(
+            lambda repo_id, filename, revision = None, expected_size = None: repo_id
+            == "unsloth/FLUX.1-dev-GGUF"
+            and filename == "flux1-dev-Q4_K_M.gguf"
+        ),
+    )
+
+    plan = DiffusionBackend().download_plan(
+        "unsloth/FLUX.1-dev-GGUF", gguf_filename = "flux1-dev-Q4_K_M.gguf"
+    )
+
+    assert [entry["repo_id"] for entry in plan["entries"]] == ["unsloth/FLUX.1-dev"]
+    assert "text_encoder/model.safetensors" in plan["entries"][0]["files"]
+    assert plan["total_bytes"] == plan["entries"][0]["bytes"]
+    # Cache state changes the pending download, never the selector's declared footprint.
+    assert plan["required_bytes"] == 7 * GB + plan["total_bytes"]
+    assert plan["checkpoint_bytes"] == 7 * GB
+
+
+def test_download_plan_is_empty_when_every_required_file_is_cached(monkeypatch):
+    _fake_hf_api(
+        monkeypatch,
+        {
+            "unsloth/FLUX.1-dev-GGUF": [_FakeSibling("flux1-dev-Q4_K_M.gguf", 7 * GB)],
+            "black-forest-labs/FLUX.1-dev": _FLUX_BASE_SIBLINGS,
+        },
+    )
+    monkeypatch.setattr(
+        "core.inference.diffusion._resolve_base_repo",
+        lambda *a, **k: "black-forest-labs/FLUX.1-dev",
+    )
+    monkeypatch.setattr(
+        DiffusionBackend, "_dense_quant_prefetch_needed", lambda self, fam, kwargs: False
+    )
+    _all_cached(monkeypatch)
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_hub_file_is_cached",
+        staticmethod(lambda repo_id, filename, revision = None, expected_size = None: True),
+    )
+
+    plan = DiffusionBackend().download_plan(
+        "unsloth/FLUX.1-dev-GGUF", gguf_filename = "flux1-dev-Q4_K_M.gguf"
+    )
+
+    assert plan["entries"] == []
+    assert plan["total_bytes"] == 0
+    assert plan["required_bytes"] > 7 * GB
+    assert plan["checkpoint_bytes"] == 7 * GB
+
+
+def test_download_plan_sizes_the_checkpoint_when_the_base_is_the_same_repo(monkeypatch):
+    # A combined repo (explicit base_repo, or a self-referential base_model tag) keys both Hub
+    # lookups on one id. Overwriting instead of merging left the checkpoint at 0 bytes and put the
+    # companion total in checkpoint_bytes, and listing it twice double counted the footprint.
+    combined = "unsloth/Combined-Image-GGUF"
+    _fake_hf_api(
+        monkeypatch,
+        {
+            combined: [
+                _FakeSibling("model-Q4_K_M.gguf", 7 * GB),
+                _FakeSibling("model_index.json", 1000),
+                _FakeSibling("text_encoder/model.safetensors", 2 * GB),
+                _FakeSibling("vae/diffusion_pytorch_model.safetensors", 300),
+            ],
+        },
+    )
+    monkeypatch.setattr("core.inference.diffusion._resolve_base_repo", lambda *a, **k: combined)
+    monkeypatch.setattr(
+        DiffusionBackend, "_dense_quant_prefetch_needed", lambda self, fam, kwargs: False
+    )
+    _no_cache(monkeypatch)
+
+    plan = DiffusionBackend().download_plan(
+        combined, gguf_filename = "model-Q4_K_M.gguf", base_repo = combined
+    )
+
+    assert len(plan["entries"]) == 1, "one repo, one scoped job"
+    entry = plan["entries"][0]
+    assert entry["gguf_filename"] == "model-Q4_K_M.gguf"
+    assert entry["files"].count("model-Q4_K_M.gguf") == 1
+    assert plan["checkpoint_bytes"] == 7 * GB
+    assert entry["bytes"] == plan["required_bytes"] == 7 * GB + 2 * GB + 1300
+
+
+def _write_hub_cache(
+    root,
+    repo_id,
+    filename,
+    sha,
+    size,
+    *,
+    symlink = True,
+):
+    """The tree hf_hub_download leaves behind: blobs/ + snapshots/<sha>/ + refs/main."""
+    import os
+
+    repo_dir = (root / f"models--{repo_id.replace('/', '--')}").resolve()
+    blobs, snaps, refs = repo_dir / "blobs", repo_dir / "snapshots" / sha, repo_dir / "refs"
+    for d in (blobs, (snaps / filename).parent, refs):
+        d.mkdir(parents = True, exist_ok = True)
+    blob = blobs / "etag"
+    blob.write_bytes(b"\0" * size)
+    target = snaps / filename
+    if symlink:
+        os.symlink(os.path.relpath(blob, target.parent), target)
+    else:
+        import shutil
+        shutil.copyfile(blob, target)
+    (refs / "main").write_text(sha)
+
+
+@pytest.mark.parametrize("symlink", [True, False], ids = ["posix_links", "windows_copies"])
+def test_a_cached_file_survives_an_unrelated_commit_to_its_repo(tmp_path, monkeypatch, symlink):
+    # model_info().sha is the REPO head, so a README commit moves it while every weight stays
+    # byte identical. Calling those files missing would re-stage the whole footprint and can fail
+    # a disk preflight for space nobody needs, so the size the plan declared has the last word.
+    repo, name = "black-forest-labs/FLUX.1-dev", "text_encoder/model.safetensors"
+    _write_hub_cache(tmp_path, repo, name, "a" * 40, 4096, symlink = symlink)
+    monkeypatch.setattr("core.inference.diffusion.hub_cache_dir", lambda: str(tmp_path))
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "unused"))
+
+    assert DiffusionBackend._hub_file_is_cached(repo, name, "a" * 40, 4096)
+    assert DiffusionBackend._hub_file_is_cached(
+        repo, name, "b" * 40, 4096
+    ), "an unrelated repo commit must not invalidate a file the plan sized identically"
+    assert not DiffusionBackend._hub_file_is_cached(
+        repo, name, "b" * 40, 9999
+    ), "a republished file has a different declared size and must be fetched through the manager"
+    # Nothing declared to compare against: trust the ref rather than call a present file missing.
+    assert DiffusionBackend._hub_file_is_cached(repo, name, "b" * 40, 0)
+
+
+def test_download_plan_probes_the_cache_at_the_revision_it_sized(monkeypatch):
+    # An unpinned probe answers from the LOCAL main ref, so a republished companion reads as
+    # present and the loader fetches it inline, outside the download manager.
+    seen = []
+    _fake_hf_api(
+        monkeypatch,
+        {
+            "unsloth/FLUX.1-dev-GGUF": [_FakeSibling("flux1-dev-Q4_K_M.gguf", 7 * GB)],
+            "black-forest-labs/FLUX.1-dev": _FLUX_BASE_SIBLINGS,
+        },
+        shas = {"unsloth/FLUX.1-dev-GGUF": "abc123", "black-forest-labs/FLUX.1-dev": "def456"},
+    )
+    monkeypatch.setattr(
+        "core.inference.diffusion._resolve_base_repo",
+        lambda *a, **k: "black-forest-labs/FLUX.1-dev",
+    )
+    monkeypatch.setattr(
+        DiffusionBackend, "_dense_quant_prefetch_needed", lambda self, fam, kwargs: False
+    )
+    # Upstream serves this pick, so both entries keep the id the sizes were read from. A mirror
+    # swap deliberately drops the pin instead: the vendor's commit means nothing in that repo.
+    _all_cached(monkeypatch)
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_hub_file_is_cached",
+        staticmethod(
+            lambda repo_id, filename, revision = None, expected_size = None: bool(seen.append(revision))
+        ),
+    )
+
+    DiffusionBackend().download_plan(
+        "unsloth/FLUX.1-dev-GGUF", gguf_filename = "flux1-dev-Q4_K_M.gguf"
+    )
+
+    assert set(seen) == {"abc123", "def456"}
 
 
 def test_download_plan_pipeline_kind_is_one_entry(monkeypatch):
@@ -5138,6 +5345,8 @@ def test_download_plan_is_empty_for_a_local_path(tmp_path, monkeypatch):
 
     plan = DiffusionBackend().download_plan(str(local), gguf_filename = "weights.gguf")
     assert plan["entries"] == []
+    assert plan["required_bytes"] == 0
+    assert plan["checkpoint_bytes"] == 0
 
 
 def test_download_plan_stages_the_precast_encoder_instead_of_the_dense_one(monkeypatch):
