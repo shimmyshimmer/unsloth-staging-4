@@ -3,7 +3,10 @@
 
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
-import { useMonitorOverlayStore } from "@/features/settings";
+import {
+  useMonitorFrameStore,
+  useMonitorOverlayStore,
+} from "@/features/settings";
 import { aggregateGpuMemoryTotalGb, useSystemInfo } from "@/hooks/use-system";
 import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
@@ -167,6 +170,14 @@ function useMonitorLayout(constraintsElement: HTMLDivElement | null) {
         session.constraintsHeight = constraintsBox.height;
       }
 
+      // Publish the real box so the overlay stack can keep clear of it.
+      useMonitorFrameStore.getState().setFrame({
+        left: monitorBox.left,
+        top: monitorBox.top,
+        right: monitorBox.right,
+        bottom: monitorBox.bottom,
+      });
+
       setLayout((current) => {
         const next = {
           left,
@@ -191,12 +202,30 @@ function useMonitorLayout(constraintsElement: HTMLDivElement | null) {
     }
     return () => {
       observer.disconnect();
+      useMonitorFrameStore.getState().setFrame(null);
       if (remeasureRef.current) {
         cancelAnimationFrame(remeasureRef.current);
         remeasureRef.current = 0;
       }
     };
   }, [constraintsElement]);
+
+  // ResizeObserver never fires for a position-only change, so dragging alone
+  // would leave the published frame at the monitor's old corner and the overlay
+  // stack dodging where it used to be. Re-publish once each layout is committed.
+  useLayoutEffect(() => {
+    const monitor = monitorRef.current;
+    if (!(monitor && constraintsElement)) {
+      return;
+    }
+    const box = monitor.getBoundingClientRect();
+    useMonitorFrameStore.getState().setFrame({
+      left: box.left,
+      top: box.top,
+      right: box.right,
+      bottom: box.bottom,
+    });
+  }, [layout, constraintsElement]);
 
   function startDrag(event: PointerEvent<HTMLDivElement>) {
     const monitor = monitorRef.current;

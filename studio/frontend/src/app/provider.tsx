@@ -17,10 +17,13 @@ import { fetchDeviceType } from "@/config/env";
 import { getTauriAuthFailure, tauriAutoAuth } from "@/features/auth";
 import { DeepLinkHandler } from "@/features/deep-links";
 import { DownloadManagerPanel } from "@/features/hub/download-manager";
+import { LoadedModelsIndicator } from "@/features/loaded-models";
 import { NativeIntentDrain } from "@/features/native-intents/native-intent-drain";
 import {
   applyCustomizationToDocument,
+  stackMaxHeight,
   useAppearanceCustomStore,
+  useStackBottomInset,
   useTheme,
 } from "@/features/settings";
 import { SttDownloadPrompt } from "@/features/settings/components/stt-download-prompt";
@@ -372,6 +375,7 @@ function TauriUpdateLayer({
   appContent: ReactNode;
 }) {
   const update = useTauriUpdate(isExternalServer);
+  const stackBottomInset = useStackBottomInset();
   const isUpdating =
     update.status === "updating-backend" ||
     update.status === "downloading" ||
@@ -390,7 +394,13 @@ function TauriUpdateLayer({
     />
   ) : (
     // Capped like the browser stack: the download panel shares it, so both must fit.
-    <div className="pointer-events-none fixed bottom-4 right-4 z-[9998] flex max-h-[calc(100dvh_-_2rem)] flex-col items-end gap-2">
+    <div
+      className="pointer-events-none fixed right-4 z-[9998] flex flex-col items-end gap-2"
+      style={{
+        bottom: stackBottomInset,
+        maxHeight: stackMaxHeight(stackBottomInset),
+      }}
+    >
       <UpdateBanner
         status={update.status}
         info={update.info}
@@ -503,6 +513,7 @@ function DesktopChromeVarsEffect({
 
 function TauriWrapper({ children }: { children: ReactNode }) {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const stackBottomInset = useStackBottomInset();
   const {
     status,
     logs,
@@ -667,7 +678,13 @@ function TauriWrapper({ children }: { children: ReactNode }) {
             corner, banners above, each owning its width. */}
         {/* Capped to the viewport, or a long download list plus expanded notes
             pushes the top of the stack off screen. */}
-        <div className="pointer-events-none fixed bottom-4 right-4 z-[9998] flex max-h-[calc(100dvh_-_2rem)] flex-col items-end gap-2">
+        <div
+          className="pointer-events-none fixed right-4 z-[9998] flex flex-col items-end gap-2"
+          style={{
+            bottom: stackBottomInset,
+            maxHeight: stackMaxHeight(stackBottomInset),
+          }}
+        >
           <WebUpdateBanner
             positioned={false}
             enabled={!WEB_UPDATE_HIDDEN_ROUTES.has(pathname)}
@@ -677,6 +694,9 @@ function TauriWrapper({ children }: { children: ReactNode }) {
             enabled={!WEB_UPDATE_HIDDEN_ROUTES.has(pathname)}
           />
           <DownloadManagerPanel positioned={false} />
+          {/* Last in the stack, so the persistent card sits at the corner and the
+              transient banners above it never cover it. */}
+          <LoadedModelsIndicator positioned={false} />
         </div>
       </>
     );
@@ -698,6 +718,7 @@ function TauriWrapper({ children }: { children: ReactNode }) {
     >
       <LlamaUpdateBanner positioned={false} enabled={!hidesTitlebarSidebar} />
       <DownloadManagerPanel positioned={false} />
+      <LoadedModelsIndicator positioned={false} />
     </TauriUpdateLayer>
   ) : (
     <StartupScreen
