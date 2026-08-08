@@ -21,6 +21,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
+      - name: placeholder frontend dist
+        shell: bash
+        working-directory: .
+        run: |
+          # tauri::generate_context! reads frontendDist at compile time; this
+          # check is about the Rust change, not the bundle.
+          mkdir -p studio/frontend/dist
+          echo '<!doctype html><title>ci</title>' > studio/frontend/dist/index.html
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
