@@ -1,0 +1,40 @@
+name: "e2e-studio macos-14"
+on:
+  push:
+    branches: [studio-file-locations-ci]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  e2e:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: install Studio under UNSLOTH_STUDIO_HOME
+        run: |
+          export UNSLOTH_STUDIO_HOME="$RUNNER_TEMP/studiohome"
+          ./install.sh --local
+          ls "$UNSLOTH_STUDIO_HOME"
+      - name: e2e orphan + update repro
+        run: |
+          python -m pip install httpx psutil
+          export UNSLOTH_STUDIO_HOME="$RUNNER_TEMP/studiohome"
+          STUDIO_HOME="$UNSLOTH_STUDIO_HOME" \
+          STUDIO_BIN="$UNSLOTH_STUDIO_HOME/bin/unsloth" \
+          STUDIO_PORT=8899 STUDIO_REPO="$GITHUB_WORKSPACE" \
+          E2E_RESULTS="$GITHUB_WORKSPACE/e2e_results.json" \
+          python -u studio/backend/tests/e2e_studio_orphan_update.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-macos
+          path: |
+            e2e_results.json
+            e2e_server.log
