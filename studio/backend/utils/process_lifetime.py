@@ -546,14 +546,16 @@ def reap_recorded_children(timeout: float = 5.0) -> "list[int]":
         return killed
 
     owner_pid = record.get("owner_pid")
-    # Our own record (a restart that reused the pid is caught by the identity),
-    # or an owner that is still running: not ours to clean up.
-    if owner_pid == os.getpid():
-        return killed
-    if isinstance(owner_pid, int) and _pid_alive(owner_pid):
-        owner_identity = record.get("owner_identity")
-        if owner_identity is None or owner_identity == _pid_identity(owner_pid):
-            return killed
+    owner_identity = record.get("owner_identity")
+    # Identity decides, not the pid. A pid is recycled quickly on a busy machine,
+    # so "the owner pid is alive" is only meaningful when its start time still
+    # matches the one recorded next to it -- including for this process, which
+    # may have inherited the pid of the Studio that wrote the record.
+    owner_matches = owner_identity is None or owner_identity == _pid_identity(owner_pid or -1)
+    if owner_pid == os.getpid() and owner_matches:
+        return killed  # our own record
+    if isinstance(owner_pid, int) and owner_matches and _pid_alive(owner_pid):
+        return killed  # that Studio is still running; its children are its own
 
     for entry in record.get("children") or []:
         pid = entry.get("pid")

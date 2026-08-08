@@ -170,16 +170,14 @@ def test_macos_style_orphans_are_recorded_and_reaped(tmp_path, monkeypatch):
         pl.adopt_pid(child.pid)
         assert record.is_file(), "the child was not recorded"
 
-        # Pretend a previous Studio wrote this and died. Use a pid that really
-        # is dead rather than an arbitrary large number: macOS answers
-        # kill(huge_pid, 0) with EPERM, which reads as "still running".
-        dead = subprocess.Popen([sys.executable, "-c", "pass"])
-        dead.wait(timeout=30)
+        # Pretend a previous Studio wrote this and died. The identity is what
+        # decides, not the pid: a dead pid is recycled fast on a busy machine
+        # (macOS especially), and an owner whose start time no longer matches is
+        # a different process, so its recorded children are orphans.
         import json
 
         payload = json.loads(record.read_text())
-        payload["owner_pid"] = dead.pid
-        payload["owner_identity"] = None
+        payload["owner_identity"] = "a-previous-studio-that-is-gone"
         record.write_text(json.dumps(payload))
 
         reaped = pl.reap_recorded_children()

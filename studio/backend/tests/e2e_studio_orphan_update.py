@@ -198,7 +198,15 @@ if survivors:
         if second.poll() is not None:
             break
         time.sleep(5)
-    time.sleep(10)
+    time.sleep(15)
+    restart_log = Path(str(LOG) + ".restart")
+    if restart_log.is_file():
+        text = restart_log.read_text(errors="replace")
+        print("--- restart log (reaper lines) ---")
+        for line in text.splitlines():
+            if any(w in line.lower() for w in ("reap", "orphan", "lifetime", "error")):
+                print("   ", line[:300])
+        print(f"--- restart log tail ---\n{text[-1500:]}")
     still_alive = [p for p in survivors if psutil.pid_exists(p["pid"])]
     results["orphans_surviving_a_restart"] = still_alive
     print("still alive after the restart:", json.dumps(still_alive, indent=2))
