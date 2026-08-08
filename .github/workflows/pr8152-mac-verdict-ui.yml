@@ -1,0 +1,137 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# PR #8152 before/after evidence on a real Apple Silicon host.
+#
+# Two jobs, same runner image, same install, same script. The only difference is
+# whether the PR's product changes are present:
+#
+#   after   the branch as it stands (the PR merged onto main)
+#   before  the same tree with pr8152_product.patch reversed, which removes exactly
+#           the five product files the PR touches and nothing else
+#
+# Nothing about the host is faked. macos-15 is Apple Silicon, install.sh --local
+# --no-torch leaves no MLX stack, so `import mlx.core` genuinely fails, detection
+# genuinely settles chat_only / "mlx_unavailable", and utils.mlx_repair genuinely runs
+# `uv pip install mlx mlx-lm mlx-vlm` in the background. The screenshots are of whatever
+# the sidebar does across that window.
+
+name: "PR-8152 mac capability verdict UI"
+
+on:
+  push:
+    branches: [pr-8152-macui-ci]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  shots:
+    name: "sidebar during the MLX self-heal (${{ matrix.variant }})"
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [before, after]
+    env:
+      STUDIO_PORT: '18893'
+      PR8152_VARIANT: ${{ matrix.variant }}
+      PW_ART_DIR: logs/pr8152_shots
+      PR8152_SAMPLE_S: '300'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Remove the PR's product changes (before only)
+        if: matrix.variant == 'before'
+        run: |
+          set -euo pipefail
+          git apply -R --verbose pr8152_product.patch
+          test ! -f studio/frontend/src/config/hardware-verdict-cache.ts
+          echo "product changes reversed"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Unsloth (--local, --no-torch)
+        uses: ./.github/actions/install-unsloth-local
+        with:
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+          hf-token: ''
+
+      - name: Install Playwright browsers
+        run: |
+          pip install 'playwright>=1.55,<1.58'
+          python -m playwright install chromium
+
+      - name: Patch Playwright pipeTransport.js to tolerate malformed JSON
+        run: |
+          python - <<'PY'
+          import os, re, playwright
+          d = os.path.join(os.path.dirname(playwright.__file__), "driver", "package", "lib", "server")
+          p = os.path.join(d, "pipeTransport.js")
+          if not os.path.exists(p):
+              print("pipeTransport.js not found; skipping")
+          else:
+              src = open(p).read()
+              out = re.sub(
+                  r"this\.onmessage\.call\(null, JSON\.parse\((message2?)\)\);",
+                  r"try { this.onmessage.call(null, JSON.parse(\1)); } catch (e) {}",
+                  src,
+              )
+              if out != src:
+                  open(p, "w").write(out)
+                  print("patched")
+              else:
+                  print("no match; skipping")
+          PY
+
+      # No --api-only: this needs the built frontend served, and no
+      # UNSLOTH_DISABLE_MLX_AUTOREPAIR, because the self-heal running for real is the
+      # window under test.
+      - name: Boot Unsloth Studio
+        run: bash .github/scripts/boot-studio-api-only.sh --port "$STUDIO_PORT" --log logs/studio.log
+
+      - name: Read the bootstrap password
+        run: |
+          for i in $(seq 1 180); do
+            [ -f ~/.unsloth/studio/auth/.bootstrap_password ] && break
+            sleep 1
+          done
+          OLD=$(cat ~/.unsloth/studio/auth/.bootstrap_password)
+          echo "::add-mask::$OLD"
+          echo "STUDIO_OLD_PW=$OLD" >> "$GITHUB_ENV"
+
+      - name: Screenshot the capability gate
+        env:
+          BASE_URL: http://127.0.0.1:18893
+        run: |
+          mkdir -p "$PW_ART_DIR"
+          python tests/studio/pr8152_capability_screenshot.py
+
+      - name: Server log
+        if: always()
+        run: tail -120 logs/studio.log || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr8152-${{ matrix.variant }}
+          path: |
+            logs/pr8152_shots/**
+            logs/studio.log
+          if-no-files-found: warn
+          retention-days: 7
