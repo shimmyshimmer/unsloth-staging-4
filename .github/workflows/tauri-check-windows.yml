@@ -1,0 +1,31 @@
+name: "tauri-check windows-latest"
+on:
+  push:
+    branches: [studio-file-locations-ci]
+    paths:
+      - 'studio/src-tauri/**'
+      - '.github/workflows/tauri-check-windows.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: studio/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri
+      - name: cargo check
+        run: cargo check --all-targets
+      - name: windows job object tests
+        run: cargo test --lib windows_job -- --nocapture
