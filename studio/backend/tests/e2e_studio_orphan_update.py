@@ -178,6 +178,44 @@ survivors = studio_processes()
 print("survivors:", json.dumps(survivors, indent=2))
 results["survivors"] = survivors
 
+# ------------------------------------------------- 4b. next startup sweeps
+# macOS has no parent-death signal, so survivors are expected right after a hard
+# kill; the fix is that the NEXT Studio reaps them before spawning anything.
+if survivors:
+    say("relaunching Studio -- the startup sweep should reap the orphans")
+    with open(str(LOG) + ".restart", "wb") as log:
+        second = subprocess.Popen(
+            [BIN, "studio", "-H", "127.0.0.1", "-p", str(PORT + 1)],
+            env=env, cwd=str(launch_cwd), stdout=log, stderr=subprocess.STDOUT,
+        )
+    deadline = time.time() + 600
+    while time.time() < deadline:
+        try:
+            if httpx.get(f"http://127.0.0.1:{PORT + 1}/healthz", timeout=5).status_code < 500:
+                break
+        except Exception:
+            pass
+        if second.poll() is not None:
+            break
+        time.sleep(5)
+    time.sleep(10)
+    still_alive = [p for p in survivors if psutil.pid_exists(p["pid"])]
+    results["orphans_surviving_a_restart"] = still_alive
+    print("still alive after the restart:", json.dumps(still_alive, indent=2))
+    try:
+        second.kill()
+        second.wait(timeout=30)
+    except Exception:
+        pass
+    time.sleep(3)
+    for p in studio_processes():
+        try:
+            psutil.Process(p["pid"]).kill()
+        except Exception:
+            pass
+else:
+    results["orphans_surviving_a_restart"] = []
+
 # ---------------------------------------------------------------- 5. update
 say("running the real `unsloth studio update`")
 upd_env = dict(os.environ)
