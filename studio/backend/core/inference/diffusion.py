@@ -21,12 +21,17 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from core._torchao_stub import (
+    install_torchao_windows_rocm_stub,
+    install_xformers_windows_rocm_stub,
+)
 from loggers import get_logger
 from utils.hardware import clear_gpu_cache
 
@@ -131,6 +136,11 @@ from .diffusion_transformer_quant import (
 
 logger = get_logger(__name__)
 
+# Every `import diffusers` below is lazy, so this runs before the first one. On Windows ROCm
+# both reach an absent distributed backend: diffusers imports xformers on sight, quantizers torchao.
+install_xformers_windows_rocm_stub()
+install_torchao_windows_rocm_stub()
+
 
 # "gguf" and "single_file" take companions from the base repo; "pipeline" is a full diffusers repo.
 _MODEL_KINDS = frozenset({"gguf", "single_file", "pipeline"})
@@ -144,6 +154,73 @@ def hub_cache_dir() -> str:
     setting, so without this a single load could split across two roots."""
     from utils.hf_cache_settings import active_hf_hub_cache
     return active_hf_hub_cache()
+
+
+# Repo id out of any hub URL in an error. Two shapes reach here: a download's file URL,
+# ".../huggingface.co/<owner>/<name>/resolve/...", which is what a gated PUBLIC repo raises,
+# and an API URL, ".../huggingface.co/api/models/<owner>/<name>", from auth_check or from
+# model_info on a gated PRIVATE one. Without the prefix branch the second yields "api/models".
+_HUB_REPO_RE = re.compile(
+    r"huggingface\.co/(?:api/(?:models|datasets|spaces)/)?([\w.\-]+/[\w.\-]+)"
+)
+
+
+def _gated_in_chain(exc: BaseException) -> Optional[BaseException]:
+    """The GatedRepoError in ``exc``'s cause/context chain, or None.
+
+    Transformers loads re-raise the 403 wrapped in an OSError, so the outermost error alone
+    misses the case this exists for. Screened by class name across the MRO, so no hub import.
+    """
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if any(cls.__name__ == "GatedRepoError" for cls in type(exc).__mro__):
+            return exc
+        # `raise ... from None` means the raiser already wrote a better message (the base-repo
+        # preflight does), so stop rather than overwrite it with the generic one.
+        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    return None
+
+
+def _hf_token_in_play(hf_token: Optional[str]) -> bool:
+    """Whether the failing Hub call carried ANY credential.
+
+    Not just Studio's own: with token=None huggingface_hub still falls back to HF_TOKEN or the
+    cached CLI login, so keying off the request token alone loops an already-authenticated user.
+    """
+    if hf_token:
+        return True
+    try:
+        # What build_hf_headers calls, not get_token(): under HF_HUB_DISABLE_IMPLICIT_TOKEN a
+        # cached login still answers get_token() while the request goes out anonymous.
+        from huggingface_hub.utils import get_token_to_send
+        return bool(get_token_to_send(None))
+    except Exception:  # noqa: BLE001 -- unreadable or an unknown hub layout: assume none, which
+        return False  # only costs the user the "add a token" half of the message
+
+
+def hub_access_message(exc: BaseException, *, had_token: bool) -> Optional[str]:
+    """Rewrite a gated-repo failure into the step that actually unblocks the user.
+
+    Returns None for anything else, so an unrelated load error keeps its own text. Only the
+    toast is affected; the raw exception, request id and resolve URL still reach the log.
+    """
+    gated = _gated_in_chain(exc)
+    if gated is None:
+        return None
+    found = _HUB_REPO_RE.search(str(gated))
+    # An API URL ends at the repo, so the sentence's full stop lands inside the name (dots are
+    # legal mid-name, as in FLUX.2-klein-9B, but a name never ends in one).
+    repo = found.group(1).rstrip(".") if found else None
+    # Any other /api/<endpoint> URL (whoami-v2, ...) would parse as the repo "api/<endpoint>".
+    if repo and repo.split("/", 1)[0] == "api":
+        repo = None
+    where = f"https://huggingface.co/{repo}" if repo else "its Hugging Face page"
+    subject = repo or "This model"
+    if had_token:
+        # A token was sent and still bounced, so the account itself lacks access.
+        return f"{subject} is gated and this Hugging Face account is not on its access list. Request access at {where}, then load again."
+    return f"{subject} is gated. Request access at {where}, then add a Hugging Face token in Settings and load again."
 
 
 def resolve_model_kind(gguf_filename: Optional[str], model_kind: Optional[str] = None) -> str:
@@ -1297,12 +1374,21 @@ class DiffusionBackend:
                 clear_gpu_cache()
             except Exception:  # noqa: BLE001
                 pass
-            # Redact native paths: this error is surfaced verbatim and Studio can be shared.
+            # Rewrite a gated-repo 403 into the step that unblocks the user, then redact native
+            # paths: this text is surfaced verbatim and Studio can be shared. Guarded because on
+            # this daemon thread anything escaping leaves _loading.error unset and
+            # load_progress() stuck on "downloading" forever.
             from utils.native_path_leases import redact_native_paths
 
+            try:
+                text = hub_access_message(
+                    exc, had_token = _hf_token_in_play(kwargs.get("hf_token"))
+                ) or str(exc)
+            except Exception:  # noqa: BLE001
+                text = str(exc)
             with self._lock:
                 if self._load_token == token and self._loading is not None:
-                    self._loading.error = redact_native_paths(str(exc))
+                    self._loading.error = redact_native_paths(text)
 
     def load_progress(self) -> dict[str, Any]:
         """Phase + downloaded/total bytes for the in-flight load (cache-scan based)."""
