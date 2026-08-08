@@ -1,0 +1,79 @@
+# Staging-only. Throwaway branch for unslothai/unsloth#8082; never merged.
+#
+# Runs the loaded-models indicator suite in all three engine families on Linux:
+# Chromium (also Chrome and the Windows WebView2), Gecko, and WebKit (also
+# Safari and the WebKitGTK the Linux desktop app embeds).
+#
+# The suite stubs the four /status endpoints with page.route, so no model, no
+# GPU and no llama.cpp inference are needed -- but a real Studio still serves
+# the built SPA and answers /api/auth, so the install below is the real one.
+
+name: "PR-8082 indicator engines ubuntu-latest"
+
+on:
+  push:
+    branches: [pr-8082-indicator-engines]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  engines:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev libssl-dev jq
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Unsloth (--local, --no-torch)
+        run: |
+          mkdir -p logs
+          ./install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Install Playwright engines
+        run: |
+          pip install 'playwright>=1.45'
+          python -m playwright install --with-deps chromium firefox webkit
+
+      # One port per engine: the runner script wipes auth and boots its own
+      # Studio each time, and reusing a port races the previous teardown.
+      - name: Chromium
+        run: bash .github/scripts/run-studio-indicator-browser.sh 18991 chromium
+
+      - name: Firefox
+        run: bash .github/scripts/run-studio-indicator-browser.sh 18992 firefox
+
+      - name: WebKit
+        run: bash .github/scripts/run-studio-indicator-browser.sh 18993 webkit
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: indicator-ubuntu
+          path: |
+            logs/playwright-indicator-*
+            logs/studio-indicator-*.log
+            logs/install.log
+          if-no-files-found: ignore

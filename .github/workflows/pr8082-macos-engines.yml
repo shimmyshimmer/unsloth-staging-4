@@ -1,0 +1,66 @@
+# Staging-only. Throwaway branch for unslothai/unsloth#8082; never merged.
+#
+# WebKit on macOS is the closest CI gets to WKWebView, which is what the macOS
+# desktop app actually embeds. Chromium runs too, because the position restore
+# under test depends on real layout and a real ResizeObserver and the two
+# engines schedule those differently.
+
+name: "PR-8082 indicator engines macos-14"
+
+on:
+  push:
+    branches: [pr-8082-indicator-engines]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  engines:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Unsloth (--local, --no-torch)
+        run: |
+          mkdir -p logs
+          ./install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Install Playwright engines
+        # No --with-deps on macOS: that flag installs Linux apt packages.
+        run: |
+          pip install 'playwright>=1.55,<1.58'
+          python -m playwright install chromium webkit
+
+      - name: WebKit
+        run: bash .github/scripts/run-studio-indicator-browser.sh 18991 webkit
+
+      - name: Chromium
+        run: bash .github/scripts/run-studio-indicator-browser.sh 18992 chromium
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: indicator-macos
+          path: |
+            logs/playwright-indicator-*
+            logs/studio-indicator-*.log
+            logs/install.log
+          if-no-files-found: ignore
