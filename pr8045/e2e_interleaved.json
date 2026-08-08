@@ -1,0 +1,16 @@
+{
+  "pairs": 40,
+  "max_tokens": 1000,
+  "pre_min_s": 0.5036,
+  "post_min_s": 0.4411,
+  "pre_median_s": 0.6607,
+  "post_median_s": 0.6442,
+  "paired_mean_diff_s": -0.0272,
+  "paired_diff_stdev_s": 0.0802,
+  "paired_diff_95ci_s": [
+    -0.0521,
+    -0.0023
+  ],
+  "paired_mean_diff_pct": -4.07,
+  "min_diff_pct": -12.41
+}

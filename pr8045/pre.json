@@ -1,0 +1,43 @@
+{
+  "root": "/mnt/disks/unslothai/ubuntu/workspace_89/temp/s8045/pre_repo/studio/backend",
+  "reps": 7,
+  "n": 20000,
+  "results": {
+    "append_reply": {
+      "us_per_op": 0.3679,
+      "median": 0.3708
+    },
+    "mark_first_token": null,
+    "set_usage": {
+      "us_per_op": 0.4123,
+      "median": 0.4186
+    },
+    "monitor_openai_chunk_content": {
+      "us_per_op": 0.8271,
+      "median": 0.8333
+    },
+    "monitor_openai_chunk_reasoning": {
+      "us_per_op": 0.552,
+      "median": 0.5632
+    },
+    "usage_only_sse_content": {
+      "us_per_op": 0.0,
+      "median": 0.0,
+      "absent": true
+    },
+    "usage_only_sse_usage": {
+      "us_per_op": 0.0,
+      "median": 0.0,
+      "absent": true
+    },
+    "usage_only_sse_done": {
+      "us_per_op": 0.0,
+      "median": 0.0,
+      "absent": true
+    },
+    "snapshot_50_rows": {
+      "us_per_op": 64.9001,
+      "median": 65.1084
+    }
+  }
+}
