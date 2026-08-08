@@ -48,6 +48,22 @@ jobs:
           $ProgressPreference = 'SilentlyContinue'
           & ./install.ps1 --local --no-torch *>&1 | Tee-Object -FilePath logs/install.log
 
+      # install.ps1 puts unsloth.exe at $StudioHome\bin and adds that dir to the
+      # User PATH via the registry, which does not propagate into a running Git
+      # Bash session -- so the runner script below would hit "command not
+      # found". Same step the upstream Windows UI workflow carries.
+      - name: Add Unsloth shim to GITHUB_PATH
+        shell: bash
+        run: |
+          SHIM_DIR=~/.unsloth/studio/bin
+          if [ ! -f "$SHIM_DIR/unsloth.exe" ]; then
+            echo "::error::unsloth.exe shim not found at $SHIM_DIR"
+            ls -la ~/.unsloth/studio/ || true
+            exit 1
+          fi
+          cygpath -w "$SHIM_DIR" >> "$GITHUB_PATH"
+          echo "Added Unsloth shim dir to PATH: $(cygpath -w "$SHIM_DIR")"
+
       - name: Install Playwright engines
         shell: bash
         run: |
