@@ -193,6 +193,24 @@ def test_macos_style_orphans_are_recorded_and_reaped(tmp_path, monkeypatch):
         _kill(child.pid)
 
 
+def test_liveness_probe_does_not_kill_what_it_probes():
+    """os.kill(pid, 0) is TerminateProcess on Windows, so the probe cannot use it."""
+    from utils import process_lifetime as pl
+
+    victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        for _ in range(3):
+            assert pl._pid_alive(victim.pid) is True
+            time.sleep(0.3)
+        assert victim.poll() is None, "the liveness probe killed the process"
+    finally:
+        _kill(victim.pid)
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait(timeout=30)
+    assert pl._pid_alive(dead.pid) is False
+
+
 def test_a_live_owner_is_never_reaped(tmp_path, monkeypatch):
     """Two Studios at once must not kill each other's children."""
     from utils import process_lifetime as pl

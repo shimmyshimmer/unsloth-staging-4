@@ -479,6 +479,39 @@ def clear_breadcrumb() -> None:
 
 
 def _pid_alive(pid: int) -> bool:
+    if _is_windows():
+        # NOT os.kill(pid, 0): on Windows that is TerminateProcess(handle, 0),
+        # so the "probe" would kill the very process it is asking about.
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            SYNCHRONIZE = 0x0010_0000
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            WAIT_TIMEOUT = 0x102
+            ERROR_ACCESS_DENIED = 5
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+            handle = kernel32.OpenProcess(
+                SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if not handle:
+                # A live process owned by someone else answers ACCESS_DENIED;
+                # anything else means there is nothing there.
+                return _last_error(ctypes) == ERROR_ACCESS_DENIED
+            try:
+                # Signalled means exited; still waiting means running.
+                return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
