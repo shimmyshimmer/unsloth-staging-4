@@ -36,4 +36,4 @@ jobs:
       - name: cargo check
         run: cargo check --all-targets
       - name: windows job object tests
-        run: cargo test --lib windows_job -- --nocapture
+        run: cargo test --bins windows_job -- --nocapture

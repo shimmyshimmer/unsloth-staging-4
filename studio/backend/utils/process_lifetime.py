@@ -563,7 +563,12 @@ def reap_recorded_children(timeout: float = 5.0) -> "list[int]":
         if not isinstance(pid, int) or not _pid_alive(pid):
             continue
         identity = entry.get("identity")
-        if identity is not None and identity != _pid_identity(pid):
+        current = _pid_identity(pid)
+        # Skip only on a definite mismatch. When the current identity cannot be
+        # read (the macOS probe shells out to `ps`, which can fail transiently
+        # under load), the record is still the better evidence -- treating an
+        # unreadable identity as a mismatch silently disables the sweep.
+        if identity is not None and current is not None and identity != current:
             continue  # pid was recycled by an unrelated process
         if _is_windows():
             try:
