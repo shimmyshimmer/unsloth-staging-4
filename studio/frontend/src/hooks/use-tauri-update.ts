@@ -384,6 +384,9 @@ export function useTauriUpdate(isExternalServer = false) {
       } finally {
         // Success, failure and cancel alike: the installer is no longer running.
         publishShellUpdateActive(false);
+        // Reaching here at all means the installer did not replace us, so the
+        // crash-cleanup guarantee the pre-exit hook stood down has to come back.
+        await invoke("resume_desktop_update_cleanup").catch(() => {});
       }
 
       // relaunch() re-execs with the original argv, so flag the inherited --hidden as not a login

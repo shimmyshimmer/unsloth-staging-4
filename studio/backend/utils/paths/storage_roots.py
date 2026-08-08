@@ -288,6 +288,14 @@ def _setup_cache_env() -> None:
     defaults: dict[str, str] = {
         "UV_CACHE_DIR": str(root / "uv"),
         "VLLM_CACHE_ROOT": str(root / "vllm"),
+        # unsloth_zoo defaults this to the bare relative name
+        # "unsloth_compiled_cache", which resolves against the CWD -- and the
+        # Windows launcher starts Studio with WorkingDirectory=%USERPROFILE%,
+        # so the cache landed in the user's home next to .unsloth. Pin it under
+        # the studio home instead. Must be set before unsloth_zoo.compiler is
+        # imported: it reads the variable at import time and inserts the value
+        # into sys.path there.
+        "UNSLOTH_COMPILE_LOCATION": str(root.parent / "compiled_cache"),
     }
     for key, value in defaults.items():
         if key not in os.environ:
