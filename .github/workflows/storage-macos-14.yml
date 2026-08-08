@@ -33,3 +33,8 @@ jobs:
         run: |
           cd studio/backend
           PYTHONPATH=.:${{ github.workspace }} python -m pytest tests/test_repro_discord_shutdown.py -q -s
+      - name: job-object boundary repro
+        shell: bash
+        run: |
+          cd studio/backend
+          PYTHONPATH=.:${{ github.workspace }} python -m pytest tests/test_repro_job_boundary.py -q -s

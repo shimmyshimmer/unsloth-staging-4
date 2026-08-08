@@ -72,7 +72,10 @@ def studio_processes() -> list[dict]:
 say("launching Studio")
 env = dict(os.environ)
 env["UNSLOTH_STUDIO_HOME"] = str(HOME)
-env["UNSLOTH_STUDIO_PASSWORD"] = PASSWORD
+if not (HOME / "auth" / "auth.db").is_file():
+    # --password / UNSLOTH_STUDIO_PASSWORD only sets the INITIAL password; passing
+    # it again to an install that already has one is a hard error.
+    env["UNSLOTH_STUDIO_PASSWORD"] = PASSWORD
 # The Windows launcher starts Studio with WorkingDirectory = %USERPROFILE%
 # (install.ps1), so mirror that: it is what decides where unsloth_compiled_cache
 # is created.
