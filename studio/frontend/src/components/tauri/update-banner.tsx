@@ -109,11 +109,26 @@ export function UpdateBanner({
             // Wider than the other overlays: notes preview plus three buttons.
             positioned
               ? "fixed bottom-4 right-4 z-[9999] w-[calc(100vw-2rem)] max-w-[448px]"
-              : "pointer-events-auto flex min-h-0 w-[calc(100vw-2rem)] max-w-[448px] flex-col",
+              : cn(
+                  "pointer-events-auto flex w-[calc(100vw-2rem)] max-w-[448px] flex-col",
+                  // The floor is this card with its notes closed, measured in
+                  // a browser: 8rem wide enough for one row of actions, 12rem
+                  // once the card is narrow enough to wrap them onto a second
+                  // row (184px at a 390px viewport). A capped rail takes the
+                  // card's height out of the notes, which clip, and stops at
+                  // the buttons. min-height:auto would be the whole card, so
+                  // the card would give up nothing and the banner below it
+                  // would be the one clipped.
+                  //
+                  // The failure card has no notes, so there is nothing in it to
+                  // give up: shrinking it only clips the diagnostics and the
+                  // retry button. It holds its height and the rail scrolls.
+                  showFailure ? "shrink-0" : "min-h-48 sm:min-h-32",
+                ),
           )}
           data-testid="tauri-update-banner"
         >
-          <div className="relative flex max-h-[calc(100dvh_-_2rem)] flex-col overflow-hidden rounded-[24px] bg-white px-5 pb-4 pt-5 shadow-[0_2px_8px_-2px_rgba(0,0,0,0.16)] dark:bg-card dark:shadow-[0_8px_28px_-6px_rgba(0,0,0,0.28)]">
+          <div className="relative flex max-h-[calc(100dvh_-_2rem)] min-h-0 flex-col overflow-hidden rounded-[24px] bg-white px-5 pb-4 pt-5 shadow-[0_2px_8px_-2px_rgba(0,0,0,0.16)] dark:bg-card dark:shadow-[0_8px_28px_-6px_rgba(0,0,0,0.28)]">
             <button
               type="button"
               onClick={onDismiss}
@@ -137,7 +152,7 @@ export function UpdateBanner({
               </svg>
             </button>
 
-            <div className="flex min-w-0 items-start gap-4 pr-6">
+            <div className="flex min-w-0 shrink-0 items-start gap-4 pr-6">
               <Icon
                 aria-hidden="true"
                 className="mt-1 size-5 shrink-0 text-foreground"
@@ -168,7 +183,7 @@ export function UpdateBanner({
             </div>
 
             {showFailure && lastFailure && (
-              <p className="mt-3 line-clamp-2 text-xs text-destructive">
+              <p className="mt-3 line-clamp-2 shrink-0 text-xs text-destructive">
                 {lastFailure.error}
               </p>
             )}
@@ -186,7 +201,8 @@ export function UpdateBanner({
 
             <div
               className={cn(
-                "mt-4 flex flex-wrap items-center gap-x-1 gap-y-2",
+                // Wraps on a narrow card, never compresses on a short one.
+                "mt-4 flex shrink-0 flex-wrap items-center gap-x-1 gap-y-2",
                 !showFailure && notesTargetVersion
                   ? "justify-between"
                   : "justify-end",
@@ -261,14 +277,16 @@ export function UpdateBanner({
               )}
             </div>
             {manualMessage && (
-              <p className="mt-3 text-xs text-destructive">{manualMessage}</p>
+              <p className="mt-3 shrink-0 text-xs text-destructive">
+                {manualMessage}
+              </p>
             )}
             {manualReport && (
               <textarea
                 readOnly={true}
                 value={manualReport}
                 onFocus={(event) => event.currentTarget.select()}
-                className="mt-2 h-28 w-full resize-none rounded-lg border border-border/50 bg-muted/30 p-2 font-mono text-ui-10 text-muted-foreground"
+                className="mt-2 h-28 w-full shrink-0 resize-none rounded-lg border border-border/50 bg-muted/30 p-2 font-mono text-ui-10 text-muted-foreground"
               />
             )}
           </div>
