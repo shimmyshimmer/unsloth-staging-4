@@ -124,7 +124,7 @@ def _ensure_project_workspace(root_path: str) -> str:
     return str(root_resolved)
 
 
-def _delete_project_workspace(project: dict) -> None:
+def delete_chat_project_workspace(project: dict) -> None:
     root_path = project.get("rootPath")
     if not root_path:
         return
@@ -307,6 +307,31 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 created_at
             )
             """
+        )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_thread_tombstones (
+            id TEXT NOT NULL PRIMARY KEY,
+            deleted_at INTEGER NOT NULL
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_clear_operations (
+            id TEXT NOT NULL PRIMARY KEY,
+            active_research_run_ids_json TEXT NOT NULL,
+            deleted_thread_ids_json TEXT NOT NULL DEFAULT '[]',
+            cleared_at INTEGER NOT NULL
+        ) WITHOUT ROWID
+        """
+    )
+    chat_clear_operation_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(chat_clear_operations)").fetchall()
+    }
+    if "deleted_thread_ids_json" not in chat_clear_operation_cols:
+        conn.execute(
+            "ALTER TABLE chat_clear_operations ADD COLUMN deleted_thread_ids_json TEXT NOT NULL DEFAULT '[]'"
         )
     conn.execute(
         """
@@ -886,12 +911,20 @@ def bulk_upsert_prompt_lists(lists: list[dict]) -> int:
         conn.close()
 
 
-def get_connection() -> sqlite3.Connection:
+# sqlite's own default, kept for every caller that may run on the event loop
+_BUSY_TIMEOUT_SECONDS = 5.0
+
+# only for the chat history transactions that run in Starlette's threadpool, where a large clear
+# can hold the writer lock past the default and the failure escapes as an unmapped 500
+_CONTENDED_BUSY_TIMEOUT_SECONDS = 30.0
+
+
+def get_connection(busy_timeout_seconds: float = _BUSY_TIMEOUT_SECONDS) -> sqlite3.Connection:
     """Open studio.db with WAL mode, create tables once per process, enable foreign keys."""
     global _schema_ready
     db_path = studio_db_path()
     ensure_dir(db_path.parent)
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), timeout = busy_timeout_seconds)
     conn.row_factory = sqlite3.Row
     # foreign_keys is session-scoped; set per connection
     conn.execute("PRAGMA foreign_keys=ON")
@@ -1539,9 +1572,24 @@ def _chat_message_from_row(row: sqlite3.Row) -> dict:
     return message
 
 
+class ChatThreadDeletedError(RuntimeError):
+    """Raised when a stale writer tries to recreate a deleted thread id."""
+
+
+def _raise_if_chat_thread_deleted(conn: sqlite3.Connection, thread_id: str) -> None:
+    row = conn.execute(
+        "SELECT 1 FROM chat_thread_tombstones WHERE id = ?",
+        (thread_id,),
+    ).fetchone()
+    if row is not None:
+        raise ChatThreadDeletedError(thread_id)
+
+
 def upsert_chat_thread(thread: dict) -> dict:
-    conn = get_connection()
+    conn = get_connection(_CONTENDED_BUSY_TIMEOUT_SECONDS)
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        _raise_if_chat_thread_deleted(conn, thread["id"])
         conn.execute(
             """
             INSERT INTO chat_threads
@@ -1579,6 +1627,9 @@ def upsert_chat_thread(thread: dict) -> dict:
         )
         conn.commit()
         return get_chat_thread(thread["id"]) or thread
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -1709,6 +1760,36 @@ def list_chat_threads(
         conn.close()
 
 
+def build_chat_history_export() -> tuple[list[dict], list[dict], list[dict]]:
+    """Read projects, threads, and messages from one SQLite snapshot."""
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN")
+        thread_rows = conn.execute(
+            """
+            SELECT * FROM chat_threads
+            ORDER BY COALESCE(updated_at, created_at) DESC, created_at DESC
+            """
+        ).fetchall()
+        project_rows = conn.execute(
+            "SELECT * FROM chat_projects ORDER BY updated_at DESC"
+        ).fetchall()
+        message_rows = conn.execute(
+            "SELECT * FROM chat_messages ORDER BY created_at ASC, id ASC"
+        ).fetchall()
+        conn.commit()
+        return (
+            [_chat_project_from_row(row) for row in project_rows],
+            [_chat_thread_from_row(row) for row in thread_rows],
+            [_chat_message_from_row(row) for row in message_rows],
+        )
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _reparent_surviving_forks(conn: sqlite3.Connection, deleted_ids: set[str]) -> None:
     """Keep fork lineage connected across any thread deletion path."""
     if not deleted_ids:
@@ -1733,14 +1814,69 @@ def _reparent_surviving_forks(conn: sqlite3.Connection, deleted_ids: set[str]) -
         )
 
 
-def delete_chat_threads(ids: list[str]) -> None:
+def _tombstone_chat_threads(conn: sqlite3.Connection, thread_ids: Iterable[str]) -> None:
+    deleted_at = int(datetime.now(timezone.utc).timestamp() * 1000)
+    conn.executemany(
+        """
+        INSERT INTO chat_thread_tombstones (id, deleted_at)
+        VALUES (?, ?)
+        ON CONFLICT(id) DO UPDATE SET deleted_at = excluded.deleted_at
+        """,
+        [(thread_id, deleted_at) for thread_id in sorted(set(thread_ids))],
+    )
+
+
+# Only these states can already own a worker. Queued, paused, and approval rows are removed before
+# they can be claimed, so signalling them would only leave unused supervisor cancellation events.
+_ACTIVE_RESEARCH_RUN_STATUSES = (
+    "planning",
+    "running",
+    "cancelling",
+)
+
+
+def _active_research_run_ids(
+    conn: sqlite3.Connection, thread_ids: set[str] | None = None
+) -> list[str]:
+    status_placeholders = ",".join("?" for _ in _ACTIVE_RESEARCH_RUN_STATUSES)
+    if thread_ids is None:
+        rows = conn.execute(
+            f"""
+            SELECT id, created_at FROM research_runs
+            WHERE status IN ({status_placeholders})
+            """,
+            _ACTIVE_RESEARCH_RUN_STATUSES,
+        ).fetchall()
+    else:
+        rows = []
+        sorted_thread_ids = sorted(thread_ids)
+        for start in range(0, len(sorted_thread_ids), _SQLITE_IN_CHUNK_SIZE):
+            chunk = sorted_thread_ids[start : start + _SQLITE_IN_CHUNK_SIZE]
+            thread_placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                conn.execute(
+                    f"SELECT id, created_at FROM research_runs "
+                    f"WHERE thread_id IN ({thread_placeholders}) "
+                    f"AND status IN ({status_placeholders})",
+                    (*chunk, *_ACTIVE_RESEARCH_RUN_STATUSES),
+                ).fetchall()
+            )
+    return [row["id"] for row in sorted(rows, key = lambda row: (row["created_at"], row["id"]))]
+
+
+def delete_chat_threads_with_active_research_runs(ids: list[str]) -> list[str]:
     if not ids:
-        return
-    conn = get_connection()
+        return []
+    conn = get_connection(_CONTENDED_BUSY_TIMEOUT_SECONDS)
     try:
         conn.execute("BEGIN IMMEDIATE")
         _ensure_chat_attachment_inventory_current(conn)
-        _reparent_surviving_forks(conn, set(ids))
+        thread_ids = set(ids)
+        active_research_run_ids = _active_research_run_ids(conn, thread_ids)
+        _reparent_surviving_forks(conn, thread_ids)
+        # Record the delete even when no row exists yet. A late POST carrying the same unique id
+        # must not recreate a thread after this request has confirmed deletion.
+        _tombstone_chat_threads(conn, thread_ids)
         conn.executemany(
             "DELETE FROM chat_attachment_tombstones WHERE thread_id = ?",
             [(id,) for id in ids],
@@ -1748,6 +1884,64 @@ def delete_chat_threads(ids: list[str]) -> None:
         conn.executemany("DELETE FROM chat_threads WHERE id = ?", [(id,) for id in ids])
         _mark_chat_attachment_inventory_clean(conn)
         conn.commit()
+        return active_research_run_ids
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def delete_chat_threads(ids: list[str]) -> None:
+    delete_chat_threads_with_active_research_runs(ids)
+
+
+def clear_chat_history_with_active_research_runs(
+    additional_thread_ids: Iterable[str] = (), operation_id: Optional[str] = None
+) -> tuple[list[str], list[str]]:
+    conn = get_connection(_CONTENDED_BUSY_TIMEOUT_SECONDS)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if operation_id is not None:
+            completed = conn.execute(
+                """
+                SELECT active_research_run_ids_json, deleted_thread_ids_json
+                FROM chat_clear_operations WHERE id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+            if completed is not None:
+                conn.commit()
+                return (
+                    list(json.loads(completed["active_research_run_ids_json"])),
+                    list(json.loads(completed["deleted_thread_ids_json"])),
+                )
+        _ensure_chat_attachment_inventory_current(conn)
+        active_research_run_ids = _active_research_run_ids(conn)
+        deleted_thread_ids = sorted(
+            row["id"] for row in conn.execute("SELECT id FROM chat_threads").fetchall()
+        )
+        # the caller's ids are fenced too, but only rows that existed here were actually deleted
+        _tombstone_chat_threads(conn, sorted(set(additional_thread_ids) | set(deleted_thread_ids)))
+        conn.execute("DELETE FROM chat_attachment_tombstones")
+        conn.execute("DELETE FROM chat_threads")
+        _mark_chat_attachment_inventory_clean(conn)
+        if operation_id is not None:
+            conn.execute(
+                """
+                INSERT INTO chat_clear_operations (
+                    id, active_research_run_ids_json, deleted_thread_ids_json, cleared_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    operation_id,
+                    json.dumps(active_research_run_ids),
+                    json.dumps(deleted_thread_ids),
+                    int(datetime.now(timezone.utc).timestamp() * 1000),
+                ),
+            )
+        conn.commit()
+        return active_research_run_ids, deleted_thread_ids
     except Exception:
         conn.rollback()
         raise
@@ -1756,16 +1950,7 @@ def delete_chat_threads(ids: list[str]) -> None:
 
 
 def clear_chat_history() -> None:
-    conn = get_connection()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        _ensure_chat_attachment_inventory_current(conn)
-        conn.execute("DELETE FROM chat_attachment_tombstones")
-        conn.execute("DELETE FROM chat_threads")
-        _mark_chat_attachment_inventory_clean(conn)
-        conn.commit()
-    finally:
-        conn.close()
+    clear_chat_history_with_active_research_runs()
 
 
 def count_chat_threads() -> int:
@@ -1849,6 +2034,13 @@ def ensure_chat_project_workspace(id: str) -> Optional[dict]:
         return None
     root_path = project.get("rootPath") or _default_project_root(project)
     root_path = _ensure_project_workspace(root_path)
+    # a delete running in another threadpool worker can drop the row at any point before the
+    # directory is created, so confirm the project outlived the create rather than trusting a
+    # pre-create snapshot
+    project = get_chat_project(id)
+    if project is None:
+        delete_chat_project_workspace({"id": id, "rootPath": root_path})
+        return None
     if project.get("rootPath") == root_path:
         return project
     conn = get_connection()
@@ -1884,7 +2076,7 @@ def list_chat_projects(include_archived: bool = False) -> list[dict]:
         conn.close()
 
 
-def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
+def delete_chat_project_with_active_research_runs(id: str) -> tuple[Optional[dict], list[str]]:
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -1892,7 +2084,7 @@ def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
         row = conn.execute("SELECT * FROM chat_projects WHERE id = ?", (id,)).fetchone()
         if row is None:
             conn.rollback()
-            return None
+            return None, []
         project = _chat_project_from_row(row)
         thread_ids = {
             thread["id"]
@@ -1901,19 +2093,26 @@ def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
                 (id,),
             )
         }
+        active_research_run_ids = _active_research_run_ids(conn, thread_ids)
         _reparent_surviving_forks(conn, thread_ids)
+        _tombstone_chat_threads(conn, thread_ids)
         conn.execute("DELETE FROM chat_threads WHERE project_id = ?", (id,))
         conn.execute("DELETE FROM chat_projects WHERE id = ?", (id,))
         _mark_chat_attachment_inventory_clean(conn)
         conn.commit()
-        if delete_files:
-            _delete_project_workspace(project)
-        return project
+        return project, active_research_run_ids
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+
+def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
+    project, _ = delete_chat_project_with_active_research_runs(id)
+    if project is not None and delete_files:
+        delete_chat_project_workspace(project)
+    return project
 
 
 class ChatMessageConflictError(RuntimeError):
@@ -2724,6 +2923,7 @@ def fork_chat_thread(
     try:
         conn.execute("BEGIN IMMEDIATE")
         _ensure_chat_attachment_inventory_current(conn)
+        _raise_if_chat_thread_deleted(conn, new_thread_id)
         src = conn.execute(
             "SELECT * FROM chat_threads WHERE id = ?", (source_thread_id,)
         ).fetchone()

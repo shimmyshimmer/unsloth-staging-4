@@ -29,7 +29,7 @@ _EMBED_BATCH = 64  # bounds peak memory
 # Poll with a timeout so the generator wakes periodically to detect a gone
 # client or a terminal job whose worker died without the None sentinel.
 _SSE_POLL_SECONDS = 1.0
-_TERMINAL_JOB_STATUSES = {"completed", "failed"}
+_TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled"}
 
 
 def _sha256_file(path: str) -> str:
@@ -246,6 +246,18 @@ def _run(
                 regions = None
 
         _progress(conn, job_id, "storing", 0.9)
+        # a project delete or a discarded upload can remove the document while this job runs, and
+        # chunks carry no foreign key to it, so writing after one would strand rows under a dead
+        # scope; the writer lock is taken before the check so a delete cannot land between them
+        conn.execute("BEGIN IMMEDIATE")
+        if store.get_document(conn, document_id) is None:
+            conn.rollback()
+            _set_job(conn, job_id, status = "cancelled", stage = "done", progress = 1.0)
+            _emit(
+                job_id,
+                {"type": "error", "stage": "cancelled", "error": "Document was deleted"},
+            )
+            return
         store.add_chunks(conn, scope, document_id, chunks, vectors, regions)
         store.set_document_status(conn, document_id, "completed", num_chunks = len(chunks))
         _replace_old_document(conn, replaces, stored_path)
