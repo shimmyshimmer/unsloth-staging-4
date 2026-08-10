@@ -3,8 +3,12 @@
 
 """
 Chat history API routes backed by studio.db.
+
+Handlers are sync defs so Starlette runs studio.db's blocking sqlite in its threadpool
+instead of on the event loop, where it would stall every other request.
 """
 
+import sqlite3
 from typing import Annotated, Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -17,14 +21,17 @@ from utils.utils import safe_curated_detail, log_and_http_error
 from storage.studio_db import (
     ChatMessageConflictError,
     ChatMessageProtectedError,
+    ChatThreadDeletedError,
     ChatThreadPreconditionFailed,
     CorruptSettingsError,
-    clear_chat_history,
+    build_chat_history_export,
+    clear_chat_history_with_active_research_runs,
     count_chat_threads,
     count_forks_for_message,
     delete_chat_attachment,
-    delete_chat_threads,
-    delete_chat_project,
+    delete_chat_project_workspace,
+    delete_chat_threads_with_active_research_runs,
+    delete_chat_project_with_active_research_runs,
     ensure_chat_project_workspace,
     fork_chat_thread,
     get_chat_attachment,
@@ -135,6 +142,11 @@ class ChatMessageSyncRequest(BaseModel):
 
 class ChatDeleteRequest(BaseModel):
     ids: list[str]
+
+
+class ChatClearRequest(BaseModel):
+    ids: list[str] = Field(default_factory = list, max_length = 10_000)
+    operationId: Optional[str] = Field(default = None, min_length = 1, max_length = 128)
 
 
 class ChatCountResponse(BaseModel):
@@ -254,7 +266,7 @@ class ChatImportLedgerRecordResponse(BaseModel):
 
 
 @router.get("/threads", response_model = ChatThreadListResponse)
-async def list_threads(
+def list_threads(
     model_type: Optional[str] = Query(None),
     pair_id: Optional[str] = Query(None),
     project_id: Optional[str] = Query(None),
@@ -270,18 +282,37 @@ async def list_threads(
     return ChatThreadListResponse(threads = [ChatThread(**t) for t in threads])
 
 
+def _missing_project_error(project_id: Optional[str]) -> HTTPException:
+    """The row references a project that is gone, whether the check or the write noticed it."""
+    return HTTPException(status_code = 404, detail = f"Project {project_id} not found")
+
+
+def _missing_thread_error(thread_id: str) -> HTTPException:
+    return HTTPException(status_code = 404, detail = f"Thread {thread_id} not found")
+
+
+def _deleted_thread_error(thread_id: str) -> HTTPException:
+    return HTTPException(status_code = 410, detail = f"Thread {thread_id} was deleted")
+
+
 @router.post("/threads", response_model = ChatThread)
-async def save_thread(payload: ChatThread, current_subject: str = Depends(get_current_subject)):
+def save_thread(payload: ChatThread, current_subject: str = Depends(get_current_subject)):
     if payload.projectId and get_chat_project(payload.projectId) is None:
-        raise HTTPException(
-            status_code = 404,
-            detail = f"Project {payload.projectId} not found",
-        )
-    return ChatThread(**upsert_chat_thread(payload.model_dump()))
+        raise _missing_project_error(payload.projectId)
+    try:
+        return ChatThread(**upsert_chat_thread(payload.model_dump()))
+    except ChatThreadDeletedError as exc:
+        raise _deleted_thread_error(payload.id) from exc
+    except sqlite3.IntegrityError as exc:
+        # The project can be deleted between the check above and this insert, and the foreign key
+        # then fails. Report the same 404 rather than surfacing a 500.
+        if not payload.projectId:
+            raise
+        raise _missing_project_error(payload.projectId) from exc
 
 
 @router.get("/threads/{thread_id}", response_model = ChatThread)
-async def get_thread(thread_id: str, current_subject: str = Depends(get_current_subject)):
+def get_thread(thread_id: str, current_subject: str = Depends(get_current_subject)):
     thread = get_chat_thread(thread_id)
     if thread is None:
         raise HTTPException(status_code = 404, detail = f"Thread {thread_id} not found")
@@ -289,7 +320,7 @@ async def get_thread(thread_id: str, current_subject: str = Depends(get_current_
 
 
 @router.patch("/threads/{thread_id}", response_model = ChatThread)
-async def patch_thread(
+def patch_thread(
     thread_id: str,
     payload: ChatThreadPatch,
     current_subject: str = Depends(get_current_subject),
@@ -301,10 +332,7 @@ async def patch_thread(
         if field in patch and patch[field] is None:
             raise HTTPException(status_code = 400, detail = f"{field} cannot be null")
     if patch.get("projectId") and get_chat_project(patch["projectId"]) is None:
-        raise HTTPException(
-            status_code = 404,
-            detail = f"Project {patch['projectId']} not found",
-        )
+        raise _missing_project_error(patch["projectId"])
     try:
         thread = update_chat_thread(
             thread_id,
@@ -312,6 +340,11 @@ async def patch_thread(
             expected_title = expected_title,
             expected_opening_message_id = expected_opening_message_id,
         )
+    except sqlite3.IntegrityError as exc:
+        # Same race as save_thread: the project can go away before this write lands.
+        if not patch.get("projectId"):
+            raise
+        raise _missing_project_error(patch["projectId"]) from exc
     except ChatThreadPreconditionFailed:
         raise HTTPException(
             status_code = 409,
@@ -322,46 +355,30 @@ async def patch_thread(
     return ChatThread(**thread)
 
 
-def _cancel_active_research(request: Request, thread_ids: list[str]) -> None:
-    """Signal any active research runs on these threads to stop before their rows are deleted.
-
-    Deleting a thread cascade-deletes its research_runs row, but the worker only notices at its
-    next lease check, so it can keep doing model/web/RAG work (up to a tool timeout) for a run
-    that no longer exists. Best-effort: cancellation bookkeeping must never break the deletion.
-    """
-    if not thread_ids:
-        return
-    try:
-        from storage import research_runs_db
-    except Exception:  # noqa: BLE001 - research storage optional/unavailable
-        return
+def _cancel_deleted_research_runs(request: Request, run_ids: list[str]) -> None:
+    """Signal workers for active runs captured by the deletion transaction."""
     supervisor = getattr(request.app.state, "research_supervisor", None)
-    for thread_id in thread_ids:
+    if supervisor is None:
+        return
+    for run_id in run_ids:
         try:
-            active = research_runs_db.list_active(thread_id)
-        except Exception:  # noqa: BLE001
-            continue
-        for run in active:
-            try:
-                status = research_runs_db.request_cancel(run["id"])
-                if supervisor is not None and status == "cancelling":
-                    supervisor.cancel(run["id"])
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "chat_history.cancel_active_research_failed run_id=%s",
-                    run.get("id"),
-                    exc_info = True,
-                )
+            supervisor.cancel(run_id)
+        except Exception:  # noqa: BLE001 - cancellation is best-effort after commit
+            logger.warning(
+                "chat_history.cancel_deleted_research_failed run_id=%s",
+                run_id,
+                exc_info = True,
+            )
 
 
 @router.delete("/threads")
-async def delete_threads(
+def delete_threads(
     payload: ChatDeleteRequest,
     request: Request,
     current_subject: str = Depends(get_current_subject),
 ):
-    _cancel_active_research(request, payload.ids)
-    delete_chat_threads(payload.ids)
+    deleted_research_run_ids = delete_chat_threads_with_active_research_runs(payload.ids)
+    _cancel_deleted_research_runs(request, deleted_research_run_ids)
     return {"status": "deleted"}
 
 
@@ -501,7 +518,7 @@ def delete_attachment(
 
 
 @router.get("/projects", response_model = ChatProjectListResponse)
-async def list_projects(
+def list_projects(
     include_archived: bool = Query(False), current_subject: str = Depends(get_current_subject)
 ):
     return ChatProjectListResponse(
@@ -513,12 +530,12 @@ async def list_projects(
 
 
 @router.post("/projects", response_model = ChatProject)
-async def save_project(payload: ChatProject, current_subject: str = Depends(get_current_subject)):
+def save_project(payload: ChatProject, current_subject: str = Depends(get_current_subject)):
     return ChatProject(**upsert_chat_project(payload.model_dump()))
 
 
 @router.get("/projects/{project_id}", response_model = ChatProject)
-async def get_project(project_id: str, current_subject: str = Depends(get_current_subject)):
+def get_project(project_id: str, current_subject: str = Depends(get_current_subject)):
     project = ensure_chat_project_workspace(project_id)
     if project is None:
         raise HTTPException(
@@ -529,7 +546,7 @@ async def get_project(project_id: str, current_subject: str = Depends(get_curren
 
 
 @router.patch("/projects/{project_id}", response_model = ChatProject)
-async def patch_project(
+def patch_project(
     project_id: str,
     payload: ChatProjectPatch,
     current_subject: str = Depends(get_current_subject),
@@ -550,21 +567,23 @@ async def patch_project(
 
 
 @router.delete("/projects/{project_id}", response_model = ChatProject)
-async def delete_project(
+def delete_project(
     project_id: str,
     request: Request,
     delete_files: bool = Query(False),
     current_subject: str = Depends(get_current_subject),
 ):
-    _cancel_active_research(
-        request, [thread["id"] for thread in list_chat_threads(project_id = project_id)]
-    )
-    project = delete_chat_project(project_id, delete_files = delete_files)
+    project, deleted_research_run_ids = delete_chat_project_with_active_research_runs(project_id)
     if project is None:
         raise HTTPException(
             status_code = 404,
             detail = f"Project {project_id} not found",
         )
+    _cancel_deleted_research_runs(request, deleted_research_run_ids)
+    # Cancellation must happen before fallible workspace cleanup. The database transaction has
+    # already removed these runs, so a cleanup error cannot be allowed to strand their workers.
+    if delete_files:
+        delete_chat_project_workspace(project)
     # Best-effort: drop the project's RAG sources (lazy import keeps RAG optional).
     try:
         import os
@@ -598,7 +617,7 @@ async def delete_project(
 
 
 @router.get("/threads/{thread_id}/messages", response_model = ChatMessageListResponse)
-async def get_thread_messages(thread_id: str, current_subject: str = Depends(get_current_subject)):
+def get_thread_messages(thread_id: str, current_subject: str = Depends(get_current_subject)):
     if get_chat_thread(thread_id) is None:
         raise HTTPException(status_code = 404, detail = f"Thread {thread_id} not found")
     return ChatMessageListResponse(
@@ -607,7 +626,7 @@ async def get_thread_messages(thread_id: str, current_subject: str = Depends(get
 
 
 @router.post("/messages:batch", response_model = ChatMessagesBatchResponse)
-async def batch_thread_messages(
+def batch_thread_messages(
     payload: ChatMessagesBatchRequest, current_subject: str = Depends(get_current_subject)
 ):
     """One round-trip per sidebar/search rebuild instead of N. Unknown thread ids return empty lists."""
@@ -620,7 +639,7 @@ async def batch_thread_messages(
 
 
 @router.get("/threads/{thread_id}/messages/{message_id}", response_model = ChatMessage)
-async def get_thread_message(
+def get_thread_message(
     thread_id: str,
     message_id: str,
     current_subject: str = Depends(get_current_subject),
@@ -646,6 +665,10 @@ def save_thread_message(
         raise HTTPException(status_code = 404, detail = f"Thread {thread_id} not found")
     try:
         return ChatMessage(**upsert_chat_message(payload.model_dump()))
+    except sqlite3.IntegrityError as exc:
+        if get_chat_thread(thread_id) is None:
+            raise _missing_thread_error(thread_id) from exc
+        raise
     except (ChatMessageConflictError, ChatMessageProtectedError) as exc:
         raise log_and_http_error(
             exc,
@@ -684,6 +707,10 @@ def replace_thread_messages(
                 )
             ]
         )
+    except sqlite3.IntegrityError as exc:
+        if get_chat_thread(thread_id) is None:
+            raise _missing_thread_error(thread_id) from exc
+        raise
     except (ChatMessageConflictError, ChatMessageProtectedError) as exc:
         raise log_and_http_error(
             exc,
@@ -695,12 +722,12 @@ def replace_thread_messages(
 
 
 @router.get("/count", response_model = ChatCountResponse)
-async def count_threads(current_subject: str = Depends(get_current_subject)):
+def count_threads(current_subject: str = Depends(get_current_subject)):
     return ChatCountResponse(count = count_chat_threads())
 
 
 @router.get("/import-ledger", response_model = ChatImportLedgerResponse)
-async def get_import_ledger(current_subject: str = Depends(get_current_subject)):
+def get_import_ledger(current_subject: str = Depends(get_current_subject)):
     """Legacy-Dexie import ledger: legacy thread ids already copied into chat tables.
 
     The frontend checks this on tab open to decide whether to re-run the Dexie -> studio.db import.
@@ -709,7 +736,7 @@ async def get_import_ledger(current_subject: str = Depends(get_current_subject))
 
 
 @router.post("/import-ledger", response_model = ChatImportLedgerRecordResponse)
-async def record_import_ledger(
+def record_import_ledger(
     payload: ChatImportLedgerRecordRequest, current_subject: str = Depends(get_current_subject)
 ):
     """Mark each legacy thread id as imported. Idempotent."""
@@ -718,21 +745,28 @@ async def record_import_ledger(
 
 
 @router.delete("")
-async def clear_history(request: Request, current_subject: str = Depends(get_current_subject)):
-    _cancel_active_research(request, [thread["id"] for thread in list_chat_threads()])
-    clear_chat_history()
-    return {"status": "deleted"}
+def clear_history(
+    request: Request,
+    payload: Optional[ChatClearRequest] = None,
+    current_subject: str = Depends(get_current_subject),
+):
+    # Pending frontend creators may not have rows yet. Tombstone their known ids in the same
+    # transaction so a successful clear also fences any POST that commits afterward.
+    deleted_research_run_ids, deleted_thread_ids = clear_chat_history_with_active_research_runs(
+        payload.ids if payload else (),
+        operation_id = payload.operationId if payload else None,
+    )
+    _cancel_deleted_research_runs(request, deleted_research_run_ids)
+    return {"status": "deleted", "deletedThreadIds": deleted_thread_ids}
 
 
 @router.get("/settings", response_model = ChatSettingsResponse)
-async def get_settings(current_subject: str = Depends(get_current_subject)):
+def get_settings(current_subject: str = Depends(get_current_subject)):
     return ChatSettingsResponse(settings = list_chat_settings())
 
 
 @router.put("/settings", response_model = ChatSettingsResponse)
-async def put_settings(
-    payload: dict[str, Any], current_subject: str = Depends(get_current_subject)
-):
+def put_settings(payload: dict[str, Any], current_subject: str = Depends(get_current_subject)):
     try:
         parsed = ChatSettingsPayload.model_validate(payload)
     except ValidationError as exc:
@@ -769,7 +803,7 @@ class ChatForkCountResponse(BaseModel):
 
 
 @router.post("/threads/{thread_id}/fork", response_model = ChatForkResponse)
-async def fork_thread(
+def fork_thread(
     thread_id: str,
     payload: ChatForkRequest,
     current_subject: str = Depends(get_current_subject),
@@ -793,16 +827,21 @@ async def fork_thread(
         )
     base_title = source.get("title") or "New Chat"
     new_title = f"fork · {base_title}"
-    forked = fork_chat_thread(
-        source_thread_id = thread_id,
-        branch_message_id = payload.messageId,
-        new_thread_id = payload.newThreadId,
-        new_title = new_title,
-        created_at = payload.createdAt,
-        id_factory = lambda: str(uuid.uuid4()),
-    )
+    try:
+        forked = fork_chat_thread(
+            source_thread_id = thread_id,
+            branch_message_id = payload.messageId,
+            new_thread_id = payload.newThreadId,
+            new_title = new_title,
+            created_at = payload.createdAt,
+            id_factory = lambda: str(uuid.uuid4()),
+        )
+    except ChatThreadDeletedError as exc:
+        raise _deleted_thread_error(payload.newThreadId) from exc
     if forked is None:
-        raise HTTPException(status_code = 500, detail = "Fork failed")
+        # The source can be deleted between the reads above and the fork transaction, which the
+        # threadpool lets run concurrently. Report it gone rather than as a server fault.
+        raise HTTPException(status_code = 404, detail = f"Thread {thread_id} not found")
     messages = list_chat_messages(payload.newThreadId)
     # Best-effort OpenAI container snapshot. Stub: a follow-up patch can
     # call /v1/containers list+download / create+upload here and patch
@@ -823,7 +862,7 @@ async def fork_thread(
     "/threads/{thread_id}/messages/{message_id}/forks",
     response_model = ChatForkCountResponse,
 )
-async def get_fork_count(
+def get_fork_count(
     thread_id: str,
     message_id: str,
     current_subject: str = Depends(get_current_subject),
@@ -832,12 +871,9 @@ async def get_fork_count(
 
 
 @router.get("/export", response_model = ChatExportResponse)
-async def export_history(current_subject: str = Depends(get_current_subject)):
+def export_history(current_subject: str = Depends(get_current_subject)):
     from datetime import datetime, timezone
-
-    threads = list_chat_threads(include_archived = True)
-    projects = list_chat_projects(include_archived = True)
-    messages = list_chat_messages_for_threads([thread["id"] for thread in threads])
+    projects, threads, messages = build_chat_history_export()
     return ChatExportResponse(
         exportedAt = datetime.now(timezone.utc).isoformat(),
         version = 1,

@@ -6,6 +6,8 @@ import { authFetch } from "@/features/auth";
 import { prepareHfTokenForUse } from "@/features/hf-auth";
 // These helpers are deliberately API-layer-only, not part of their features' public barrels.
 // eslint-disable-next-line no-restricted-imports
+import { disposableTimeoutSignal } from "@/features/hub/lib/abort-signals";
+// eslint-disable-next-line no-restricted-imports
 import { hubTokenHeader } from "@/features/hub/lib/hub-token-header";
 // eslint-disable-next-line no-restricted-imports
 import { isHuggingFaceOffline } from "@/features/hub/lib/network";
@@ -42,6 +44,22 @@ import { assertCompletedPaddedBody } from "./padded-response";
 
 export const CHAT_HISTORY_UPDATED_EVENT = "unsloth-chat-history-updated";
 export const CHAT_PROJECTS_UPDATED_EVENT = "unsloth-chat-projects-updated";
+
+// bounds the request itself so a wedged socket cannot stall every reader waiting on the write
+const THREAD_WRITE_TIMEOUT_MS = 30_000;
+
+/** authFetch under a disposed timeout, so the ponyfill path leaves no timer behind. */
+async function threadWriteFetch(
+  input: string,
+  init: RequestInit,
+): Promise<Response> {
+  const timeout = disposableTimeoutSignal(THREAD_WRITE_TIMEOUT_MS);
+  try {
+    return await authFetch(input, { ...init, signal: timeout.signal });
+  } finally {
+    timeout.dispose();
+  }
+}
 
 /**
 * Thrown when the chat SSE stream ends without a terminal signal (`[DONE]` or a finish_reason
@@ -711,22 +729,44 @@ export async function deleteChatAttachment(
 
 export async function getChatThread(
   threadId: string,
+  options: { bounded?: boolean } = {},
 ): Promise<ThreadRecord | null> {
-  const response = await authFetch(
-    `/api/chat/threads/${encodeURIComponent(threadId)}`,
-  );
-  if (response.status === 404) return null;
-  return parseJsonOrThrow<ThreadRecord>(response);
+  // Bounded for the delete reconciliation: an unbounded read there would hang the delete that
+  // the write timeout exists to keep moving. Callers on a render path stay unbounded.
+  const timeout = options.bounded
+    ? disposableTimeoutSignal(THREAD_WRITE_TIMEOUT_MS)
+    : null;
+  try {
+    const response = await authFetch(
+      `/api/chat/threads/${encodeURIComponent(threadId)}`,
+      timeout ? { signal: timeout.signal } : undefined,
+    );
+    if (response.status === 404) return null;
+    return parseJsonOrThrow<ThreadRecord>(response);
+  } finally {
+    timeout?.dispose();
+  }
+}
+
+export class ChatThreadDeletedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChatThreadDeletedError";
+  }
 }
 
 export async function saveChatThread(
   thread: ThreadRecord,
 ): Promise<ThreadRecord> {
-  const response = await authFetch("/api/chat/threads", {
+  const response = await threadWriteFetch("/api/chat/threads", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(thread),
   });
+  if (response.status === 410) {
+    const body = await response.json().catch(() => null);
+    throw new ChatThreadDeletedError(parseErrorText(response.status, body));
+  }
   const savedThread = await parseJsonOrThrow<ThreadRecord>(response);
   notifyChatHistoryUpdated();
   return savedThread;
@@ -751,7 +791,7 @@ export async function updateChatThread(
   if (options.expectedOpeningMessageId !== undefined) {
     body.expectedOpeningMessageId = options.expectedOpeningMessageId;
   }
-  const response = await authFetch(
+  const response = await threadWriteFetch(
     `/api/chat/threads/${encodeURIComponent(threadId)}`,
     {
       method: "PATCH",
@@ -805,7 +845,7 @@ export async function getForkCount(
 
 export async function deleteChatThreads(threadIds: string[]): Promise<void> {
   if (threadIds.length === 0) return;
-  const response = await authFetch("/api/chat/threads", {
+  const response = await threadWriteFetch("/api/chat/threads", {
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ids: threadIds }),
@@ -956,7 +996,7 @@ export async function syncChatMessages(
   messages: MessageRecord[],
   options: { pruneMissing?: boolean } = {},
 ): Promise<MessageRecord[]> {
-  const response = await authFetch(
+  const response = await threadWriteFetch(
     `/api/chat/threads/${encodeURIComponent(threadId)}/messages`,
     {
       method: "PUT",
@@ -979,13 +1019,25 @@ export async function countBackendChats(): Promise<number> {
 }
 
 export async function clearBackendChats(
-  options: { notify?: boolean } = {},
-): Promise<void> {
-  const response = await authFetch("/api/chat", { method: "DELETE" });
-  await parseJsonOrThrow<unknown>(response);
+  options: {
+    notify?: boolean;
+    operationId?: string;
+    tombstoneThreadIds?: string[];
+  } = {},
+): Promise<string[]> {
+  const response = await threadWriteFetch("/api/chat", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ids: options.tombstoneThreadIds ?? [],
+      operationId: options.operationId,
+    }),
+  });
+  const data = await parseJsonOrThrow<{ deletedThreadIds: string[] }>(response);
   if (options.notify !== false) {
     notifyChatHistoryUpdated();
   }
+  return data.deletedThreadIds;
 }
 
 export async function buildBackendChatExport(): Promise<{
