@@ -1678,6 +1678,39 @@ def test_high_risk_dispatcher_non_terminal():
         ("from builtins import open as w\nw('x', 'w')", True),
         ("globals()['open']('x', 'w')", True),  # dynamic open lookup
         ("import pickle\npickle.loads(b'')", True),  # code exec on load
+        # PyYAML's non-safe loaders build arbitrary Python objects from tags
+        # (!!python/object/apply:os.system), so the command runs from the data.
+        ("import yaml\nyaml.load(s, Loader=yaml.Loader)", True),
+        ("import yaml as y\ny.unsafe_load(s)", True),  # via module alias
+        ("from yaml import unsafe_load\nunsafe_load(s)", True),  # bare name
+        ("import yaml\nld = yaml.load\nld(s, Loader=yaml.Loader)", True),  # alias
+        ("import yaml\nc = yaml\nc.load(s, Loader=yaml.Loader)", True),  # module rebound
+        ("import yaml\nprint(yaml.Loader(s).get_data())", True),  # loader class directly
+        ("from yaml import Loader\nprint(Loader(s).get_data())", True),
+        ("import yaml\ndef g(fn): fn(s, Loader=yaml.Loader)\ng(yaml.load)", True),  # via helper
+        ("import json\ndef g(fn): return fn(open('a.json'))\nprint(g(json.load))", False),
+        ("import yaml\ndef run(l=yaml.unsafe_load): l(s)\nrun()", True),  # parameter default
+        ("import yaml\nld, _ = (yaml.unsafe_load, None)\nld(s)", True),  # destructured
+        ("import yaml.loader as yl\nyl.Loader(s).get_data()", True),  # submodule import
+        ("import yaml\nclass L(yaml.Loader): pass\nL(s).get_data()", True),  # loader subclass
+        ("import yaml\ndef run(fn, s): fn(s)\nrun(*(yaml.unsafe_load, s))", True),  # star args
+        ("def run(fn, p, m): fn(p, m)\nrun(*(open, 'o', 'w'))", True),  # star args, writer
+        # Loader= is the documented safe spelling, so it stays auto-approved, but
+        # only when the loader is statically one of the safe classes.
+        ("import yaml\nprint(yaml.load(open('c.yml'), Loader=yaml.SafeLoader))", False),
+        (
+            "from yaml.loader import SafeLoader\nimport yaml\nyaml.load(f, Loader=SafeLoader)",
+            False,
+        ),
+        ("import yaml\nyaml.SafeLoader = yaml.Loader\nyaml.load(s, Loader=yaml.SafeLoader)", True),
+        ("import yaml\nyaml.load(s, Loader=pick())", True),  # dynamic loader
+        ("import yaml\nyaml.load(s, **kw)", True),  # loader hidden in a splat
+        ("import yaml\nyaml.load(s, Loader=yaml.FullLoader)", True),  # RCE before PyYAML 5.4
+        ("import yaml\nfor d in yaml.load_all(s, Loader=yaml.Loader): print(d)", True),
+        ("import yaml\nprint(yaml.safe_load(open('c.yml')))", False),  # safe loader
+        ("from yaml import safe_load\nprint(safe_load(open('c.yml')))", False),
+        ("import json\nprint(json.load(open('a.json')))", False),  # json.load is data
+        ("from torch import load\nload('m.pt')", True),  # bare pickle-backed load
         ("import io\nio.FileIO('out', 'w')", True),  # raw write handle
         (
             "import zipfile\nprint(zipfile.ZipFile('a').open('n.txt', 'r'))",
