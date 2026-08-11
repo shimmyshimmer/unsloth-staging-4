@@ -271,7 +271,8 @@ _TC_FUNC_START_RE = re.compile(r'<function(?:=([\w\.\-]+)|\s+name="([\w\.\-]+)")
 # Body ends at ``</tool_call>`` (Hermes) or ``</function>`` (Qwen3.5 / MiniCPM-5)
 # so it stops at the close even when prose follows (else prose leaked into args).
 _TC_END_TAG_RE = re.compile(r"</(?:tool_call|function)>")
-_TC_FUNC_CLOSE_RE = re.compile(r"\s*</function>\s*$")
+# Byte-identical to the healer's; shared so the pair cannot drift.
+_TC_FUNC_CLOSE_RE = _tool_healing._TC_FUNC_CLOSE_RE
 # Horizontal whitespace only (``[^\S\n]*``, not ``\s*``) so the wrapping newline +
 # first-line indentation survive; ``_trim_param_value`` trims one newline, preserving
 # code indentation (SGLang qwen3_coder).
@@ -361,34 +362,9 @@ _GEMMA_BARE_TC_PREFIX_RE = re.compile(r"(?<!\w)call\s*(?::\s*[\w\.\-]*)?$")
 _GEMMA_KEY_RE = re.compile(r"\s*([A-Za-z_][\w.\-]*)\s*:")
 
 
-def _balanced_bracket_end(text: str, start: int) -> int | None:
-    """Index of the ``]`` matching ``[`` at ``text[start]`` (ignores brackets in JSON strings)."""
-    if start >= len(text) or text[start] != "[":
-        return None
-    depth = 0
-    in_string = False
-    esc = False
-    i = start
-    while i < len(text):
-        ch = text[i]
-        if in_string:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_string = False
-        else:
-            if ch == '"':
-                in_string = True
-            elif ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    return i
-        i += 1
-    return None
+# Shared with the healer rather than copied. The healer's version also counts ``{``/``}``
+# toward the depth, so a truncated object inside an array cannot close the array early.
+_balanced_bracket_end = _tool_healing._balanced_bracket_end
 
 
 def _skip_mistral_call_id(text: str, pos: int) -> int:
@@ -668,6 +644,48 @@ def _strip_glm_calls(text: str, *, final: bool) -> str:
     return "".join(out)
 
 
+def strip_segment(
+    segment: str,
+    *,
+    seg_final: bool,
+    enabled_tool_names: Optional[set] = None,
+) -> str:
+    """Strip tool-call markup from one non-``<think>`` segment.
+
+    The single definition of the scan order. It used to be copy-pasted into
+    ``llama_cpp.py``, ``safetensors_agentic.py`` and ``routes/inference.py``; those call
+    here now, so the order cannot drift between the GGUF, safetensors and passthrough
+    paths. ``seg_final`` enables the end-of-turn arms (markerless Gemma, open tails,
+    trailing partial rehearsal) that must not run mid-segment.
+    """
+    seg = _strip_mistral_closed_calls(segment)
+    # Bare reasoning-rehearsal ``name[ARGS]{json}`` and the Mistral name form promote through
+    # the shared balanced scan, so strip them the same way (any nesting depth removed whole).
+    # The rehearsal arm is name-gated: an inactive ``foo[ARGS]{..}`` is prose and is kept.
+    seg = _tool_healing._strip_bracket_tag_calls(seg, enabled_tool_names = enabled_tool_names)
+    if seg_final:
+        # Markerless Gemma ``call:NAME{...}`` (name-gated, mirrors the parse gate); end-of-turn only.
+        seg = _strip_gemma_wrapperless_calls(seg, enabled_tool_names)
+    # Scan-strip the function-XML form (parser-accurate: a literal ``<function=...>`` in a
+    # value is data, not a call); the regex arms below cover the other formats.
+    seg = _strip_function_xml_calls(seg, final = seg_final)
+    # GLM 4.x: scan to the call's real </tool_call> so a literal one inside a value is data,
+    # not a leak. Qwen <tool_call>{json} is left to the regex arms.
+    seg = _strip_glm_calls(seg, final = seg_final)
+    pats = _TOOL_ALL_PATS if seg_final else _TOOL_CLOSED_PATS
+    for pat in pats:
+        seg = pat.sub("", seg)
+    if seg_final:
+        # Drop a trailing partial bare rehearsal (``name[ARGS]`` with a truncated or absent
+        # body) the balanced scan cannot close; gated so prose ``foo[ARGS] ...`` survives.
+        seg = _tool_healing.apply_tool_strip_patterns(
+            seg,
+            [_tool_healing._REHEARSAL_TAIL_STRIP_RE],
+            enabled_tool_names = enabled_tool_names,
+        )
+    return seg
+
+
 def strip_tool_markup(
     text: str,
     *,
@@ -687,39 +705,268 @@ def strip_tool_markup(
         text = _strip_mistral_reasoning(text)
 
     def _strip_segment(segment: str, is_last: bool) -> str:
-        seg_final = final and is_last
-        seg = _strip_mistral_closed_calls(segment)
-        # Bare reasoning-rehearsal ``name[ARGS]{json}`` and the Mistral name form promote through
-        # the shared balanced scan, so strip them the same way (any nesting depth removed whole).
-        # The rehearsal arm is name-gated: an inactive ``foo[ARGS]{..}`` is prose and is kept.
-        seg = _tool_healing._strip_bracket_tag_calls(seg, enabled_tool_names = enabled_tool_names)
-        if seg_final:
-            # Markerless Gemma ``call:NAME{...}`` (name-gated, mirrors the parse gate); end-of-turn only.
-            seg = _strip_gemma_wrapperless_calls(seg, enabled_tool_names)
-        # Scan-strip the function-XML form (parser-accurate: a literal ``<function=...>`` in a
-        # value is data, not a call); the regex arms below cover the other formats.
-        seg = _strip_function_xml_calls(seg, final = seg_final)
-        # GLM 4.x: scan to the call's real </tool_call> so a literal one inside a value is data,
-        # not a leak. Qwen <tool_call>{json} is left to the regex arms.
-        seg = _strip_glm_calls(seg, final = seg_final)
-        pats = _TOOL_ALL_PATS if seg_final else _TOOL_CLOSED_PATS
-        for pat in pats:
-            seg = pat.sub("", seg)
-        if seg_final:
-            # Drop a trailing partial bare rehearsal (``name[ARGS]`` with a truncated or absent
-            # body) the balanced scan cannot close; gated so prose ``foo[ARGS] ...`` survives.
-            seg = _tool_healing.apply_tool_strip_patterns(
-                seg,
-                [_tool_healing._REHEARSAL_TAIL_STRIP_RE],
-                enabled_tool_names = enabled_tool_names,
-            )
-        return seg
+        return strip_segment(
+            segment,
+            seg_final = final and is_last,
+            enabled_tool_names = enabled_tool_names,
+        )
 
     # ``<think>`` / ``[THINK]`` reasoning is preserved verbatim (a rehearsed call inside it is
     # not executed, so it must not be stripped from display either); a literal think marker
     # inside a real call's arguments is that call's data and is stripped with the call.
     result = _tool_healing.strip_outside_think(text, _strip_segment)
     return result.strip() if final else result
+
+
+# Every strip arm above is anchored on one of these literals, so text containing none of
+# them is returned unchanged. ``StreamingMarkupStripper`` uses that to skip the whole scan,
+# and ``test_refactor_guard.py`` proves the claim by asserting the identity over a fuzz
+# corpus and by checking the prefix-split property. An arm added without its literal here
+# would break that test, not production.
+_STRIP_SENTINELS = (
+    "<tool_call",  # Qwen/Hermes open + GLM, and the <tool_call|> Gemma closer
+    "<|tool_call",  # Gemma open, Kimi <|tool_call_begin|> / <|tool_calls_section_begin|>
+    "<function",  # Qwen3.5 <function=name> and <function name="...">
+    "[TOOL_CALLS]",  # Mistral array + name forms
+    "[ARGS]",  # reasoning-model rehearsal
+    "<|python_tag|>",  # Llama-3 built-in tools
+    "<|content_invoke_tool_json|>",  # TML Inkling
+    "<｜",  # DeepSeek's full-width pipe opens every one of its markers
+    "<think",  # reasoning segmentation
+    "</think",
+    "[THINK",
+    "[/THINK",
+    "call:",  # markerless Gemma
+)
+_SENTINEL_MAX_LEN = max(len(sentinel) for sentinel in _STRIP_SENTINELS)
+# Bytes sampled from each end when checking that a buffer continues the previous one.
+_EXTENSION_SAMPLE = 64
+
+
+def _first_sentinel(text: str, start: int) -> int:
+    """Lowest index >= ``start`` at which any strip sentinel occurs, or -1."""
+    best = -1
+    for sentinel in _STRIP_SENTINELS:
+        found = text.find(sentinel, start)
+        if found >= 0 and (best < 0 or found < best):
+            best = found
+    return best
+
+
+def _safe_cut(text: str, first: int) -> int:
+    """Largest index <= ``first`` that no strip decision can depend on text before.
+
+    Every arm anchors on a sentinel, so a match cannot begin before the first sentinel --
+    with two exceptions, both of which reach backwards:
+
+    * the rehearsal form is ``NAME[ARGS]{...}``, whose match starts at the name, before
+      its ``[ARGS]`` sentinel. A name contains no whitespace, so backing up to the start
+      of the preceding run covers it. (``[TOOL_CALLS] NAME[ARGS]`` needs no wider window:
+      ``[TOOL_CALLS]`` is itself a sentinel, so it would be the first one found.)
+    * the ``[TOOL_CALLS]`` and ``[ARGS]`` arms are gated on markdown code spans, and an
+      opening fence can sit arbitrarily far back. If any backtick or tilde precedes the
+      cut, no cut is safe.
+
+    The result is then snapped back to a line start. The code-fence pattern is anchored
+    with ``^``, so cutting mid-line can turn a fence that was mid-line into one that opens
+    a block -- which flips the in-code gate and changes the output. Snapping to a newline
+    keeps ``^`` meaning the same thing on the slice as on the whole buffer.
+    """
+    if first <= 0:
+        return 0
+    cut = first
+    if text.startswith("[ARGS]", first):
+        while cut > 0 and not text[cut - 1].isspace():
+            cut -= 1
+    cut = text.rfind("\n", 0, cut) + 1
+    if "`" in text[:cut] or "~" in text[:cut]:
+        return 0
+    return cut
+
+
+class StreamingMarkupStripper:
+    """Strip tool markup from an append-only buffer without rescanning it every token.
+
+    The streaming display path used to call the full strip on the entire accumulated
+    response once per content token, which is a linear scan with ~10 regex passes per
+    token and therefore quadratic in the response length. Two properties make that
+    avoidable, both asserted by ``test_refactor_guard.py``:
+
+    * text containing no sentinel from ``_STRIP_SENTINELS`` is returned unchanged, so a
+      prose-only response does no regex work at all; and
+    * no arm can match before the first sentinel, so
+      ``strip(text) == text[:first] + strip(text[first:])``.
+
+    The scan for that first sentinel resumes where the previous call stopped (overlapping
+    by ``_SENTINEL_MAX_LEN - 1`` so a sentinel split across two appends is still seen),
+    which makes the pre-markup phase amortized constant per token rather than linear.
+
+    The instance assumes append-only growth and re-derives its state if the caller ever
+    passes text that is not an extension of the previous call, so a rewind is safe.
+    """
+
+    __slots__ = (
+        "_enabled_tool_names",
+        "_scanned_upto",
+        "_first",
+        "_floor",
+        "_floor_out",
+        "_floor_identity",
+        "_degenerate",
+        "_last_in",
+        "_last_out",
+    )
+
+    def __init__(self, enabled_tool_names: Optional[set] = None):
+        self._enabled_tool_names = enabled_tool_names
+        self._reset()
+
+    def _reset(self):
+        self._scanned_upto = 0
+        self._first = -1
+        # Settled prefix: text below ``_floor`` is final, and ``_floor_out`` is its output.
+        self._floor = 0
+        self._floor_out = ""
+        # True while nothing has actually been removed yet, which lets the sentinel-free
+        # path hand back the caller's own string instead of rebuilding it every token.
+        self._floor_identity = True
+        # Set when markup sits at the very start of the unsettled text and is not a
+        # reasoning block. Nothing can then ever be settled or sliced off, so the
+        # bookkeeping is pure overhead on top of a strip that has to run in full anyway;
+        # this flag skips straight to it, keeping the worst case no slower than before.
+        self._degenerate = False
+        self._last_in = None
+        self._last_out = None
+
+    def _think_block(self, text: str, first: int) -> str:
+        """Classify the reasoning block opening at absolute offset ``first``.
+
+        Returns ``"settled"`` when a complete, unambiguous block was folded into the
+        settled prefix, ``"open"`` when a clean block is still streaming (its content is
+        preserved verbatim, so the whole buffer is currently unchanged), or ``""`` when
+        the shape is anything else and the full strip has to run.
+
+        ``strip_outside_think`` already processes each segment in isolation, so a segment
+        boundary is a point nothing downstream can reach back across -- unlike a cut inside
+        a segment, which is why this needs neither the line-start snap nor the backtick
+        check that ``_safe_cut`` does.
+
+        Deliberately conservative: it only fires on a block whose opener is the first
+        sentinel in the remaining text and whose body carries no other markup. A
+        ``</think>`` sitting inside a call's arguments is that call's data, not a closer,
+        and this refuses to guess about it.
+        """
+        for opener, closer in (("<think>", "</think>"), ("[THINK]", "[/THINK]")):
+            if text.startswith(opener, first):
+                break
+        else:
+            return ""
+        end = text.find(closer, first + len(opener))
+        if end < 0:
+            # Still streaming. An unclosed block runs to EOF and is preserved verbatim, and
+            # the text before it is markup-free by construction, so the buffer is untouched
+            # -- as long as nothing else in it needs stripping.
+            body_start = first + len(opener)
+            return "open" if _first_sentinel(text, body_start) < 0 else ""
+        end += len(closer)
+        body = text[self._floor : end]
+        if _first_sentinel(body.replace(opener, "").replace(closer, ""), 0) >= 0:
+            return ""
+        settled = self._full_strip(body)
+        self._floor_out += settled
+        self._floor_identity = self._floor_identity and settled == body
+        self._floor = end
+        self._first = -1
+        self._scanned_upto = end
+        return "settled"
+
+    def _full_strip(self, text: str) -> str:
+        def _seg(segment: str, is_last: bool) -> str:
+            # Streaming has no separate ``final`` pass: the last segment always gets the
+            # end-of-turn arms so partial markup never renders. This mirrors the closure
+            # llama_cpp.py used to carry.
+            return strip_segment(
+                segment,
+                seg_final = is_last,
+                enabled_tool_names = self._enabled_tool_names,
+            )
+
+        return _tool_healing.strip_outside_think(text, _seg)
+
+    def _is_extension(self, text: str) -> bool:
+        """Cheap check that ``text`` continues the previous call's buffer.
+
+        A full ``startswith`` would be linear in the buffer and so reintroduce the
+        quadratic cost this class exists to remove. Callers stream append-only, so this
+        only has to catch a caller that clearly is not: a shorter buffer, or one whose
+        head or previous tail no longer matches. Sampling both ends is O(1).
+        """
+        previous = self._last_in
+        if previous is None:
+            return True
+        end = len(previous)
+        if len(text) < end:
+            return False
+        sample = _EXTENSION_SAMPLE
+        return text[:sample] == previous[:sample] and text[end - sample : end] == previous[-sample:]
+
+    def strip(self, text: str) -> str:
+        previous = self._last_in
+        if text is previous or (
+            previous is not None and len(text) == len(previous) and text == previous
+        ):
+            return self._last_out
+        if not self._is_extension(text):
+            # Not an extension of what we saw: the cached prefix no longer applies.
+            self._reset()
+
+        if self._degenerate:
+            out = self._floor_out + self._full_strip(text[self._floor :])
+            self._last_in = text
+            self._last_out = out
+            return out
+
+        # Offsets stay absolute through the scan so the buffer is never sliced just to
+        # look for a sentinel; a slice would be linear per token and put back the cost
+        # this class removes. Loop so several reasoning blocks settle in one call.
+        while True:
+            if self._first < 0:
+                # Resume where the last scan stopped, overlapping just enough that a
+                # sentinel straddling two appends is still found. This is what keeps the
+                # pre-markup phase from rescanning the whole buffer per token.
+                resume = self._scanned_upto - _SENTINEL_MAX_LEN + 1
+                found = _first_sentinel(text, resume if resume > self._floor else self._floor)
+                if found < 0:
+                    self._scanned_upto = len(text)
+                    return self._unchanged(text)
+                self._first = found - self._floor
+            state = self._think_block(text, self._floor + self._first)
+            if state == "open":
+                return self._unchanged(text)
+            if state != "settled":
+                break
+
+        tail = text[self._floor :]
+        # Markup at offset 0 of the unsettled text: the cut is 0 now and stays 0 as the
+        # buffer grows, and no reasoning block can settle, so skip the bookkeeping from
+        # here on.
+        self._degenerate = self._first == 0
+        # Recomputed per call rather than cached: the sentinel may have been found before
+        # the run preceding it finished streaming, so re-deriving keeps the cut exact.
+        cut = _safe_cut(tail, self._first)
+        stripped = tail[:cut] + self._full_strip(tail[cut:]) if cut else self._full_strip(tail)
+        out = self._floor_out + stripped if self._floor else stripped
+        self._last_in = text
+        self._last_out = out
+        return out
+
+    def _unchanged(self, text: str) -> str:
+        """Result when nothing after the settled prefix needs stripping."""
+        self._last_in = text
+        # With nothing removed so far the answer is the caller's own string, so hand it
+        # straight back rather than rebuilding it a token at a time.
+        self._last_out = text if self._floor_identity else self._floor_out + text[self._floor :]
+        return self._last_out
 
 
 def has_tool_signal(text: str) -> bool:
@@ -1256,51 +1503,26 @@ def _parse_tool_call_json(
     return out
 
 
-def _trim_param_value(val: str) -> str:
-    """Trim one wrapping newline the template adds around an XML parameter value
-    (``<parameter=k>\nVALUE\n</parameter>``), preserving inner indentation.
-    ``str.strip()`` destroyed code/diff indentation; SGLang's qwen3_coder trims only
-    the wrapping newline."""
-    if val.startswith("\n"):
-        val = val[1:]
-    if val.endswith("\n"):
-        val = val[:-1]
-    return val
+# Identical to the healer's copy; imported so the two cannot drift.
+_trim_param_value = _tool_healing._trim_param_value
 
 
 def _inside_open_parameter(text: str, pos: int) -> bool:
     """True if ``pos`` sits inside an unclosed ``<parameter>``/``<param>`` block --
     i.e. a ``<function>`` / ``<parameter>`` opener at ``pos`` is a literal inside an
     argument value (e.g. code that prints tool-call XML), not a real nested call.
-    Compares the last parameter opener before ``pos`` against the last
-    parameter/function close before it."""
-    last_param_open = -1
-    for m in _TC_PARAM_START_RE.finditer(text, 0, pos):
-        last_param_open = m.start()
-    if last_param_open < 0:
-        return False
-    # The parameter's OWN close tag decides: while it closes after ``pos`` the position is
-    # argument data, even across several literal function closes. Only an unclosed
-    # parameter (heal mode) falls back to the first function close.
-    own_closes = [
-        c
-        for c in (
-            text.find("</parameter>", last_param_open),
-            text.find("</param>", last_param_open),
-        )
-        if c >= 0
-    ]
-    if own_closes:
-        return min(own_closes) > pos
-    func_closes = [
-        c
-        for c in (
-            text.find("</function>", last_param_open),
-            text.find("</tool_call>", last_param_open),
-        )
-        if c >= 0
-    ]
-    return not func_closes or pos < min(func_closes)
+
+    Same algorithm as the healer's, over a wider vocabulary: this module's opener regex
+    also matches ``<param name="...">``, and GLM 4.x / Kimi K2 close a call with
+    ``</tool_call>`` rather than ``</function>``. Only the vocabulary is passed in; the
+    body lives in ``core.tool_healing``."""
+    return _tool_healing._inside_open_parameter(
+        text,
+        pos,
+        param_start_re = _TC_PARAM_START_RE,
+        param_closers = ("</parameter>", "</param>"),
+        func_closers = ("</function>", "</tool_call>"),
+    )
 
 
 def _parse_function_xml(
@@ -1940,34 +2162,10 @@ def _parse_gemma_tool_calls(
     return out
 
 
-def _balanced_brace_end(text: str, brace_pos: int) -> int | None:
-    """Index of the ``}`` matching ``{`` at ``brace_pos`` (ignores braces in JSON strings)."""
-    if brace_pos >= len(text) or text[brace_pos] != "{":
-        return None
-    depth = 0
-    in_string = False
-    esc = False
-    i = brace_pos
-    while i < len(text):
-        ch = text[i]
-        if in_string:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_string = False
-        else:
-            if ch == '"':
-                in_string = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    return i
-        i += 1
-    return None
+# Shared with the healer rather than copied. The healer's version additionally
+# understands Gemma ``<|"|>`` quoting behind a keyword-only flag this module never sets,
+# so positional calls behave identically.
+_balanced_brace_end = _tool_healing._balanced_brace_end
 
 
 def _gemma_body_brace_end(text: str, brace_pos: int) -> int | None:
