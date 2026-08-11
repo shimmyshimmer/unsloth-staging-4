@@ -1,0 +1,32 @@
+name: "A/B end-to-end: install output identical + idempotent"
+
+on:
+  push:
+    branches: [dl-ab-e2e]
+  workflow_dispatch:
+
+concurrency:
+  group: ab-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: "windows install x3 (unpatched, patched, patched again)"
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install x3 + manifest diff
+        shell: pwsh
+        run: pwsh -NoProfile -File .github/workflows/e2e_idempotent.ps1
+      - name: Upload manifests + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifests
+          path: |
+            manifest*.txt
+            install_*.log
+          if-no-files-found: warn
