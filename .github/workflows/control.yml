@@ -1,0 +1,20 @@
+name: "Control: two identical unpatched installs"
+on:
+  push:
+    branches: [dl-ab-control]
+  workflow_dispatch:
+concurrency:
+  group: ctl-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  control:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - shell: pwsh
+        run: pwsh -NoProfile -File .github/workflows/control_probe.ps1
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: control, path: "ctl*.txt", if-no-files-found: warn }
