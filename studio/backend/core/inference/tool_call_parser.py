@@ -912,7 +912,9 @@ class StreamingMarkupStripper:
 
     def strip(self, text: str) -> str:
         previous = self._last_in
-        if text is previous or (previous is not None and len(text) == len(previous) and text == previous):
+        if text is previous or (
+            previous is not None and len(text) == len(previous) and text == previous
+        ):
             return self._last_out
         if not self._is_extension(text):
             # Not an extension of what we saw: the cached prefix no longer applies.

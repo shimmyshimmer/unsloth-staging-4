@@ -41,18 +41,16 @@ import refactor_guard  # noqa: E402
 ENABLED = {"get_weather", "search", "trunc", "broken"}
 
 
-def _reference_strip(text, enabled_tool_names=ENABLED):
+def _reference_strip(text, enabled_tool_names = ENABLED):
     """The pre-refactor streaming strip: full rescan, no caching."""
 
     def _seg(segment, is_last):
-        return strip_segment(
-            segment, seg_final=is_last, enabled_tool_names=enabled_tool_names
-        )
+        return strip_segment(segment, seg_final = is_last, enabled_tool_names = enabled_tool_names)
 
     return tool_healing.strip_outside_think(text, _seg)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope = "module")
 def corpus():
     return refactor_guard.build_corpus()
 
@@ -97,9 +95,9 @@ def test_prefix_split_property(corpus):
         first = _first_sentinel(text, 0)
         cut = _safe_cut(text, first) if first >= 0 else len(text)
         expected = _reference_strip(text)
-        assert text[:cut] + _reference_strip(text[cut:]) == expected, (
-            f"prefix split at {cut} changed the result for {text!r}"
-        )
+        assert (
+            text[:cut] + _reference_strip(text[cut:]) == expected
+        ), f"prefix split at {cut} changed the result for {text!r}"
 
 
 def test_prefix_split_property_fuzz():
@@ -110,9 +108,9 @@ def test_prefix_split_property_fuzz():
         text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 80)))
         first = _first_sentinel(text, 0)
         cut = _safe_cut(text, first) if first >= 0 else len(text)
-        assert text[:cut] + _reference_strip(text[cut:]) == _reference_strip(text), (
-            f"prefix split at {cut} changed the result for {text!r}"
-        )
+        assert text[:cut] + _reference_strip(text[cut:]) == _reference_strip(
+            text
+        ), f"prefix split at {cut} changed the result for {text!r}"
 
 
 def test_incremental_matches_reference_token_by_token(corpus):
@@ -121,9 +119,9 @@ def test_incremental_matches_reference_token_by_token(corpus):
         stripper = StreamingMarkupStripper(ENABLED)
         for end in range(len(text) + 1):
             prefix = text[:end]
-            assert stripper.strip(prefix) == _reference_strip(prefix), (
-                f"diverged at offset {end} of {text!r}"
-            )
+            assert stripper.strip(prefix) == _reference_strip(
+                prefix
+            ), f"diverged at offset {end} of {text!r}"
 
 
 def test_incremental_matches_reference_for_random_chunkings(corpus):
@@ -135,9 +133,9 @@ def test_incremental_matches_reference_for_random_chunkings(corpus):
         while pos < len(text):
             pos = min(len(text), pos + rng.randint(1, 7))
             prefix = text[:pos]
-            assert stripper.strip(prefix) == _reference_strip(prefix), (
-                f"diverged at offset {pos} of {text!r}"
-            )
+            assert stripper.strip(prefix) == _reference_strip(
+                prefix
+            ), f"diverged at offset {pos} of {text!r}"
 
 
 def test_incremental_matches_reference_on_fuzz():
@@ -149,9 +147,9 @@ def test_incremental_matches_reference_on_fuzz():
         stripper = StreamingMarkupStripper(ENABLED)
         for end in range(len(text) + 1):
             prefix = text[:end]
-            assert stripper.strip(prefix) == _reference_strip(prefix), (
-                f"diverged at offset {end} of {text!r}"
-            )
+            assert stripper.strip(prefix) == _reference_strip(
+                prefix
+            ), f"diverged at offset {end} of {text!r}"
 
 
 def test_rewind_resets_cached_state():
