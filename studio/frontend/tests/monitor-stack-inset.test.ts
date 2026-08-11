@@ -333,6 +333,33 @@ test("the height is measured with the hook's own cap lifted", async () => {
 });
 
 // The sweep above, re-run at the heights the stack actually takes.
+// The stack scrolls now, and an uncapped box does not, so the measurement has
+// to put scrollTop back with the cap or a resize below throws a reader of the
+// download list back to the first card.
+test("the measurement restores the stack's scroll position", async () => {
+  const source = await readFile(
+    new URL(
+      "../src/features/settings/stores/monitor-frame-store.ts",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  const measure = source.slice(
+    source.indexOf("const measure = () => {"),
+    source.indexOf("const observer = new ResizeObserver"),
+  );
+  assert.match(
+    measure,
+    /const scrolled = node\.scrollTop;[\s\S]*node\.style\.maxHeight = "none";/,
+    "scrollTop is read after the cap comes off, when it has already clamped",
+  );
+  assert.match(
+    measure,
+    /node\.style\.maxHeight = capped;[\s\S]*node\.scrollTop = scrolled;/,
+    "the scroll position is never put back",
+  );
+});
+
 test("no measured height leaves the stack overlapping a box", () => {
   const composer = { left: 412, top: 664, right: 1148, bottom: 814 };
   for (const needed of [0, 40, 80, 120, 200, 320]) {
@@ -351,6 +378,130 @@ test("no measured height leaves the stack overlapping a box", () => {
       }
     }
   }
+});
+
+// A window too short to hold the cards above the composer has no arrangement
+// that both dodges it and shows them whole. Clipping them is what the overlap
+// report was about, and a card sliced off at the rail's edge reads as one that
+// has slid behind the page, so the stack takes the corner and paints over the
+// composer instead. Only for a box that said it may be covered.
+test("a stack that cannot fit above the composer covers it rather than clipping", () => {
+  // 534px tall, the size from the report, with the welcome composer centred.
+  const H = 534;
+  const composer = { left: 236, top: 300, right: 684, bottom: 420, coverable: true };
+  const needed = 339;
+  const covered = stackGeometry(composer, 921, H, needed);
+  assert.equal(covered.bottom, 16, "the stack left the corner");
+  assert.ok(
+    covered.maxHeight >= needed,
+    `the cards are still clipped: ${covered.maxHeight} < ${needed}`,
+  );
+  // The same box that has to be dodged when dodging it costs nothing.
+  const roomy = stackGeometry(composer, 921, 1200, needed);
+  assert.ok(
+    1200 - roomy.bottom <= composer.top || roomy.maxHeight <= 1200 - 16 - composer.bottom,
+    "a composer that could have been dodged was covered anyway",
+  );
+});
+
+test("a box that never said it may be covered is still never covered", () => {
+  // The Live monitor. Its Close button and resize grip are why this store
+  // exists, so it keeps the old answer even when the stack does not fit.
+  const H = 534;
+  const monitor = { left: 236, top: 300, right: 684, bottom: 420 };
+  const geometry = stackGeometry(monitor, 921, H, 339);
+  const stackTop = H - geometry.bottom - geometry.maxHeight;
+  const clearsAbove = H - geometry.bottom <= monitor.top;
+  const clearsBelow = stackTop >= monitor.bottom;
+  assert.ok(clearsAbove || clearsBelow, "the stack was allowed over the monitor");
+});
+
+// The fallback drops the coverable boxes and places against what is left, so
+// the monitor has to come out of it exactly as it would have on its own. Stated
+// as a comparison rather than an absolute: a window this short cannot always
+// clear a monitor either, and the claim here is that the composer's permission
+// is not inherited, not that the monitor is always dodged.
+test("a coverable composer does not licence covering the monitor beside it", () => {
+  const composer = { left: 236, top: 300, right: 684, bottom: 420, coverable: true };
+  const monitor = { left: 640, top: 60, right: 905, bottom: 250 };
+  for (const height of [534, 700, 900, 1200]) {
+    for (const needed of [56, 200, 339, 600]) {
+      const alone = stackGeometry(monitor, 921, height, needed);
+      const withComposer = stackGeometry([composer, monitor], 921, height, needed);
+      const clearance = (g: { bottom: number; maxHeight: number }) => ({
+        edge: height - g.bottom,
+        top: height - g.bottom - g.maxHeight,
+      });
+      const a = clearance(alone);
+      const b = clearance(withComposer);
+      const label = `height=${height} needed=${needed}`;
+      assert.ok(
+        b.top >= a.top || b.edge <= monitor.top,
+        `the composer pushed the stack further over the monitor: ${label}`,
+      );
+    }
+  }
+});
+
+// The cards may give up their notes, so a placement short of the height they
+// would PREFER still shows all of them. Covering the composer to win those few
+// pixels is the worse answer, and testing the fallback against the natural
+// height rather than the floor is what did it: at 1280x830 a 3px shortfall took
+// the stack off a dodge that fitted and put it over the composer.
+test("a placement that fits the cards at their floor is not given up on", () => {
+  const H = 830;
+  const composer = { left: 416, top: 415, right: 864, bottom: 530, coverable: true };
+  const natural = 394;
+  const floor = 339;
+  const geometry = stackGeometry(composer, 1280, H, natural, floor);
+  assert.ok(
+    H - geometry.bottom <= composer.top,
+    "the stack covered a composer it could have dodged",
+  );
+  assert.ok(geometry.maxHeight >= floor, "and it still holds the cards");
+});
+
+// The loaded models indicator is the LAST child of the rail, so it is the one
+// that lands on the corner, and it is persistent: over Send it is #8210 again,
+// permanently rather than until a dismiss. #8346 ships it off by default, which
+// makes this whoever turned it on rather than nobody.
+test("a persistent card that would land on the composer stops the cover", () => {
+  const H = 534;
+  // Docked under a thread: it sits on the bottom edge, so the corner is where
+  // the persistent tail would go and the tail would land on Send.
+  const docked = { left: 236, top: 380, right: 684, bottom: 518, coverable: true };
+  const dodging = stackGeometry(docked, 921, H, 460, 420, 60);
+  assert.ok(
+    H - dodging.bottom <= docked.top,
+    "the persistent tail took the docked composer's corner",
+  );
+});
+
+test("a persistent card clear of the composer does not stop the cover", () => {
+  const H = 534;
+  // The welcome composer, centred. The corner underneath it is free, so the
+  // cards that reach it are the dismissible ones and there is nothing to
+  // protect: covering is still the right answer.
+  const welcome = { left: 236, top: 275, right: 684, bottom: 387, coverable: true };
+  const covering = stackGeometry(welcome, 921, H, 460, 420, 60);
+  assert.equal(covering.bottom, 16, "it gave up a cover that was safe");
+  assert.ok(covering.maxHeight >= 460, "and the cards are whole");
+});
+
+test("no persistent tail means the old answer", () => {
+  const composer = { left: 236, top: 300, right: 684, bottom: 420, coverable: true };
+  const withZero = stackGeometry(composer, 921, 534, 420, 420, 0);
+  const withoutArg = stackGeometry(composer, 921, 534, 420, 420);
+  assert.deepEqual(withoutArg, withZero);
+});
+
+// One number means the strict reading of it, so nothing that knows only the
+// natural height silently starts covering things.
+test("a caller that passes one height gets the stricter answer", () => {
+  const composer = { left: 416, top: 415, right: 864, bottom: 530, coverable: true };
+  const one = stackGeometry(composer, 1280, 830, 394);
+  const two = stackGeometry(composer, 1280, 830, 394, 394);
+  assert.deepEqual(one, two);
 });
 
 // Same rule, applied to the other publisher: a monitor dragged up the screen
