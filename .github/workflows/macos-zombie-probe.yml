@@ -1,0 +1,16 @@
+name: macOS zombie probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [macos-zombie-probe]
+
+jobs:
+  probe:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run the probe
+        run: |
+          cc -O0 -g -o probe probe.c -lproc
+          ./probe
