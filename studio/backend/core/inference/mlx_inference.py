@@ -14,6 +14,7 @@ from core.inference.message_content import content_to_text
 from core.inference.runtime_context import runtime_context_length
 from core.inference.chat_template_helpers import (
     ReasoningChannelNormalizer,
+    detect_reasoning_channel_markers,
     markup_for_tokenizer,
     neutralize_control_markup_in_messages,
     normalize_reasoning_snapshots,
@@ -122,8 +123,20 @@ def _render_registered_vlm_prompt(
     config, model_type = _mlx_vlm_model_config(model)
     if config is None:
         return None
-    if model_type not in getattr(prompt_utils, "MODEL_CONFIG", {}):
-        return None
+    model_config = getattr(prompt_utils, "MODEL_CONFIG", {})
+    if model_type not in model_config:
+        folded = model_type.casefold() if isinstance(model_type, str) else None
+        canonical = next(
+            (key for key in model_config if isinstance(key, str) and key.casefold() == folded),
+            None,
+        )
+        if canonical is None:
+            return None
+        # Preserve the checkpoint's config object. The prompt helper only needs
+        # its own canonical routing key, and mutating the loaded model would make
+        # later capability and export logic observe a value it never published.
+        config = dict(config) if isinstance(config, dict) else dict(config.__dict__)
+        config["model_type"] = canonical
 
     # Recovery path: sweeps the caller's original list rather than reusing a copy (#7066).
     swept = neutralize_control_markup_in_messages(messages, None, markup_for_tokenizer(processor))
@@ -1900,6 +1913,8 @@ class MLXInferenceBackend:
             )
 
         logger.info("MLX audio-input generating: prompt_len=%d", len(prompt))
+        markers = detect_reasoning_channel_markers(self._processor)
+        normalizer = ReasoningChannelNormalizer(*markers) if markers is not None else None
         # Hold the adapter state for the whole stream, as text and vision do,
         # so Base-vs-LoRA compare doesn't run the adapter on both sides.
         with self._generation_lock, _temporary_mlx_adapter_state(self._model, use_adapter):
@@ -1917,6 +1932,8 @@ class MLXInferenceBackend:
                 ):
                     final_response = response
                     token_text = response.text if hasattr(response, "text") else str(response)
+                    if normalizer is not None:
+                        token_text = normalizer.feed(token_text)
                     if token_text:
                         yield token_text
                     if cancel_event and cancel_event.is_set():
@@ -1929,6 +1946,11 @@ class MLXInferenceBackend:
                         getattr(final_response, "generation_tokens", 0),
                         getattr(final_response, "generation_tps", 0.0),
                     )
+        if normalizer is not None:
+            cancelled = cancel_event is not None and cancel_event.is_set()
+            tail = normalizer.drain() if cancelled else normalizer.finish()
+            if tail:
+                yield tail
 
     def generate_with_adapter_control(
         self,

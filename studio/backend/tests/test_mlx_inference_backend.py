@@ -1669,16 +1669,15 @@ def test_mlx_audio_probe_that_answered_no_still_retracts_audio_vlm(monkeypatch):
         ("gemma4", True),
         ("phi4mm", True),
         ("minicpmo", True),
-        ("qwen3_omni_moe", False),
+        ("qwen3_omni_moe", True),
     ],
 )
 def test_mlx_vlm_renderer_audio_marker_contract(model_type, places_marker):
     """Pins which mlx-vlm message builders honour num_audios.
 
     This is the message-construction layer, not the final template render:
-    qwen3_omni_moe is registered but its formatter drops audio here, so
-    classifying on registry membership alone would advertise a model whose
-    prompt can never carry an audio marker.
+    Every currently registered native-audio formatter preserves the requested
+    audio count under mlx-vlm 0.6.10.
     """
     pu = pytest.importorskip("mlx_vlm.prompt_utils")
     render = lambda n: pu.apply_chat_template(
@@ -1690,6 +1689,37 @@ def test_mlx_vlm_renderer_audio_marker_contract(model_type, places_marker):
         return_messages = True,
     )
     assert (render(1) != render(0)) is places_marker
+
+
+def test_mlx_registered_renderer_accepts_published_nemotron_model_type_case():
+    """The official checkpoint capitalizes its model type while mlx-vlm's
+    registry uses lowercase. Studio must reach the registered renderer rather
+    than rejecting the checkpoint before the loader's normalization can run."""
+    from unsloth_zoo.mlx.loader import _ensure_vlm_prompt_utils_patched
+    from core.inference.mlx_inference import _render_registered_vlm_prompt
+
+    _ensure_vlm_prompt_utils_patched()
+    model = SimpleNamespace(
+        config = {"model_type": "NemotronH_Nano_Omni_Reasoning_V3"},
+    )
+    messages = [{"role": "user", "content": "Transcribe this audio."}]
+
+    plain = _render_registered_vlm_prompt(
+        None,
+        model,
+        messages,
+        num_images = 0,
+        num_audios = 0,
+    )
+    marked = _render_registered_vlm_prompt(
+        None,
+        model,
+        messages,
+        num_images = 0,
+        num_audios = 1,
+    )
+
+    assert plain and marked and plain != marked
 
 
 def test_mlx_generate_audio_input_deltas_and_reject(monkeypatch):
@@ -1746,6 +1776,69 @@ def test_mlx_generate_audio_input_deltas_and_reject(monkeypatch):
     backend.models["m"]["audio_type"] = None
     with pytest.raises(RuntimeError, match = "not supported .* MLX"):
         next(backend.generate_audio_input_response(**args))
+
+
+def test_mlx_audio_input_normalizes_split_native_reasoning_channels(monkeypatch):
+    from core.inference import mlx_inference
+    from core.inference.mlx_inference import MLXInferenceBackend
+
+    stats = dict(prompt_tokens = 3, prompt_tps = 1.0, generation_tokens = 6, generation_tps = 1.0)
+
+    def _fake_stream(*_args, **_kwargs):
+        for text in ("<|chan", "nel>thought\n", "transcript", "<chan", "nel|>", " answer"):
+            yield SimpleNamespace(text = text, **stats)
+
+    fake_vlm = types.ModuleType("mlx_vlm")
+    fake_vlm.stream_generate = _fake_stream
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_vlm)
+    monkeypatch.setattr(
+        mlx_inference,
+        "_render_registered_vlm_prompt",
+        lambda *a, num_images = 0, num_audios = 0: "P<audio>",
+    )
+
+    backend = MLXInferenceBackend.__new__(MLXInferenceBackend)
+    backend._generation_lock = __import__("threading").Lock()
+    # Protocol selection follows the template, never a Gemma model-name branch.
+    backend._model = _audio_model(model_type = "template_declared_audio")
+    backend._processor = _audio_processor()
+    backend._processor.chat_template = "...<|channel>thought\n...<channel|>"
+    backend.active_model_name = "m"
+    backend.last_generation_stats = None
+    backend.models = {"m": {"audio_type": "audio_vlm"}}
+
+    assert list(
+        backend.generate_audio_input_response(
+            messages = [{"role": "user", "content": "transcribe"}],
+            system_prompt = "",
+            audio_array = [0.0],
+            max_new_tokens = 8,
+        )
+    ) == ["<think>", "transcript", "</think>", " answer"]
+
+    def _open_stream(*_args, **_kwargs):
+        for text in ("<|channel>thought\n", "unfinished"):
+            yield SimpleNamespace(text = text, **stats)
+
+    fake_vlm.stream_generate = _open_stream
+    assert list(
+        backend.generate_audio_input_response(
+            messages = [{"role": "user", "content": "transcribe"}],
+            system_prompt = "",
+            audio_array = [0.0],
+        )
+    ) == ["<think>", "unfinished", "</think>"]
+
+    cancelled = __import__("threading").Event()
+    cancelled.set()
+    assert list(
+        backend.generate_audio_input_response(
+            messages = [{"role": "user", "content": "transcribe"}],
+            system_prompt = "",
+            audio_array = [0.0],
+            cancel_event = cancelled,
+        )
+    ) == ["<think>"]
 
 
 def test_mlx_audio_input_honors_adapter_selection(monkeypatch):
