@@ -2909,6 +2909,123 @@ _cap_cuda_family_for_pre_turing() {
     printf '%s\n' "$1"
 }
 
+# ── ROCm version sources ──
+# One helper per source. Each prints at most one "rocmX.Y" line and nothing when
+# its source is absent or unparseable.
+#
+# CONTRACT: none of these may fail its caller. install.sh runs under set -e, and
+# the case where EVERY source is missing (a real AMD GPU with no ROCm userspace)
+# has to reach the actionable warning at the end of the ROCm branch rather than
+# kill the installer, so every helper returns 0 no matter what its source does.
+_rocm_tag_from_amd_smi() {
+    command -v amd-smi >/dev/null 2>&1 || return 0
+    # Stop at the field separator and require digits. amd-smi prints one pipe-delimited line
+    # ("... | ROCm version: N/A | amdgpu version: 6.10.10 | ..."), so stripping every non-digit
+    # glued the amdgpu driver version onto the ROCm one and reported the driver as ROCm. That
+    # was harmless while this source was shadowed by position; under highest-wins a fabricated
+    # reading can outvote a correct one, so an unparseable field must yield nothing instead.
+    amd-smi version 2>/dev/null | awk -F'ROCm version: ' \
+        'NF>1{v=$2; sub(/[ \t|].*$/, "", v); if (v ~ /^[0-9]+\.[0-9]+/) {split(v,a,"."); print "rocm"a[1]"."a[2]} exit}' || return 0
+}
+
+_rocm_tag_from_version_file() {
+    [ -r /opt/rocm/.info/version ] || return 0
+    awk -F. '{print "rocm"$1"."$2; exit}' /opt/rocm/.info/version || return 0
+}
+
+_rocm_tag_from_hipconfig() {
+    command -v hipconfig >/dev/null 2>&1 || return 0
+    hipconfig --version 2>/dev/null \
+        | awk 'NR==1 && /^[0-9]/{split($1,a,"."); if(a[1]+0>0){print "rocm"a[1]"."a[2]}}' || return 0
+}
+
+_rocm_tag_from_dpkg() {
+    command -v dpkg-query >/dev/null 2>&1 || return 0
+    # ${Status}, not ${Version} alone. dpkg-query -W lists every package in the
+    # status database except purged ones (man dpkg-query, --list: "regardless of
+    # their status ... excluding the ones marked as not-installed"), so a
+    # rocm-core taken out with `apt remove` and not purged stays queryable in
+    # state "deinstall ok config-files" and still reports the version it had.
+    # Under highest-wins that dead entry would outrank every live source: a host
+    # that ran ROCm 7.0, downgraded to 6.1 and never purged would resolve rocm7.0
+    # off a package that is not there. Every other source at least describes a
+    # tree that exists, so this one has to require the status word "installed".
+    # ${Status} is a documented showformat field with no dpkg
+    # version floor, and dpkg-query renders an unrecognised field as empty rather
+    # than failing, so on any dpkg that somehow lacks it this source goes silent
+    # instead of over-reporting.
+    _rt_ver=$(dpkg-query -W -f='${Status} ${Version}\n' rocm-core 2>/dev/null \
+        | awk '$3 == "installed" && $4 != "" { print $4; exit }') || return 0
+    [ -n "$_rt_ver" ] || return 0
+    printf '%s\n' "$_rt_ver" | sed 's/^[0-9]*://' \
+        | awk -F'[.-]' '{print "rocm"$1"."$2; exit}' || return 0
+}
+
+_rocm_tag_from_rpm() {
+    command -v rpm >/dev/null 2>&1 || return 0
+    _rt_ver=$(rpm -q --qf '%{VERSION}\n' rocm-core 2>/dev/null) || return 0
+    [ -n "$_rt_ver" ] || return 0
+    printf '%s\n' "$_rt_ver" | awk -F'[.-]' '{print "rocm"$1"."$2; exit}' || return 0
+}
+
+# Highest "rocmX.Y" line on stdin (major >= 1), or nothing when no line is usable.
+_highest_rocm_tag() {
+    awk '
+        /^rocm[0-9]+\.[0-9]+$/ {
+            split(substr($0, 5), a, ".")
+            maj = a[1] + 0; min = a[2] + 0
+            if (maj < 1) next
+            if (!seen || maj > best_maj || (maj == best_maj && min > best_min)) {
+                best_maj = maj; best_min = min; seen = 1
+            }
+        }
+        END { if (seen) printf "rocm%d.%d\n", best_maj, best_min }
+    '
+}
+
+# Resolve the host ROCm version by consulting EVERY source and taking the
+# highest, rather than the first that answers. Distros with split ROCm packaging
+# ship one component well behind the runtime the GPU actually uses: Debian 13
+# (and Linux Mint on top of it) packages hipconfig at 5.7.x next to a 6.1.x
+# rocminfo/HSA, so first-answer resolution reported rocm5.7 on a working gfx1100
+# and the 6.0+ gate below sent it to CPU-only wheels (issue #8402). A source
+# reporting lower than another on the same host is stale packaging, not a
+# downgrade, so the highest reading is the one that describes the runtime.
+#
+# The symmetric risk of highest-wins is overshoot: a source reading HIGHER than
+# the host now picks the wheel family instead of being shadowed by its position.
+# Two things bound it. PyTorch's ROCm wheels vendor their own ROCm userspace
+# into torch/lib, so what they need from the host is the amdgpu/KFD driver, and
+# AMD documents that as compatible +/- 2 releases (a year's span from 6.4), not
+# pinned to the userspace these sources report. And the normalisation below can
+# only emit a leaf PyTorch publishes. What is NOT bounded is a reading taken off
+# something that is not installed at all, so the one source that can produce one
+# -- a removed-but-not-purged dpkg rocm-core -- is filtered above. Past that,
+# disagreement is named on stderr: when overshoot does bite it surfaces as an
+# HSA error at the first HIP call, or a GPU that is simply absent from torch,
+# and neither points back here without the readings in the log.
+_detect_rocm_version_tag() {
+    _rt_readings=$({
+        _rocm_tag_from_amd_smi
+        _rocm_tag_from_version_file
+        _rocm_tag_from_hipconfig
+        _rocm_tag_from_dpkg
+        _rocm_tag_from_rpm
+    } 2>/dev/null) || _rt_readings=""
+    _rt_best=$(printf '%s\n' "$_rt_readings" | _highest_rocm_tag) || _rt_best=""
+    if [ -n "$_rt_best" ]; then
+        # Same shape gate as _highest_rocm_tag, so a garbage or major-0 reading
+        # is not named as a dissenting opinion when it never was a candidate.
+        _rt_seen=$(printf '%s\n' "$_rt_readings" \
+            | grep '^rocm[1-9][0-9]*\.[0-9][0-9]*$' | sort -u | tr '\n' ' ') || _rt_seen=""
+        case "$_rt_seen" in
+            ""|"$_rt_best ") : ;;  # one reading, or every source agreeing
+            *) echo "[WARN] ROCm version sources disagree (${_rt_seen% }) -- using the highest, $_rt_best." >&2 ;;
+        esac
+    fi
+    printf '%s\n' "$_rt_best"
+}
+
 # ── Detect GPU and choose PyTorch index URL ──
 # Mirrors Get-TorchIndexUrl in install.ps1.
 # On CPU-only machines this returns the cpu index, avoiding the solver
@@ -2987,26 +3104,20 @@ get_torch_index_url() {
         fi
         # AMD GPU confirmed -- detect ROCm version
         _rocm_tag=""
-        _rocm_tag=$({ command -v amd-smi >/dev/null 2>&1 && \
-            amd-smi version 2>/dev/null | awk -F'ROCm version: ' \
-                'NF>1{gsub(/[^0-9.]/, "", $2); split($2,a,"."); print "rocm"a[1]"."a[2]; ok=1; exit} END{exit !ok}'; } || \
-            { [ -r /opt/rocm/.info/version ] && \
-                awk -F. '{print "rocm"$1"."$2; exit}' /opt/rocm/.info/version; } || \
-            { command -v hipconfig >/dev/null 2>&1 && \
-                hipconfig --version 2>/dev/null | awk 'NR==1 && /^[0-9]/{split($1,a,"."); if(a[1]+0>0){print "rocm"a[1]"."a[2]; found=1}} END{exit !found}'; } || \
-            { command -v dpkg-query >/dev/null 2>&1 && \
-                ver="$(dpkg-query -W -f='${Version}\n' rocm-core 2>/dev/null)" && \
-                [ -n "$ver" ] && \
-                printf '%s\n' "$ver" | sed 's/^[0-9]*://' | awk -F'[.-]' '{print "rocm"$1"."$2; exit}'; } || \
-            { command -v rpm >/dev/null 2>&1 && \
-                ver="$(rpm -q --qf '%{VERSION}\n' rocm-core 2>/dev/null)" && \
-                [ -n "$ver" ] && \
-                printf '%s\n' "$ver" | awk -F'[.-]' '{print "rocm"$1"."$2; exit}'; }) 2>/dev/null || _rocm_tag=""
+        _rocm_tag=$(_detect_rocm_version_tag) || _rocm_tag=""
         # ^ || guard: when EVERY version source is missing (e.g. rocminfo present
-        # but rocm-core not installed, so dpkg-query/rpm exit 1), the whole ||
-        # chain fails and set -e would kill the installer BEFORE the actionable
-        # no-version WARN below -- exactly the fresh-install case it exists for.
-        # Validate _rocm_tag: must match "rocmX.Y" with major >= 1
+        # but rocm-core not installed, so dpkg-query/rpm exit 1), detection must
+        # still return empty-and-successful rather than let set -e kill the
+        # installer BEFORE the actionable no-version WARN below -- exactly the
+        # fresh-install case it exists for. _detect_rocm_version_tag holds that
+        # contract internally; the guard here is belt and braces. stderr is NOT
+        # redirected: every source's own noise is already suppressed inside the
+        # resolver, so the only thing left on stderr is its deliberate
+        # sources-disagree breadcrumb, which belongs in the install log.
+        # Validate _rocm_tag: must match "rocmX.Y" with major >= 1.
+        # _highest_rocm_tag already enforces this shape; kept as a second gate so
+        # a future source added to _detect_rocm_version_tag cannot leak garbage
+        # into the wheel-index cases below.
         case "$_rocm_tag" in
             rocm[1-9]*.[0-9]*) : ;;  # valid (major >= 1)
             *) _rocm_tag="" ;;        # reject malformed (empty, garbled, or major=0)
@@ -3016,7 +3127,11 @@ get_torch_index_url() {
             case "$_rocm_tag" in
                 rocm[1-5].*)
                     echo "[WARN] ROCm $_rocm_tag detected but PyTorch ROCm wheels require ROCm 6.0+ -- falling back to CPU-only PyTorch" >&2
+                    echo "[WARN] $_rocm_tag is the HIGHEST version any of amd-smi, /opt/rocm/.info/version, hipconfig or rocm-core reported." >&2
                     echo "[WARN] Upgrade ROCm: https://rocm.docs.amd.com/en/latest/deploy/linux/index.html" >&2
+                    echo "[WARN] If this host really runs ROCm 6.0+ and only its packaging says otherwise, pin the wheels and re-run:" >&2
+                    echo "[WARN]   UNSLOTH_TORCH_INDEX_FAMILY=rocm6.4   (a PyTorch wheel leaf: rocm6.0-6.4, rocm7.0-7.2)" >&2
+                    echo "[WARN]   UNSLOTH_TORCH_INDEX_URL=<full index URL>   (takes precedence, used verbatim)" >&2
                     echo "$_base/cpu"; return ;;
             esac
             # Supported tags; 6.5+ clips to rocm6.4, 7.3+ caps to rocm7.2.
