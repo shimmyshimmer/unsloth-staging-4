@@ -48,22 +48,32 @@ jobs:
           hf-token: ''
       - name: Record the installed runtime
         run: |
-          set -x
-          BIN="$(find "${UNSLOTH_STUDIO_HOME:-$HOME/.unsloth/studio}" -name llama-server -type f | head -1)"
+          # Same layout assert-llama-loads.sh uses: STUDIO_HOME defaults to
+          # ~/.unsloth, and the runtime lands in llama.cpp/build/bin under it.
+          UNSLOTH_HOME="${STUDIO_HOME:-$HOME/.unsloth}"
+          BIN="$(find "$UNSLOTH_HOME" -type f -name llama-server 2>/dev/null | head -1)"
           echo "binary=$BIN"
+          [ -n "$BIN" ] || { echo "::error::no llama-server under $UNSLOTH_HOME"; ls -la "$UNSLOTH_HOME" || true; exit 1; }
           file "$BIN" || true
           otool -L "$BIN" || true
           otool -l "$BIN" | grep -A2 LC_RPATH || true
           codesign -dv "$BIN" 2>&1 || true
+          vtool -show-build "$BIN" 2>&1 || true
           ls -la "$(dirname "$BIN")"
+          # The backend's own deps (structlog, ...) live in the installed venv,
+          # not in the runner's setup-python.
+          VENV_PY="${STUDIO_HOME:-$HOME/.unsloth}/unsloth_studio/bin/python"
+          [ -x "$VENV_PY" ] || VENV_PY="$(find "$UNSLOTH_HOME" -type f -path '*/bin/python' 2>/dev/null | head -1)"
+          echo "VENV_PY=$VENV_PY" >> "$GITHUB_ENV"
+          "$VENV_PY" -V
       - name: Assert the child environment (with the fix)
-        run: python .github/scripts/assert_llama_dyld_env.py
+        run: "$VENV_PY" .github/scripts/assert_llama_dyld_env.py
       - name: Assert the same check FAILS before the fix
         run: |
           cp studio/backend/core/inference/llama_cpp.py /tmp/llama_cpp_fixed.py
           git show origin/main:studio/backend/core/inference/llama_cpp.py \
             > studio/backend/core/inference/llama_cpp.py
-          if python .github/scripts/assert_llama_dyld_env.py; then
+          if "$VENV_PY" .github/scripts/assert_llama_dyld_env.py; then
             cp /tmp/llama_cpp_fixed.py studio/backend/core/inference/llama_cpp.py
             echo "::error::the pre-fix revision passed, so this job proves nothing"
             exit 1
@@ -76,5 +86,7 @@ jobs:
         with:
           name: dyld-env-logs
           path: |
+            ~/.unsloth/logs/**
             ~/.unsloth/studio/logs/**
+            logs/install.log
           if-no-files-found: ignore
