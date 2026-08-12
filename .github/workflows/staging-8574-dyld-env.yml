@@ -67,7 +67,10 @@ jobs:
           echo "VENV_PY=$VENV_PY" >> "$GITHUB_ENV"
           "$VENV_PY" -V
       - name: Assert the child environment (with the fix)
-        run: "$VENV_PY" .github/scripts/assert_llama_dyld_env.py
+        # Block scalar: a run: value starting with a quote is a quoted YAML
+        # scalar, and the rest of the line then breaks the parse.
+        run: |
+          "$VENV_PY" .github/scripts/assert_llama_dyld_env.py
       - name: Assert the same check FAILS before the fix
         run: |
           cp studio/backend/core/inference/llama_cpp.py /tmp/llama_cpp_fixed.py
