@@ -1463,97 +1463,32 @@ class VideoBackend:
                 if self._load_token == token and self._loading is not None:
                     self._loading.error = redact_native_paths(str(exc))
 
-    def _run_load_h3_native(
-        self,
-        *,
-        fam: VideoFamily,
-        token: Optional[int],
-        cancel_event: threading.Event,
-        repo_id: str,
-        gguf_filename: Optional[str] = None,
-        hf_token: Optional[str] = None,
-        memory_mode: Optional[str] = None,
-        **_: Any,
-    ) -> None:
-        """Download and commit the four-file stable-diffusion.cpp H3 runtime."""
-        from huggingface_hub import HfApi
+    def _h3_native_binary(
+        self, *, cancel_event: threading.Event
+    ) -> tuple[str, Optional[bool], str, Optional[tuple[int, int]]]:
+        """Produce the sd-cli the H3 runtime will run on, and the device decision made around it.
 
-        from .sd_cpp_args import SdCppModelFiles, offload_flags
+        Split out of ``_run_load_h3_native`` so it can run BEFORE the four-file download. Returns
+        ``(native_device, listed_accelerator, binary, identity)``; ``listed_accelerator`` is None
+        when the decision never consulted it, and both it and ``identity`` are what the caller's
+        claimed re-vet compares against. Raises when no H3-capable binary can be produced.
+        """
         from .diffusion_engine_router import _install_accelerator_for
         from .sd_cpp_backend import (
             _install_allowed,
             ensure_h3_sd_cpp_binary,
             sd_cpp_lists_accelerator_device,
         )
-        from .sd_cpp_engine import SdCppEngine
-        from .video_minimax_h3 import (
-            H3_AUDIO_VAE,
-            H3_COMPONENT_REPO,
-            H3_GGUF_REPO,
-            H3_VIDEO_VAE,
-            h3_download_error,
-            h3_text_encoder_filename,
-        )
-        from utils.hf_xet_fallback import hf_hub_download_with_xet_fallback
 
-        filename = gguf_filename or ""
-        qwen_filename = h3_text_encoder_filename(filename)
-        requests = (
-            (repo_id, filename),
-            (self._h3_text_encoder_repo(repo_id, qwen_filename), qwen_filename),
-            (H3_COMPONENT_REPO, H3_VIDEO_VAE),
-            (H3_COMPONENT_REPO, H3_AUDIO_VAE),
-        )
-        total = 0
-        try:
-            api = HfApi(token = hf_token or None)
-            for repo, wanted in requests:
-                if Path(repo).expanduser().exists():
-                    continue
-                info = api.model_info(repo, files_metadata = True)
-                total += sum(
-                    int(s.size or 0) for s in (info.siblings or []) if s.rfilename == wanted
-                )
-        except Exception:  # noqa: BLE001 -- progress estimate is optional
-            total = 0
-        with self._lock:
-            if self._load_token == token and self._loading is not None:
-                self._loading.base_repo = fam.base_repo
-                # The download list below pulls from the H3 companion repos too, and neither is
-                # repo_id or base_repo, so without this the delete-cached guard would let one be
-                # deleted out from under the in-flight load. The committed twin is loaded_repo_ids().
-                self._loading.asset_repos = (H3_GGUF_REPO, H3_COMPONENT_REPO)
-                self._loading.expected_bytes = total or None
-
-        resolved: list[Path] = []
-        for repo, wanted in requests:
-            if cancel_event.is_set():
-                raise RuntimeError(VIDEO_CANCELLED_MSG)
-            root = Path(repo).expanduser()
-            if root.is_file():
-                local = root
-            elif root.is_dir():
-                from .diffusion_families import resolve_local_gguf_child
-                local = resolve_local_gguf_child(root, wanted)
-            else:
-                try:
-                    local = Path(
-                        hf_hub_download_with_xet_fallback(
-                            repo,
-                            wanted,
-                            hf_token,
-                            cancel_event = cancel_event,
-                            reuse_other_cache_root = True,
-                        )
-                    )
-                except Exception as exc:  # noqa: BLE001 -- re-raised below, narrowed by name
-                    raise h3_download_error(repo, wanted, exc) from exc
-            resolved.append(local)
-
+        # The install underneath does not consume cancel_event and can spend minutes fetching the
+        # prebuilt. Running after the download loop this inherited that loop's first cancel check;
+        # running before it, the check comes along.
+        if cancel_event.is_set():
+            raise RuntimeError(VIDEO_CANCELLED_MSG)
         target = resolve_diffusion_device_target()
         allow_install = _install_allowed()
         # The H3-gated ensure, not the plain one: a build that predates H3 runs fine and so clears
-        # the version() gate below, then aborts on the first generation, i.e. after the whole
+        # the caller's version() gate, then aborts on the first generation, i.e. after the whole
         # bundle has downloaded.
         binary = ensure_h3_sd_cpp_binary(
             allow_install = allow_install,
@@ -1589,11 +1524,116 @@ class VideoBackend:
             # The baseline this branch is compared against is the DECISION, not a fresh probe of
             # what came back. An install can replace the returned CPU binary with a GPU build
             # between that ensure and this line, and probing here would record ITS answer -- after
-            # which the re-check under the claim below compares the replacement against itself,
+            # which the caller's re-check under the claim compares the replacement against itself,
             # passes, and commits CPU resource accounting around a CUDA executable that runs on
             # VRAM nothing accounted for. native_device is "cpu" precisely because the build must
             # offer no accelerator device, so that -- False -- is what the claim has to still find.
             listed_accelerator = False
+        if not binary:
+            # The caller's claimed re-vet raises this too; nothing downstream can recover a binary
+            # that could not be produced, so there is no reason to spend the bundle first.
+            raise RuntimeError(
+                "stable-diffusion.cpp could not be installed or started for MiniMax-H3."
+            )
+        # The identity of the file these answers came from, so the caller can tell "same build" from
+        # "something replaced it" across the download without re-probing an unchanged one.
+        return native_device, listed_accelerator, binary, _sd_cli_identity(binary)
+
+    def _run_load_h3_native(
+        self,
+        *,
+        fam: VideoFamily,
+        token: Optional[int],
+        cancel_event: threading.Event,
+        repo_id: str,
+        gguf_filename: Optional[str] = None,
+        hf_token: Optional[str] = None,
+        memory_mode: Optional[str] = None,
+        **_: Any,
+    ) -> None:
+        """Download and commit the four-file stable-diffusion.cpp H3 runtime."""
+        from huggingface_hub import HfApi
+
+        from .sd_cpp_args import SdCppModelFiles, offload_flags
+        from .sd_cpp_backend import sd_cpp_lists_accelerator_device
+        from .sd_cpp_engine import SdCppEngine
+        from .video_minimax_h3 import (
+            H3_AUDIO_VAE,
+            H3_COMPONENT_REPO,
+            H3_GGUF_REPO,
+            H3_VIDEO_VAE,
+            h3_download_error,
+            h3_text_encoder_filename,
+        )
+        from utils.hf_xet_fallback import hf_hub_download_with_xet_fallback
+
+        filename = gguf_filename or ""
+        qwen_filename = h3_text_encoder_filename(filename)
+        requests = (
+            (repo_id, filename),
+            (self._h3_text_encoder_repo(repo_id, qwen_filename), qwen_filename),
+            (H3_COMPONENT_REPO, H3_VIDEO_VAE),
+            (H3_COMPONENT_REPO, H3_AUDIO_VAE),
+        )
+        # Claimed BEFORE anything slow, acquisition included: that can spend minutes installing the
+        # prebuilt, and a delete the guard admits inside that window is not revoked by claiming the
+        # repos afterwards. The byte estimate stays below, where the sizes are known.
+        with self._lock:
+            if self._load_token == token and self._loading is not None:
+                self._loading.base_repo = fam.base_repo
+                # The download list below pulls from the H3 companion repos too, and neither is
+                # repo_id or base_repo, so without this the delete-cached guard would let one be
+                # deleted out from under the in-flight load. The committed twin is loaded_repo_ids().
+                self._loading.asset_repos = (H3_GGUF_REPO, H3_COMPONENT_REPO)
+
+        # BEFORE the download, which is the whole point of the H3-gated ensure: its own refusal
+        # says a build without H3 support "would fail after the whole H3 bundle has downloaded".
+        # Nothing in here depends on the resolved paths.
+        native_device, listed_accelerator, binary, vetted_identity = self._h3_native_binary(
+            cancel_event = cancel_event
+        )
+
+        total = 0
+        try:
+            api = HfApi(token = hf_token or None)
+            for repo, wanted in requests:
+                if Path(repo).expanduser().exists():
+                    continue
+                info = api.model_info(repo, files_metadata = True)
+                total += sum(
+                    int(s.size or 0) for s in (info.siblings or []) if s.rfilename == wanted
+                )
+        except Exception:  # noqa: BLE001 -- progress estimate is optional
+            total = 0
+        with self._lock:
+            if self._load_token == token and self._loading is not None:
+                self._loading.expected_bytes = total or None
+
+        resolved: list[Path] = []
+        for repo, wanted in requests:
+            if cancel_event.is_set():
+                raise RuntimeError(VIDEO_CANCELLED_MSG)
+            root = Path(repo).expanduser()
+            if root.is_file():
+                local = root
+            elif root.is_dir():
+                from .diffusion_families import resolve_local_gguf_child
+                local = resolve_local_gguf_child(root, wanted)
+            else:
+                try:
+                    local = Path(
+                        hf_hub_download_with_xet_fallback(
+                            repo,
+                            wanted,
+                            hf_token,
+                            cancel_event = cancel_event,
+                            reuse_other_cache_root = True,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 -- re-raised below, narrowed by name
+                    raise h3_download_error(repo, wanted, exc) from exc
+            resolved.append(local)
+
         engine = SdCppEngine(binary)
         # Re-vet and take the identity under ONE reader claim. ensure_h3_sd_cpp_binary checked the
         # file it returned, but an install can start between that return and this line, and an
@@ -1609,10 +1649,18 @@ class VideoBackend:
                 raise RuntimeError(
                     "stable-diffusion.cpp could not be installed or started for MiniMax-H3."
                 )
-            if is_managed_binary(binary) and not sd_cpp_supports_minimax_h3(binary):
+            # is_managed_binary alone was enough while the vet sat immediately above this line:
+            # only an install can replace a copy we own, and nothing else had time to. With the vet
+            # hoisted above the download, a user-supplied binary (SD_CLI_PATH / UNSLOTH_SD_CPP_PATH)
+            # rebuilt during those tens of GB would reach the commit on nothing but version(), so
+            # a changed identity re-opens the question for an unmanaged build too. An unchanged
+            # file cannot have changed its answers, so the common case still costs no probe.
+            replaced = _sd_cli_identity(binary) != vetted_identity
+            recheck = is_managed_binary(binary) or replaced
+            if recheck and not sd_cpp_supports_minimax_h3(binary):
                 raise RuntimeError(
-                    "The stable-diffusion.cpp binary was replaced by an install that does not "
-                    "support MiniMax-H3. Try the load again."
+                    "The stable-diffusion.cpp binary changed while this model was loading and no "
+                    "longer advertises MiniMax-H3 support. Try the load again."
                 )
             # And re-ask the question native_device was decided on. H3 support alone is not
             # enough: a replacement can be H3-capable and still be a different accelerator, and
@@ -1624,12 +1672,12 @@ class VideoBackend:
             # there is no answer to have changed, and inventing one would refuse those loads.
             if (
                 listed_accelerator is not None
-                and is_managed_binary(binary)
+                and recheck
                 and sd_cpp_lists_accelerator_device(binary) != listed_accelerator
             ):
                 raise RuntimeError(
-                    "The stable-diffusion.cpp binary was replaced by an install for a different "
-                    "accelerator while this model was loading. Try the load again."
+                    "The stable-diffusion.cpp binary changed while this model was loading and is "
+                    "for a different accelerator. Try the load again."
                 )
             binary_identity = _sd_cli_identity(binary)
         requested_mode = normalize_memory_mode(memory_mode) or "auto"

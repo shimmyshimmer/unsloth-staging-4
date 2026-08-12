@@ -3081,6 +3081,202 @@ def test_h3_native_load_honors_install_switch_and_maps_xpu_to_vulkan(monkeypatch
     assert backend._state.device == "cpu"
 
 
+def _h3_load_with_no_usable_binary(monkeypatch, tmp_path, *, ensure):
+    """Drive an H3 native load whose binary cannot be produced, recording every download."""
+    from core.inference import video as video_mod
+    from core.inference import sd_cpp_backend
+
+    class _Api:
+        def __init__(self, **_kwargs):
+            pass
+
+        def model_info(self, *_args, **_kwargs):
+            return _PlanInfo([])
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+    monkeypatch.setattr(
+        video_mod,
+        "resolve_diffusion_device_target",
+        lambda: types.SimpleNamespace(backend = "cpu", device = "cpu", dtype = None),
+    )
+    monkeypatch.setattr(sd_cpp_backend, "_install_allowed", lambda: True)
+    monkeypatch.setattr(sd_cpp_backend, "ensure_h3_sd_cpp_binary", ensure)
+
+    downloads: list[str] = []
+
+    def _download(_repo, wanted, *_args, **_kwargs):
+        downloads.append(wanted)
+        path = tmp_path / Path(wanted).name
+        path.write_bytes(b"x")
+        return str(path)
+
+    monkeypatch.setattr("utils.hf_xet_fallback.hf_hub_download_with_xet_fallback", _download)
+
+    backend = VideoBackend()
+    fam = _detect_load_family("leejet/MiniMax-H3-GGUF", None, "minimax-h3")
+    assert fam is not None
+    return backend, fam, downloads
+
+
+def test_h3_native_load_claims_the_companion_repos_before_acquiring_the_binary(
+    monkeypatch, tmp_path
+):
+    # asset_repos is what stops the delete-cached guard dropping the H3 companion repos mid-load.
+    # Claiming them after acquisition left the whole install window open, and a delete admitted
+    # inside it is not revoked by claiming them afterwards.
+    from core.inference import video as video_mod
+    from core.inference import sd_cpp_backend
+
+    seen: list[tuple[str, ...]] = []
+
+    def _ensure(**_kwargs):
+        seen.append(backend._loading.asset_repos)
+        return "/existing/sd-cli"
+
+    backend, fam, _downloads = _h3_load_with_no_usable_binary(monkeypatch, tmp_path, ensure = _ensure)
+    backend._loading = video_mod._VideoLoadingState(
+        repo_id = "leejet/MiniMax-H3-GGUF", base_repo = fam.base_repo
+    )
+    backend._load_token = 7
+
+    class _Engine:
+        def __init__(self, binary):
+            self.binary = binary
+
+        def version(self):
+            return "stub-version"
+
+    monkeypatch.setattr(sd_cpp_backend, "sd_cpp_supports_minimax_h3", lambda _b: True)
+    monkeypatch.setattr(video_mod, "SdCppEngine", _Engine, raising = False)
+    from core.inference import sd_cpp_engine
+
+    monkeypatch.setattr(sd_cpp_engine, "SdCppEngine", _Engine)
+
+    backend._run_load_h3_native(
+        fam = fam,
+        token = 7,
+        cancel_event = threading.Event(),
+        repo_id = "leejet/MiniMax-H3-GGUF",
+        gguf_filename = "minimax_h3_fl2va-Q4_K_M.gguf",
+    )
+
+    from core.inference.video_minimax_h3 import H3_COMPONENT_REPO, H3_GGUF_REPO
+
+    assert seen == [(H3_GGUF_REPO, H3_COMPONENT_REPO)]
+
+
+def test_h3_native_load_stops_on_an_already_cancelled_load_before_acquiring(monkeypatch, tmp_path):
+    # The installer does not consume cancel_event and can spend minutes on a prebuilt, so an
+    # already-cancelled load must stop before it rather than leave that running for nobody.
+    ensures: list[dict] = []
+
+    def _ensure(**kwargs):
+        ensures.append(kwargs)
+        return "/existing/sd-cli"
+
+    backend, fam, downloads = _h3_load_with_no_usable_binary(monkeypatch, tmp_path, ensure = _ensure)
+    cancelled = threading.Event()
+    cancelled.set()
+
+    with pytest.raises(RuntimeError, match = VIDEO_CANCELLED_MSG):
+        backend._run_load_h3_native(
+            fam = fam,
+            token = None,
+            cancel_event = cancelled,
+            repo_id = "leejet/MiniMax-H3-GGUF",
+            gguf_filename = "minimax_h3_fl2va-Q4_K_M.gguf",
+        )
+    assert ensures == []
+    assert downloads == []
+    assert backend._state is None
+
+
+def test_h3_native_load_rejects_a_user_binary_swapped_during_the_download(monkeypatch, tmp_path):
+    # is_managed_binary alone gated the re-vet, because only an install can replace a copy we own
+    # and the vet used to sit right above it. Vetting before the download makes that window the
+    # whole bundle, so a user-supplied build rebuilt inside it would commit on version() alone.
+    from core.inference import video as video_mod
+    from core.inference import sd_cpp_backend, sd_cpp_engine
+
+    binary = tmp_path / "my-sd-cli"
+    binary.write_text("h3 build")
+
+    backend, fam, _downloads = _h3_load_with_no_usable_binary(
+        monkeypatch, tmp_path, ensure = lambda **_k: str(binary)
+    )
+    # Not ours, so the old guard skipped every re-check on it.
+    monkeypatch.setattr(sd_cpp_engine, "is_managed_binary", lambda _b: False)
+    monkeypatch.setattr(video_mod, "is_managed_binary", lambda _b: False, raising = False)
+
+    # The vetted answer came from the stubbed ensure; this is what the swapped-in build answers.
+    monkeypatch.setattr(sd_cpp_backend, "sd_cpp_supports_minimax_h3", lambda _b: False)
+
+    class _Engine:
+        def __init__(self, b):
+            self.binary = b
+
+        def version(self):
+            return "stub-version"
+
+    monkeypatch.setattr(sd_cpp_engine, "SdCppEngine", _Engine)
+
+    def _swap(_repo, wanted, *_args, **_kwargs):
+        # The swap lands mid-download, which is exactly the window the reorder opened.
+        binary.write_text("a different build entirely")
+        path = tmp_path / Path(wanted).name
+        path.write_bytes(b"x")
+        return str(path)
+
+    monkeypatch.setattr("utils.hf_xet_fallback.hf_hub_download_with_xet_fallback", _swap)
+
+    with pytest.raises(RuntimeError, match = "no longer advertises MiniMax-H3"):
+        backend._run_load_h3_native(
+            fam = fam,
+            token = None,
+            cancel_event = threading.Event(),
+            repo_id = "leejet/MiniMax-H3-GGUF",
+            gguf_filename = "minimax_h3_fl2va-Q4_K_M.gguf",
+        )
+    assert backend._state is None
+
+
+def test_h3_native_load_vets_the_binary_before_downloading_the_bundle(monkeypatch, tmp_path):
+    # The refusal says generation "would fail after the whole H3 bundle has downloaded". Running
+    # the check after the four-file download made it cost the very tens of GB it names.
+    def _refuse(**_kwargs):
+        raise RuntimeError("does not advertise MiniMax-H3 support")
+
+    backend, fam, downloads = _h3_load_with_no_usable_binary(monkeypatch, tmp_path, ensure = _refuse)
+    with pytest.raises(RuntimeError, match = "does not advertise MiniMax-H3"):
+        backend._run_load_h3_native(
+            fam = fam,
+            token = None,
+            cancel_event = threading.Event(),
+            repo_id = "leejet/MiniMax-H3-GGUF",
+            gguf_filename = "minimax_h3_fl2va-Q4_K_M.gguf",
+        )
+    assert downloads == []
+    assert backend._state is None
+
+
+def test_h3_native_load_refuses_a_missing_binary_before_downloading(monkeypatch, tmp_path):
+    # Same ordering for the other way it can be unusable: None (install off, failed, or no asset
+    # for this host), which nothing downstream of the download recovers either.
+    backend, fam, downloads = _h3_load_with_no_usable_binary(
+        monkeypatch, tmp_path, ensure = lambda **_kwargs: None
+    )
+    with pytest.raises(RuntimeError, match = "could not be installed or started"):
+        backend._run_load_h3_native(
+            fam = fam,
+            token = None,
+            cancel_event = threading.Event(),
+            repo_id = "leejet/MiniMax-H3-GGUF",
+            gguf_filename = "minimax_h3_fl2va-Q4_K_M.gguf",
+        )
+    assert downloads == []
+    assert backend._state is None
+
+
 def test_h3_native_cpu_fallback_releases_the_video_gpu_claim(monkeypatch, tmp_path):
     """The accelerator binary is missing, so the runtime commits to the CPU build and holds no
     VRAM; /video/load's VIDEO claim (taken off the non-CPU device target) must not survive it,
