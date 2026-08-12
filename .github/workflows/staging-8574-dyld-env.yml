@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# unslothai/unsloth#8574 (issue #8566). The unit tests monkeypatch
+# sys.platform, which can only prove the branch is taken -- not that dyld ends
+# up with a usable search path. This job installs a real llama.cpp runtime on
+# an Apple Silicon runner and inspects the environment llama-server is actually
+# launched with, at the fix AND at the pre-fix revision of that one file. The
+# pre-fix run must FAIL: an @loader_path-healthy bundle would otherwise make
+# both revisions look green and prove nothing.
+name: "staging-8574 dyld env (macOS)"
+
+on:
+  push:
+    branches: ["pr-8574-xplat-ci"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  dyld-env:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Unsloth (local, no torch)
+        uses: ./.github/actions/install-unsloth-local
+        with:
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+          hf-token: ''
+      - name: Record the installed runtime
+        run: |
+          set -x
+          BIN="$(find "${UNSLOTH_STUDIO_HOME:-$HOME/.unsloth/studio}" -name llama-server -type f | head -1)"
+          echo "binary=$BIN"
+          file "$BIN" || true
+          otool -L "$BIN" || true
+          otool -l "$BIN" | grep -A2 LC_RPATH || true
+          codesign -dv "$BIN" 2>&1 || true
+          ls -la "$(dirname "$BIN")"
+      - name: Assert the child environment (with the fix)
+        run: python .github/scripts/assert_llama_dyld_env.py
+      - name: Assert the same check FAILS before the fix
+        run: |
+          cp studio/backend/core/inference/llama_cpp.py /tmp/llama_cpp_fixed.py
+          git show origin/main:studio/backend/core/inference/llama_cpp.py \
+            > studio/backend/core/inference/llama_cpp.py
+          if python .github/scripts/assert_llama_dyld_env.py; then
+            cp /tmp/llama_cpp_fixed.py studio/backend/core/inference/llama_cpp.py
+            echo "::error::the pre-fix revision passed, so this job proves nothing"
+            exit 1
+          fi
+          cp /tmp/llama_cpp_fixed.py studio/backend/core/inference/llama_cpp.py
+          echo "pre-fix revision failed the check, as expected"
+      - name: Upload llama-server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dyld-env-logs
+          path: |
+            ~/.unsloth/studio/logs/**
+          if-no-files-found: ignore
