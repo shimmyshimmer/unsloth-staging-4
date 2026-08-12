@@ -111,18 +111,36 @@ struct NativeIntakeInner {
 pub struct NativeIntakeState {
     inner: Mutex<NativeIntakeInner>,
     lease_secret: Vec<u8>,
+    lease_secret_persisted: bool,
 }
 
 pub fn new_native_intake_state() -> NativeIntakeState {
+    // Per-install, not per-process: a backend adopted from a dead previous app
+    // still holds the key it was spawned with. See
+    // desktop_backend_owner::ensure_native_path_lease_secret. A home we cannot
+    // write to falls back to a process-local key, which is what this always was.
+    let (lease_secret, lease_secret_persisted) =
+        match crate::desktop_backend_owner::ensure_native_path_lease_secret() {
+            Ok(secret) => (secret, true),
+            Err(error) => {
+                log::warn!("Could not persist the native path lease secret: {error}");
+                (crate::native_backend_lease::new_lease_secret(), false)
+            }
+        };
     NativeIntakeState {
         inner: Mutex::new(NativeIntakeInner::default()),
-        lease_secret: crate::native_backend_lease::new_lease_secret(),
+        lease_secret,
+        lease_secret_persisted,
     }
 }
 
 impl NativeIntakeState {
     pub fn lease_secret_env(&self) -> String {
         encode_secret_env(&self.lease_secret)
+    }
+
+    pub fn lease_secret_persisted(&self) -> bool {
+        self.lease_secret_persisted
     }
 
     #[allow(dead_code)]
