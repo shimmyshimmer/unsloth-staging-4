@@ -1480,6 +1480,12 @@ class VideoBackend:
             sd_cpp_lists_accelerator_device,
         )
 
+        # The install underneath does not consume cancel_event and can spend minutes downloading
+        # and extracting the prebuilt, so a load cancelled before it starts must stop here. Running
+        # after the download loop, this method inherited that loop's own first cancel check;
+        # running before it, the check has to come along.
+        if cancel_event.is_set():
+            raise RuntimeError(VIDEO_CANCELLED_MSG)
         target = resolve_diffusion_device_target()
         allow_install = _install_allowed()
         # The H3-gated ensure, not the plain one: a build that predates H3 runs fine and so clears
@@ -1569,6 +1575,20 @@ class VideoBackend:
             (H3_COMPONENT_REPO, H3_VIDEO_VAE),
             (H3_COMPONENT_REPO, H3_AUDIO_VAE),
         )
+        # Publish what this load is about to pull BEFORE anything slow, binary acquisition
+        # included. asset_repos is what stops the delete-cached guard admitting a delete of the H3
+        # companion repos mid-load, and the acquisition can spend minutes installing the prebuilt:
+        # claiming them only afterwards leaves that whole window open, and a delete admitted inside
+        # it is not revoked by publishing them later. The byte estimate stays below, where the
+        # sizes are actually known.
+        with self._lock:
+            if self._load_token == token and self._loading is not None:
+                self._loading.base_repo = fam.base_repo
+                # The download list below pulls from the H3 companion repos too, and neither is
+                # repo_id or base_repo, so without this the delete-cached guard would let one be
+                # deleted out from under the in-flight load. The committed twin is loaded_repo_ids().
+                self._loading.asset_repos = (H3_GGUF_REPO, H3_COMPONENT_REPO)
+
         # BEFORE the download, which is the whole point of the H3-gated ensure. Its own refusal
         # says a build without H3 support "would fail after the whole H3 bundle has downloaded",
         # and resolving the four files first is exactly that: tens of GB spent to reach a check
@@ -1591,11 +1611,6 @@ class VideoBackend:
             total = 0
         with self._lock:
             if self._load_token == token and self._loading is not None:
-                self._loading.base_repo = fam.base_repo
-                # The download list below pulls from the H3 companion repos too, and neither is
-                # repo_id or base_repo, so without this the delete-cached guard would let one be
-                # deleted out from under the in-flight load. The committed twin is loaded_repo_ids().
-                self._loading.asset_repos = (H3_GGUF_REPO, H3_COMPONENT_REPO)
                 self._loading.expected_bytes = total or None
 
         resolved: list[Path] = []
