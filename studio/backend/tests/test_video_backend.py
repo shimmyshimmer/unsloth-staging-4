@@ -3081,6 +3081,84 @@ def test_h3_native_load_honors_install_switch_and_maps_xpu_to_vulkan(monkeypatch
     assert backend._state.device == "cpu"
 
 
+def _h3_load_with_no_usable_binary(monkeypatch, tmp_path, *, ensure):
+    """Drive an H3 native load whose binary cannot be produced, recording every download."""
+    from core.inference import video as video_mod
+    from core.inference import sd_cpp_backend
+
+    class _Api:
+        def __init__(self, **_kwargs):
+            pass
+
+        def model_info(self, *_args, **_kwargs):
+            return _PlanInfo([])
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+    monkeypatch.setattr(
+        video_mod,
+        "resolve_diffusion_device_target",
+        lambda: types.SimpleNamespace(backend = "cpu", device = "cpu", dtype = None),
+    )
+    monkeypatch.setattr(sd_cpp_backend, "_install_allowed", lambda: True)
+    monkeypatch.setattr(sd_cpp_backend, "ensure_h3_sd_cpp_binary", ensure)
+
+    downloads: list[str] = []
+
+    def _download(_repo, wanted, *_args, **_kwargs):
+        downloads.append(wanted)
+        path = tmp_path / Path(wanted).name
+        path.write_bytes(b"x")
+        return str(path)
+
+    monkeypatch.setattr("utils.hf_xet_fallback.hf_hub_download_with_xet_fallback", _download)
+
+    backend = VideoBackend()
+    fam = _detect_load_family("leejet/MiniMax-H3-GGUF", None, "minimax-h3")
+    assert fam is not None
+    return backend, fam, downloads
+
+
+def test_h3_native_load_vets_the_binary_before_downloading_the_bundle(monkeypatch, tmp_path):
+    # The H3-gated ensure exists to refuse a build that would abort on the first generation, and
+    # its own refusal says that would happen "after the whole H3 bundle has downloaded". Running
+    # it after the four-file download made that refusal cost the very tens of GB it names, on a
+    # check that needs no assets at all.
+    def _refuse(**_kwargs):
+        raise RuntimeError("does not advertise MiniMax-H3 support")
+
+    backend, fam, downloads = _h3_load_with_no_usable_binary(
+        monkeypatch, tmp_path, ensure = _refuse
+    )
+    with pytest.raises(RuntimeError, match = "does not advertise MiniMax-H3"):
+        backend._run_load_h3_native(
+            fam = fam,
+            token = None,
+            cancel_event = threading.Event(),
+            repo_id = "leejet/MiniMax-H3-GGUF",
+            gguf_filename = "minimax_h3_fl2va-Q4_K_M.gguf",
+        )
+    assert downloads == []
+    assert backend._state is None
+
+
+def test_h3_native_load_refuses_a_missing_binary_before_downloading(monkeypatch, tmp_path):
+    # Same ordering for the other way the binary can be unusable. None means the install was off,
+    # failed, or has no asset for this host, and nothing downstream of the download can recover it.
+    backend, fam, downloads = _h3_load_with_no_usable_binary(
+        monkeypatch, tmp_path, ensure = lambda **_kwargs: None
+    )
+    with pytest.raises(RuntimeError, match = "could not be installed or started"):
+        backend._run_load_h3_native(
+            fam = fam,
+            token = None,
+            cancel_event = threading.Event(),
+            repo_id = "leejet/MiniMax-H3-GGUF",
+            gguf_filename = "minimax_h3_fl2va-Q4_K_M.gguf",
+        )
+    assert downloads == []
+    assert backend._state is None
+
+
 def test_h3_native_cpu_fallback_releases_the_video_gpu_claim(monkeypatch, tmp_path):
     """The accelerator binary is missing, so the runtime commits to the CPU build and holds no
     VRAM; /video/load's VIDEO claim (taken off the non-CPU device target) must not survive it,
