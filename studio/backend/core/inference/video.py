@@ -1463,6 +1463,76 @@ class VideoBackend:
                 if self._load_token == token and self._loading is not None:
                     self._loading.error = redact_native_paths(str(exc))
 
+    def _h3_native_binary(
+        self, *, cancel_event: threading.Event
+    ) -> tuple[str, Optional[bool], str]:
+        """Produce the sd-cli the H3 runtime will run on, and the device decision made around it.
+
+        Split out of ``_run_load_h3_native`` so it can run BEFORE the four-file download. Returns
+        ``(native_device, listed_accelerator, binary)``; ``listed_accelerator`` is None when the
+        decision never consulted it, which is what the caller's claimed re-vet compares against.
+        Raises when no H3-capable binary can be produced.
+        """
+        from .diffusion_engine_router import _install_accelerator_for
+        from .sd_cpp_backend import (
+            _install_allowed,
+            ensure_h3_sd_cpp_binary,
+            sd_cpp_lists_accelerator_device,
+        )
+
+        target = resolve_diffusion_device_target()
+        allow_install = _install_allowed()
+        # The H3-gated ensure, not the plain one: a build that predates H3 runs fine and so clears
+        # the caller's version() gate, then aborts on the first generation, i.e. after the whole
+        # bundle has downloaded.
+        binary = ensure_h3_sd_cpp_binary(
+            allow_install = allow_install,
+            accelerator = _install_accelerator_for(target.backend),
+        )
+        native_device = target.device
+        # What the accelerator decision below was made on, or None when it was never asked (a CPU
+        # or MPS target never consults it). Re-checked under the reader claim, so a replacement
+        # that arrives mid-load cannot silently change the answer this device choice rests on.
+        listed_accelerator: Optional[bool] = None
+        if target.backend not in ("cpu", "mps"):
+            # Under the claim, like the recheck. This probe SPAWNS the managed sd-cli, so leaving
+            # it unclaimed lets an install started by another in-process load extract over the
+            # executing binary: on Windows that fails on the locked file, on Linux it can leave
+            # the replacement half-written. The later claimed recheck cannot undo damage this
+            # first probe already allowed.
+            from .sd_cpp_backend import _tree_reader as _claim_tree
+            with _claim_tree(binary, cancel_event, VIDEO_CANCELLED_MSG):
+                listed_accelerator = sd_cpp_lists_accelerator_device(binary)
+        if target.backend not in ("cpu", "mps") and not listed_accelerator:
+            # Upstream currently publishes no Linux CUDA archive. Keep the picker
+            # functional with the CPU prebuilt when the user has not supplied a
+            # locally compiled CUDA binary through the normal sd.cpp discovery path.
+            #
+            # The test is what the binary actually offers, not whether one was returned: the
+            # accelerator install fails only ONCE, and every later load finds the CPU binary this
+            # branch put there and gets it back unchanged. "binary is truthy" therefore skipped
+            # the fallback from the second load on, left native_device on the GPU, and applied GPU
+            # offload policy and held the VIDEO claim while sd-cli ran wholly on the CPU -- so the
+            # next chat/image acquire evicted a model to make room for one that was never there.
+            binary = ensure_h3_sd_cpp_binary(allow_install = allow_install, accelerator = "cpu")
+            native_device = "cpu"
+            # The baseline this branch is compared against is the DECISION, not a fresh probe of
+            # what came back. An install can replace the returned CPU binary with a GPU build
+            # between that ensure and this line, and probing here would record ITS answer -- after
+            # which the caller's re-check under the claim compares the replacement against itself,
+            # passes, and commits CPU resource accounting around a CUDA executable that runs on
+            # VRAM nothing accounted for. native_device is "cpu" precisely because the build must
+            # offer no accelerator device, so that -- False -- is what the claim has to still find.
+            listed_accelerator = False
+        if not binary:
+            # The same message the caller's claimed re-vet raises, just before the download rather
+            # than after it. Nothing downstream can recover a binary that could not be produced, so
+            # there is no reason to spend the bundle first.
+            raise RuntimeError(
+                "stable-diffusion.cpp could not be installed or started for MiniMax-H3."
+            )
+        return native_device, listed_accelerator, binary
+
     def _run_load_h3_native(
         self,
         *,
@@ -1479,12 +1549,7 @@ class VideoBackend:
         from huggingface_hub import HfApi
 
         from .sd_cpp_args import SdCppModelFiles, offload_flags
-        from .diffusion_engine_router import _install_accelerator_for
-        from .sd_cpp_backend import (
-            _install_allowed,
-            ensure_h3_sd_cpp_binary,
-            sd_cpp_lists_accelerator_device,
-        )
+        from .sd_cpp_backend import sd_cpp_lists_accelerator_device
         from .sd_cpp_engine import SdCppEngine
         from .video_minimax_h3 import (
             H3_AUDIO_VAE,
@@ -1504,6 +1569,14 @@ class VideoBackend:
             (H3_COMPONENT_REPO, H3_VIDEO_VAE),
             (H3_COMPONENT_REPO, H3_AUDIO_VAE),
         )
+        # BEFORE the download, which is the whole point of the H3-gated ensure. Its own refusal
+        # says a build without H3 support "would fail after the whole H3 bundle has downloaded",
+        # and resolving the four files first is exactly that: tens of GB spent to reach a check
+        # that needs no assets at all. Nothing here depends on the downloaded paths.
+        native_device, listed_accelerator, binary = self._h3_native_binary(
+            cancel_event = cancel_event
+        )
+
         total = 0
         try:
             api = HfApi(token = hf_token or None)
@@ -1550,50 +1623,6 @@ class VideoBackend:
                     raise h3_download_error(repo, wanted, exc) from exc
             resolved.append(local)
 
-        target = resolve_diffusion_device_target()
-        allow_install = _install_allowed()
-        # The H3-gated ensure, not the plain one: a build that predates H3 runs fine and so clears
-        # the version() gate below, then aborts on the first generation, i.e. after the whole
-        # bundle has downloaded.
-        binary = ensure_h3_sd_cpp_binary(
-            allow_install = allow_install,
-            accelerator = _install_accelerator_for(target.backend),
-        )
-        native_device = target.device
-        # What the accelerator decision below was made on, or None when it was never asked (a CPU
-        # or MPS target never consults it). Re-checked under the reader claim, so a replacement
-        # that arrives mid-load cannot silently change the answer this device choice rests on.
-        listed_accelerator: Optional[bool] = None
-        if target.backend not in ("cpu", "mps"):
-            # Under the claim, like the recheck. This probe SPAWNS the managed sd-cli, so leaving
-            # it unclaimed lets an install started by another in-process load extract over the
-            # executing binary: on Windows that fails on the locked file, on Linux it can leave
-            # the replacement half-written. The later claimed recheck cannot undo damage this
-            # first probe already allowed.
-            from .sd_cpp_backend import _tree_reader as _claim_tree
-            with _claim_tree(binary, cancel_event, VIDEO_CANCELLED_MSG):
-                listed_accelerator = sd_cpp_lists_accelerator_device(binary)
-        if target.backend not in ("cpu", "mps") and not listed_accelerator:
-            # Upstream currently publishes no Linux CUDA archive. Keep the picker
-            # functional with the CPU prebuilt when the user has not supplied a
-            # locally compiled CUDA binary through the normal sd.cpp discovery path.
-            #
-            # The test is what the binary actually offers, not whether one was returned: the
-            # accelerator install fails only ONCE, and every later load finds the CPU binary this
-            # branch put there and gets it back unchanged. "binary is truthy" therefore skipped
-            # the fallback from the second load on, left native_device on the GPU, and applied GPU
-            # offload policy and held the VIDEO claim while sd-cli ran wholly on the CPU -- so the
-            # next chat/image acquire evicted a model to make room for one that was never there.
-            binary = ensure_h3_sd_cpp_binary(allow_install = allow_install, accelerator = "cpu")
-            native_device = "cpu"
-            # The baseline this branch is compared against is the DECISION, not a fresh probe of
-            # what came back. An install can replace the returned CPU binary with a GPU build
-            # between that ensure and this line, and probing here would record ITS answer -- after
-            # which the re-check under the claim below compares the replacement against itself,
-            # passes, and commits CPU resource accounting around a CUDA executable that runs on
-            # VRAM nothing accounted for. native_device is "cpu" precisely because the build must
-            # offer no accelerator device, so that -- False -- is what the claim has to still find.
-            listed_accelerator = False
         engine = SdCppEngine(binary)
         # Re-vet and take the identity under ONE reader claim. ensure_h3_sd_cpp_binary checked the
         # file it returned, but an install can start between that return and this line, and an
