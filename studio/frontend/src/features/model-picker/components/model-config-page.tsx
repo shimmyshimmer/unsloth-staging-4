@@ -23,6 +23,11 @@ import {
 } from "@/features/chat";
 import { prepareHfTokenForUse } from "@/features/hf-auth";
 import {
+  type VramBudgetSettings,
+  loadVramBudgetSettings,
+  updateVramBudgetSettings,
+} from "@/features/settings/api/vram-budget";
+import {
   type GpuIndexKind,
   type SystemGpuDevice,
   cachedPinnableGpuContext,
@@ -77,6 +82,8 @@ import {
   saveAdvancedSettingsOpen,
   savePerModelConfig,
   subscribeAdvancedSettingsOpen,
+  vramFractionToPercent,
+  vramPercentToFraction,
 } from "../model-config/per-model-config";
 import { ChatTemplateEditorDialog } from "./chat-template-editor-dialog";
 import type { ModelPickTarget } from "./model-selector/types";
@@ -333,6 +340,144 @@ function AdvancedGpuSlider({
   );
 }
 
+// How much of each card a load may claim. Unlike everything else in this panel this
+// is a SERVER-WIDE setting, not a per-model override: it replaces two constants the
+// fit reads, so there is nothing per-model to attach it to. The label says so.
+//
+// Driven in whole percent so a dragged value round-trips exactly and reuses
+// AdvancedGpuSlider's step of 1; the fraction is rebuilt at the API boundary.
+function VramBudgetRow() {
+  // Every branch that reads the budget is gated on a discrete GPU. macOS reports
+  // none (_get_gpu_memory returns [] there), so the Metal path sizes itself from
+  // _APPLE_UNIFIED_MEMORY_FRACTION and calls the context fitter with
+  // budget_frac = 1.0, and this slider cannot move anything. Showing it anyway
+  // would promise "applies on the next load" for a setting Macs ignore, and the
+  // reload hint would fire for a reload that changes nothing.
+  const isMac = usePlatformStore((s) => s.deviceType === "mac");
+  const [settings, setSettings] = useState<VramBudgetSettings | null>(null);
+  const [percent, setPercent] = useState<number | null>(null);
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Fraction a debounced save has not sent yet, so unmount can flush it instead of
+  // dropping it. Cleared the moment the PUT is issued.
+  const pendingFraction = useRef<number | null>(null);
+  const adviceId = useId();
+
+  useEffect(() => {
+    let cancelled = false;
+    if (isMac) {
+      // Nothing to show, so do not even ask; the row is hidden below.
+      return;
+    }
+    loadVramBudgetSettings().then((loaded) => {
+      if (cancelled || !loaded) {
+        return;
+      }
+      setSettings(loaded);
+      setPercent(vramFractionToPercent(loaded.fraction));
+    });
+    return () => {
+      cancelled = true;
+    };
+    // deviceType settles once /api/health answers, so re-run if the seed guess flips.
+  }, [isMac]);
+
+  // Flush, don't drop. The timer is cleared so nothing fires against a torn-down
+  // view, but the pending fraction is still sent: this is a server-wide setting
+  // held nowhere else, so a drag followed within the debounce window by Run, by
+  // the Advanced toggle, or by closing the panel would otherwise be discarded with
+  // no way to get it back. The view is gone, so the response only reaches the
+  // subscribers, not this component's state.
+  useEffect(
+    () => () => {
+      if (saveTimer.current) {
+        clearTimeout(saveTimer.current);
+        saveTimer.current = null;
+      }
+      const fraction = pendingFraction.current;
+      pendingFraction.current = null;
+      if (fraction === null) {
+        return;
+      }
+      updateVramBudgetSettings(fraction).catch((error: unknown) => {
+        toast.error(
+          error instanceof Error ? error.message : "Failed to save VRAM budget",
+        );
+      });
+    },
+    [],
+  );
+
+  // A null response means the backend predates this endpoint; hide rather than
+  // render a control that cannot save.
+  if (isMac || !settings || percent === null) {
+    return null;
+  }
+
+  const defaultPercent = vramFractionToPercent(settings.defaultFraction);
+  const commit = (next: number) => {
+    setPercent(next);
+    // The slider fires on every pointer move, so debounce: otherwise one drag is
+    // dozens of writes, each invalidating the read cache.
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current);
+    }
+    pendingFraction.current = vramPercentToFraction(next);
+    saveTimer.current = setTimeout(() => {
+      saveTimer.current = null;
+      const fraction = pendingFraction.current;
+      pendingFraction.current = null;
+      if (fraction === null) {
+        return;
+      }
+      updateVramBudgetSettings(fraction)
+        .then(setSettings)
+        .catch((error: unknown) => {
+          toast.error(
+            error instanceof Error ? error.message : "Failed to save VRAM budget",
+          );
+        });
+    }, 400);
+  };
+
+  return (
+    <div className="space-y-2">
+      <AdvancedGpuSlider
+        label="VRAM Budget"
+        value={percent}
+        min={vramFractionToPercent(settings.minFraction)}
+        max={vramFractionToPercent(settings.maxFraction)}
+        onChange={commit}
+        info={
+          <div className="flex flex-col gap-1.5">
+            <div>
+              Share of each GPU Unsloth will claim when it sizes the model and
+              context. The rest is left for memory fragmentation, the per-device
+              CUDA context on a multi-GPU split, and MoE routing.
+            </div>
+            <div>
+              Applies to every model, not just this one, and takes effect on the
+              next load. Default {defaultPercent}%.
+            </div>
+          </div>
+        }
+      />
+      {percent !== defaultPercent && (
+        <p id={adviceId} className="text-ui-11 text-amber-500">
+          {percent > defaultPercent
+            ? "Above the default fits more context but leaves less slack, so a load can run out of memory. llama.cpp treats that as a hard failure rather than falling back."
+            : "Below the default is safer on a shared GPU, but a tight fit may push layers onto the CPU and generate slowly."}
+        </p>
+      )}
+      {settings.reloadRequired && (
+        <p className="text-ui-11 text-muted-foreground">
+          The loaded model was sized with a different budget. Reload it to apply
+          this one.
+        </p>
+      )}
+    </div>
+  );
+}
+
 // GPU Memory placement controls (mode / GPU Layers / MoE offload / GPU picker), GGUF only.
 // Slider ceilings come from the GGUF header dims; --tensor-split is not persisted per model.
 function GpuMemorySettings({
@@ -435,6 +580,9 @@ function GpuMemorySettings({
           </SelectContent>
         </Select>
       </div>
+      {/* Sits with the GPU controls but applies in Default mode too: the budget
+          drives the auto-fit, which is exactly what Manual mode opts out of. */}
+      {!isDiffusion && <VramBudgetRow />}
       {!isDiffusion && isManual && (
         <>
           <AdvancedGpuSlider
