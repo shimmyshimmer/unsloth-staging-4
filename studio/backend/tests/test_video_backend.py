@@ -3191,6 +3191,55 @@ def test_h3_native_load_stops_on_an_already_cancelled_load_before_acquiring(monk
     assert backend._state is None
 
 
+def test_h3_native_load_rejects_a_user_binary_swapped_during_the_download(monkeypatch, tmp_path):
+    # is_managed_binary alone gated the re-vet, because only an install can replace a copy we own
+    # and the vet used to sit right above it. Vetting before the download makes that window the
+    # whole bundle, so a user-supplied build rebuilt inside it would commit on version() alone.
+    from core.inference import video as video_mod
+    from core.inference import sd_cpp_backend, sd_cpp_engine
+
+    binary = tmp_path / "my-sd-cli"
+    binary.write_text("h3 build")
+
+    backend, fam, _downloads = _h3_load_with_no_usable_binary(
+        monkeypatch, tmp_path, ensure = lambda **_k: str(binary)
+    )
+    # Not ours, so the old guard skipped every re-check on it.
+    monkeypatch.setattr(sd_cpp_engine, "is_managed_binary", lambda _b: False)
+    monkeypatch.setattr(video_mod, "is_managed_binary", lambda _b: False, raising = False)
+
+    # The vetted answer came from the stubbed ensure; this is what the swapped-in build answers.
+    monkeypatch.setattr(sd_cpp_backend, "sd_cpp_supports_minimax_h3", lambda _b: False)
+
+    class _Engine:
+        def __init__(self, b):
+            self.binary = b
+
+        def version(self):
+            return "stub-version"
+
+    monkeypatch.setattr(sd_cpp_engine, "SdCppEngine", _Engine)
+
+    def _swap(_repo, wanted, *_args, **_kwargs):
+        # The swap lands mid-download, which is exactly the window the reorder opened.
+        binary.write_text("a different build entirely")
+        path = tmp_path / Path(wanted).name
+        path.write_bytes(b"x")
+        return str(path)
+
+    monkeypatch.setattr("utils.hf_xet_fallback.hf_hub_download_with_xet_fallback", _swap)
+
+    with pytest.raises(RuntimeError, match = "no longer advertises MiniMax-H3"):
+        backend._run_load_h3_native(
+            fam = fam,
+            token = None,
+            cancel_event = threading.Event(),
+            repo_id = "leejet/MiniMax-H3-GGUF",
+            gguf_filename = "minimax_h3_fl2va-Q4_K_M.gguf",
+        )
+    assert backend._state is None
+
+
 def test_h3_native_load_vets_the_binary_before_downloading_the_bundle(monkeypatch, tmp_path):
     # The refusal says generation "would fail after the whole H3 bundle has downloaded". Running
     # the check after the four-file download made it cost the very tens of GB it names.

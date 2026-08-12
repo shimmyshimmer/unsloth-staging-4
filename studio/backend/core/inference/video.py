@@ -1465,13 +1465,13 @@ class VideoBackend:
 
     def _h3_native_binary(
         self, *, cancel_event: threading.Event
-    ) -> tuple[str, Optional[bool], str]:
+    ) -> tuple[str, Optional[bool], str, Optional[tuple[int, int]]]:
         """Produce the sd-cli the H3 runtime will run on, and the device decision made around it.
 
         Split out of ``_run_load_h3_native`` so it can run BEFORE the four-file download. Returns
-        ``(native_device, listed_accelerator, binary)``; ``listed_accelerator`` is None when the
-        decision never consulted it, which is what the caller's claimed re-vet compares against.
-        Raises when no H3-capable binary can be produced.
+        ``(native_device, listed_accelerator, binary, identity)``; ``listed_accelerator`` is None
+        when the decision never consulted it, and both it and ``identity`` are what the caller's
+        claimed re-vet compares against. Raises when no H3-capable binary can be produced.
         """
         from .diffusion_engine_router import _install_accelerator_for
         from .sd_cpp_backend import (
@@ -1535,7 +1535,9 @@ class VideoBackend:
             raise RuntimeError(
                 "stable-diffusion.cpp could not be installed or started for MiniMax-H3."
             )
-        return native_device, listed_accelerator, binary
+        # The identity of the file these answers came from, so the caller can tell "same build" from
+        # "something replaced it" across the download without re-probing an unchanged one.
+        return native_device, listed_accelerator, binary, _sd_cli_identity(binary)
 
     def _run_load_h3_native(
         self,
@@ -1587,7 +1589,7 @@ class VideoBackend:
         # BEFORE the download, which is the whole point of the H3-gated ensure: its own refusal
         # says a build without H3 support "would fail after the whole H3 bundle has downloaded".
         # Nothing in here depends on the resolved paths.
-        native_device, listed_accelerator, binary = self._h3_native_binary(
+        native_device, listed_accelerator, binary, vetted_identity = self._h3_native_binary(
             cancel_event = cancel_event
         )
 
@@ -1647,10 +1649,18 @@ class VideoBackend:
                 raise RuntimeError(
                     "stable-diffusion.cpp could not be installed or started for MiniMax-H3."
                 )
-            if is_managed_binary(binary) and not sd_cpp_supports_minimax_h3(binary):
+            # is_managed_binary alone was enough while the vet sat immediately above this line:
+            # only an install can replace a copy we own, and nothing else had time to. With the vet
+            # hoisted above the download, a user-supplied binary (SD_CLI_PATH / UNSLOTH_SD_CPP_PATH)
+            # rebuilt during those tens of GB would reach the commit on nothing but version(), so
+            # a changed identity re-opens the question for an unmanaged build too. An unchanged
+            # file cannot have changed its answers, so the common case still costs no probe.
+            replaced = _sd_cli_identity(binary) != vetted_identity
+            recheck = is_managed_binary(binary) or replaced
+            if recheck and not sd_cpp_supports_minimax_h3(binary):
                 raise RuntimeError(
-                    "The stable-diffusion.cpp binary was replaced by an install that does not "
-                    "support MiniMax-H3. Try the load again."
+                    "The stable-diffusion.cpp binary changed while this model was loading and no "
+                    "longer advertises MiniMax-H3 support. Try the load again."
                 )
             # And re-ask the question native_device was decided on. H3 support alone is not
             # enough: a replacement can be H3-capable and still be a different accelerator, and
@@ -1662,12 +1672,12 @@ class VideoBackend:
             # there is no answer to have changed, and inventing one would refuse those loads.
             if (
                 listed_accelerator is not None
-                and is_managed_binary(binary)
+                and recheck
                 and sd_cpp_lists_accelerator_device(binary) != listed_accelerator
             ):
                 raise RuntimeError(
-                    "The stable-diffusion.cpp binary was replaced by an install for a different "
-                    "accelerator while this model was loading. Try the load again."
+                    "The stable-diffusion.cpp binary changed while this model was loading and is "
+                    "for a different accelerator. Try the load again."
                 )
             binary_identity = _sd_cli_identity(binary)
         requested_mode = normalize_memory_mode(memory_mode) or "auto"
