@@ -3126,9 +3126,7 @@ def test_h3_native_load_vets_the_binary_before_downloading_the_bundle(monkeypatc
     def _refuse(**_kwargs):
         raise RuntimeError("does not advertise MiniMax-H3 support")
 
-    backend, fam, downloads = _h3_load_with_no_usable_binary(
-        monkeypatch, tmp_path, ensure = _refuse
-    )
+    backend, fam, downloads = _h3_load_with_no_usable_binary(monkeypatch, tmp_path, ensure = _refuse)
     with pytest.raises(RuntimeError, match = "does not advertise MiniMax-H3"):
         backend._run_load_h3_native(
             fam = fam,
