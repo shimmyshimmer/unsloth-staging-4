@@ -3121,10 +3121,9 @@ def _h3_load_with_no_usable_binary(monkeypatch, tmp_path, *, ensure):
 def test_h3_native_load_claims_the_companion_repos_before_acquiring_the_binary(
     monkeypatch, tmp_path
 ):
-    # asset_repos is what stops the delete-cached guard admitting a delete of the H3 companion
-    # repos while this load is pulling from them, and acquiring the binary can spend minutes
-    # installing the prebuilt. Claiming them after that call left the whole install window open,
-    # and a delete admitted inside it is not revoked by claiming them afterwards.
+    # asset_repos is what stops the delete-cached guard dropping the H3 companion repos mid-load.
+    # Claiming them after acquisition left the whole install window open, and a delete admitted
+    # inside it is not revoked by claiming them afterwards.
     from core.inference import video as video_mod
     from core.inference import sd_cpp_backend
 
@@ -3167,10 +3166,8 @@ def test_h3_native_load_claims_the_companion_repos_before_acquiring_the_binary(
 
 
 def test_h3_native_load_stops_on_an_already_cancelled_load_before_acquiring(monkeypatch, tmp_path):
-    # The installer under ensure_h3_sd_cpp_binary does not consume cancel_event and can spend
-    # minutes downloading a prebuilt. Acquiring after the download loop, this path inherited that
-    # loop's first cancel check; acquiring before it, an already-cancelled load must still stop
-    # rather than leave an install running for a load nobody is waiting on.
+    # The installer does not consume cancel_event and can spend minutes on a prebuilt, so an
+    # already-cancelled load must stop before it rather than leave that running for nobody.
     ensures: list[dict] = []
 
     def _ensure(**kwargs):
@@ -3195,10 +3192,8 @@ def test_h3_native_load_stops_on_an_already_cancelled_load_before_acquiring(monk
 
 
 def test_h3_native_load_vets_the_binary_before_downloading_the_bundle(monkeypatch, tmp_path):
-    # The H3-gated ensure exists to refuse a build that would abort on the first generation, and
-    # its own refusal says that would happen "after the whole H3 bundle has downloaded". Running
-    # it after the four-file download made that refusal cost the very tens of GB it names, on a
-    # check that needs no assets at all.
+    # The refusal says generation "would fail after the whole H3 bundle has downloaded". Running
+    # the check after the four-file download made it cost the very tens of GB it names.
     def _refuse(**_kwargs):
         raise RuntimeError("does not advertise MiniMax-H3 support")
 
@@ -3216,8 +3211,8 @@ def test_h3_native_load_vets_the_binary_before_downloading_the_bundle(monkeypatc
 
 
 def test_h3_native_load_refuses_a_missing_binary_before_downloading(monkeypatch, tmp_path):
-    # Same ordering for the other way the binary can be unusable. None means the install was off,
-    # failed, or has no asset for this host, and nothing downstream of the download can recover it.
+    # Same ordering for the other way it can be unusable: None (install off, failed, or no asset
+    # for this host), which nothing downstream of the download recovers either.
     backend, fam, downloads = _h3_load_with_no_usable_binary(
         monkeypatch, tmp_path, ensure = lambda **_kwargs: None
     )

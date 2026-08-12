@@ -1480,10 +1480,9 @@ class VideoBackend:
             sd_cpp_lists_accelerator_device,
         )
 
-        # The install underneath does not consume cancel_event and can spend minutes downloading
-        # and extracting the prebuilt, so a load cancelled before it starts must stop here. Running
-        # after the download loop, this method inherited that loop's own first cancel check;
-        # running before it, the check has to come along.
+        # The install underneath does not consume cancel_event and can spend minutes fetching the
+        # prebuilt. Running after the download loop this inherited that loop's first cancel check;
+        # running before it, the check comes along.
         if cancel_event.is_set():
             raise RuntimeError(VIDEO_CANCELLED_MSG)
         target = resolve_diffusion_device_target()
@@ -1531,9 +1530,8 @@ class VideoBackend:
             # offer no accelerator device, so that -- False -- is what the claim has to still find.
             listed_accelerator = False
         if not binary:
-            # The same message the caller's claimed re-vet raises, just before the download rather
-            # than after it. Nothing downstream can recover a binary that could not be produced, so
-            # there is no reason to spend the bundle first.
+            # The caller's claimed re-vet raises this too; nothing downstream can recover a binary
+            # that could not be produced, so there is no reason to spend the bundle first.
             raise RuntimeError(
                 "stable-diffusion.cpp could not be installed or started for MiniMax-H3."
             )
@@ -1575,12 +1573,9 @@ class VideoBackend:
             (H3_COMPONENT_REPO, H3_VIDEO_VAE),
             (H3_COMPONENT_REPO, H3_AUDIO_VAE),
         )
-        # Publish what this load is about to pull BEFORE anything slow, binary acquisition
-        # included. asset_repos is what stops the delete-cached guard admitting a delete of the H3
-        # companion repos mid-load, and the acquisition can spend minutes installing the prebuilt:
-        # claiming them only afterwards leaves that whole window open, and a delete admitted inside
-        # it is not revoked by publishing them later. The byte estimate stays below, where the
-        # sizes are actually known.
+        # Claimed BEFORE anything slow, acquisition included: that can spend minutes installing the
+        # prebuilt, and a delete the guard admits inside that window is not revoked by claiming the
+        # repos afterwards. The byte estimate stays below, where the sizes are known.
         with self._lock:
             if self._load_token == token and self._loading is not None:
                 self._loading.base_repo = fam.base_repo
@@ -1589,10 +1584,9 @@ class VideoBackend:
                 # deleted out from under the in-flight load. The committed twin is loaded_repo_ids().
                 self._loading.asset_repos = (H3_GGUF_REPO, H3_COMPONENT_REPO)
 
-        # BEFORE the download, which is the whole point of the H3-gated ensure. Its own refusal
-        # says a build without H3 support "would fail after the whole H3 bundle has downloaded",
-        # and resolving the four files first is exactly that: tens of GB spent to reach a check
-        # that needs no assets at all. Nothing here depends on the downloaded paths.
+        # BEFORE the download, which is the whole point of the H3-gated ensure: its own refusal
+        # says a build without H3 support "would fail after the whole H3 bundle has downloaded".
+        # Nothing in here depends on the resolved paths.
         native_device, listed_accelerator, binary = self._h3_native_binary(
             cancel_event = cancel_event
         )
