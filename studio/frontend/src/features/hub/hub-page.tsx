@@ -25,6 +25,8 @@ import {
   useActiveModelConfig,
 } from "@/features/model-picker";
 import { loadOpenAIAutoSwitchSettings } from "@/features/settings";
+import { taskForMediaPick } from "@/features/model-picker/components/model-selector/audio-picker-policy";
+import { diffusionRouteSearch } from "@/lib/diffusion-route-search";
 import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { useGpuInfo, useInferenceGpuInfo } from "@/hooks/use-gpu-info";
 import { toast } from "@/lib/toast";
@@ -97,6 +99,7 @@ import {
   isHiddenModelId,
 } from "./lib/hidden-models";
 import { inventoryRowMatches, tokenizeQuery } from "./lib/inventory-search";
+import { looksLikeLocalPath } from "./lib/local-path";
 import {
   ggufVariantsMatch,
   modelIdsMatch,
@@ -107,6 +110,7 @@ import {
   matchesModelType,
 } from "./lib/model-type-filter";
 import { resolveOwnerProviderLogo } from "./lib/provider-logos";
+import { studioPageForTask } from "./lib/unsloth-support";
 import { fingerprintToken } from "./lib/token-fingerprint";
 import {
   buildDiscoverRows,
@@ -1277,6 +1281,39 @@ export function ModelsPage() {
     (opts: ModelLoadOptions, isDownloaded: boolean) => {
       if (!selectedModel) return;
       const runId = selectedModel.resource.runId;
+      // An image / video model is run by its own page, not by chat. Loading it here started
+      // a llama.cpp load that could only fail ("llama-server failed to start") after evicting
+      // whatever chat had resident, and dropped the user in a chat that could never answer.
+      // Same destination and params the chat picker already routes its media picks to.
+      // pipelineTag alone would never fire for the rows this is FOR: only CachedModelRepo
+      // carries it, so every cached GGUF repo (the reported MiniMax-H3 case included)
+      // reports its modality on `task` instead and would have gone to chat regardless.
+      // Same resolution the chat picker uses, so both surfaces route a pick identically.
+      const mediaPage = studioPageForTask(
+        taskForMediaPick(selectedModel.pipelineTag, selectedModel.task) ?? undefined,
+      );
+      // A local row's runId is a filesystem path, and the target pages read a routed
+      // `model` as a Hub id (their own local branch splits directory + filename first),
+      // so a path sent through here would arrive as a repo that does not exist. Those keep
+      // today's route; the backend preflight now refuses them by name instead of letting
+      // llama-server fail opaquely.
+      // A cached repo whose id does not resolve on its own -- one outside the active HF
+      // cache, or whose default ref names no whole quant -- is pinned by the inventory to
+      // its snapshot directory, so runId is an absolute path on a row that is not `local`.
+      // The target pages reject that: a snapshot entry is a symlink into the sibling blobs
+      // dir, and the containment check refuses a child resolving outside the repo root. The
+      // Hub id loads the SAME copy, since the loader reuses whichever cache root holds it.
+      const routeId = runId && !looksLikeLocalPath(runId) ? runId : selectedModel.hubRepoId;
+      if (mediaPage && selectedModel.kind !== "local" && routeId) {
+        void navigate({
+          to: `/${mediaPage}`,
+          // `quant` is consumed verbatim as a gguf filename, so a label rides `ggufQuant`.
+          search: diffusionRouteSearch(routeId, {
+            ggufVariant: opts.ggufVariant ?? null,
+          }),
+        });
+        return;
+      }
       const configIdentity = modelConfigIdentity(
         selectedModel.kind,
         selectedModel.resource,
@@ -1313,7 +1350,7 @@ export function ModelsPage() {
         .catch(() => undefined);
       openNewChat();
     },
-    [openNewChat, selectModel, selectedModel],
+    [navigate, openNewChat, selectModel, selectedModel],
   );
   const handleLoad = useCallback(
     (opts: ModelLoadOptions) =>

@@ -1873,6 +1873,53 @@ def _gguf_files_for_variant(files: Iterable[str], variant: str) -> list[str]:
     return sorted(f for f in main_files if boundary.search(f.lower()))
 
 
+def _resolve_variant_gguf_files(
+    hf_repo: str,
+    hf_variant: Optional[str],
+    hf_token: Optional[str] = None,
+) -> tuple[Optional[str], list[str]]:
+    """Which file in ``hf_repo`` this variant means, plus its extra shards.
+
+    The repo listing first, the local HF cache when the Hub cannot be asked, and finally a
+    name synthesised from the repo id. Every tier fails soft: ``(None, [])`` means "no
+    opinion", not "no such file". Lives out here rather than inside ``_download_gguf`` so
+    the pre-teardown header probe asks the question exactly the way the download will
+    answer it -- two implementations of this cascade would let the file the probe judged
+    drift from the file the load opens.
+    """
+    gguf_filename: Optional[str] = None
+    gguf_extra_shards: list[str] = []
+    if not hf_variant:
+        return None, []
+    try:
+        from huggingface_hub import list_repo_files
+
+        files = list_repo_files(hf_repo, token = hf_token)
+        gguf_files = _gguf_files_for_variant(files, hf_variant)
+        if gguf_files:
+            gguf_filename = gguf_files[0]
+            gguf_extra_shards = _gguf_extra_shards(gguf_files, gguf_filename)
+    except Exception as e:
+        logger.warning(f"Could not list repo files: {e}")
+
+    # Fall back to the local cache when the repo listing is unavailable.
+    if not gguf_filename:
+        cached_name, cached_shards = _cached_variant_resolution(hf_repo, hf_variant)
+        if cached_name:
+            gguf_filename = cached_name
+            gguf_extra_shards = cached_shards
+            logger.info(
+                "Resolved variant %s -> %s from local HF cache",
+                hf_variant,
+                gguf_filename,
+            )
+
+    if not gguf_filename:
+        repo_name = hf_repo.split("/")[-1].replace("-GGUF", "")
+        gguf_filename = f"{repo_name}-{hf_variant}.gguf"
+    return gguf_filename, gguf_extra_shards
+
+
 # Below this many B params, draft-mtp regresses vs spec-off (bench in
 # _build_speculative_flags); auto mode drops MTP under it.
 _MTP_MIN_SIZE_B = 3.0
@@ -3324,6 +3371,9 @@ class LlamaCppBackend:
         # runner, not llama-server. Set from the GGUF architecture at load.
         self._architecture: Optional[str] = None
         self._is_diffusion: bool = False
+        # Whether the last _read_gguf_metadata walked the whole header without failing.
+        # Separates "declares no architecture" from "could not be read" (see the preflight).
+        self._gguf_header_parsed: bool = False
         self._diffusion_visual_bin: Optional[str] = None
         self._healthy = False
         self._load_rss_hwm = (None, 0)  # (pid, peak VmRSS) for load_progress
@@ -7142,6 +7192,92 @@ class LlamaCppBackend:
         if self._gguf_path_is_diffusion(gguf_path, model_identifier):
             raise ValueError(_VULKAN_DIFFUSION_GPU_IDS_ERROR)
 
+    @classmethod
+    def _non_chat_gguf_refusal_for_path(
+        cls, gguf_path: str, model_identifier: Optional[str]
+    ) -> Optional[str]:
+        """``_non_chat_gguf_refusal`` for a file on disk, WITHOUT touching the active
+        backend, so the refusal can be raised before Phase 1 tears the running model down.
+
+        Refusing after the teardown would still cost the user their resident chat model to
+        answer a question the header could have answered first, which is most of what this
+        preflight is for. Same probe-instance trick as ``_gguf_path_is_diffusion``: reading
+        the header into ``self`` here would overwrite the live model's metadata with a
+        file we are about to reject."""
+        probe = object.__new__(cls)
+        probe._model_identifier = model_identifier
+        probe._read_gguf_metadata(gguf_path)
+        return probe._non_chat_gguf_refusal(gguf_path)
+
+    @classmethod
+    def _remote_non_chat_gguf_refusal(
+        cls,
+        *,
+        hf_repo: str,
+        hf_variant: Optional[str],
+        hf_token: Optional[str],
+        model_identifier: Optional[str],
+    ) -> Optional[str]:
+        """``_non_chat_gguf_refusal_for_path`` for a repo load, decided from a header-sized
+        BYTE RANGE instead of the checkpoint, so the verdict lands before Phase 1 tears the
+        resident model down.
+
+        A repo load reaches the same refusal after Phase 2, which is one teardown too late:
+        the Model Hub sends a repo id for every Hub model (the route, not the UI, decides
+        local-vs-remote), so a media GGUF opened into a chat kills the user's live model to
+        answer a question its own header answers. Downloading first to answer it earlier
+        would trade the teardown for tens of GB, so this reads the header only.
+
+        A 256 KiB prefix is enough for exactly the files this refuses. Media GGUFs carry a
+        handful of KV pairs -- measured over the Hub, flux / flux2 / cosmos / wan / sd3 all
+        finish the KV walk in 144-145 bytes and LTX-2, the largest seen, in 3,987 -- while a
+        chat model's ``tokenizer.ggml.tokens`` array pushes its KV block into the megabytes
+        (Qwen3-0.6B 5.93 MB, Llama-3.2-1B 7.82 MB). So the prefix completes the walk for a
+        media GGUF and cuts mid-KV for a chat one, where ``_gguf_header_parsed`` stays False
+        and ``_non_chat_gguf_refusal`` declines to have an opinion.
+
+        Fails open at every step -- no resolvable filename, an unreachable Hub, a proxy that
+        answers 200 instead of 206, a prefix too short to finish the walk -- because the
+        post-download check is still there as the backstop. This can only turn a refusal
+        that costs the resident model into one that does not; it can never refuse a load the
+        full-file check would have allowed, since it runs the same verdict on the same
+        bytes."""
+        try:
+            from core.inference.diffusion_compat import (
+                _local_gguf_path,
+                _read_gguf_header,
+                _read_local_header,
+            )
+        except Exception as e:  # noqa: BLE001 -- an unavailable probe is not a verdict
+            logger.debug("GGUF header probe unavailable: %s", e)
+            return None
+        try:
+            gguf_filename, _shards = _resolve_variant_gguf_files(hf_repo, hf_variant, hf_token)
+            if not gguf_filename:
+                return None
+            # A copy already in the cache answers this with no request at all, and is the
+            # only thing that can answer it while the Hub is unreachable.
+            local = _local_gguf_path(hf_repo, gguf_filename)
+            prefix = (
+                _read_local_header(local)
+                if local
+                else _read_gguf_header(hf_repo, gguf_filename, hf_token)
+            )
+            # Magic, version and the two counts. Anything shorter cannot even be opened as
+            # a GGUF, so there is nothing to be right about.
+            if len(prefix) < 24:
+                return None
+            with tempfile.TemporaryDirectory(prefix = "unsloth-gguf-probe-") as probe_dir:
+                # Named after the real file: a GGUF that declares no architecture is refused
+                # on the strength of its name, and a temp name would lose the page pointer.
+                probe_path = os.path.join(probe_dir, os.path.basename(gguf_filename))
+                with open(probe_path, "wb") as handle:
+                    handle.write(prefix)
+                return cls._non_chat_gguf_refusal_for_path(probe_path, model_identifier)
+        except Exception as e:  # noqa: BLE001 -- a probe that failed is not a verdict
+            logger.debug("Non-chat GGUF header probe failed for %s: %s", hf_repo, e)
+            return None
+
     def _read_gguf_metadata(self, gguf_path: str) -> None:
         """Read context_length, architecture params, and chat_template from a GGUF header.
 
@@ -7187,6 +7323,7 @@ class LlamaCppBackend:
         self._nextn_predict_layers = None
         self._architecture = None
         self._is_diffusion = False
+        self._gguf_header_parsed = False
 
         try:
             canvas_seen = False
@@ -7222,6 +7359,9 @@ class LlamaCppBackend:
                 _version = struct.unpack("<I", f.read(4))[0]
                 _tensor_count, kv_count = struct.unpack("<QQ", f.read(16))
 
+                # Set by the loop's `else` below: True only when every declared KV pair was
+                # walked, i.e. no truncation `break` fired.
+                kv_complete = False
                 for _ in range(kv_count):
                     # Tolerate truncated input (e.g. a partial header from an
                     # HTTP byte-range fetch): bail out so the resolver
@@ -7326,6 +7466,8 @@ class LlamaCppBackend:
                         # fetch); break so the resolver fallback runs on
                         # what we have.
                         break
+                else:
+                    kv_complete = True
 
             # Decide diffusion routing before the SWA resolver below: it can raise on an arch transformers
             # does not know, which would otherwise drop a DiffusionGemma model to plain llama-server.
@@ -7381,6 +7523,11 @@ class LlamaCppBackend:
                     self._n_layers,
                     hf_repo_candidates,
                 )
+
+            # Every declared KV pair was walked. Only now does ``_architecture is None``
+            # mean "this GGUF declares no architecture" rather than "the read stopped
+            # early", which is the distinction the non-chat preflight below is built on.
+            self._gguf_header_parsed = kv_complete
 
             if self._context_length:
                 logger.info(f"GGUF metadata: context_length={self._context_length}")
@@ -7804,36 +7951,10 @@ class LlamaCppBackend:
             )
             hf_repo = resolved_hf_repo
 
-        # Resolve the filename from the variant
-        gguf_filename = None
-        gguf_extra_shards: list[str] = []
-        if hf_variant:
-            try:
-                from huggingface_hub import list_repo_files
-
-                files = list_repo_files(hf_repo, token = hf_token)
-                gguf_files = _gguf_files_for_variant(files, hf_variant)
-                if gguf_files:
-                    gguf_filename = gguf_files[0]
-                    gguf_extra_shards = _gguf_extra_shards(gguf_files, gguf_filename)
-            except Exception as e:
-                logger.warning(f"Could not list repo files: {e}")
-
-            # Fall back to the local cache when the repo listing is unavailable.
-            if not gguf_filename:
-                cached_name, cached_shards = _cached_variant_resolution(hf_repo, hf_variant)
-                if cached_name:
-                    gguf_filename = cached_name
-                    gguf_extra_shards = cached_shards
-                    logger.info(
-                        "Resolved variant %s -> %s from local HF cache",
-                        hf_variant,
-                        gguf_filename,
-                    )
-
-            if not gguf_filename:
-                repo_name = hf_repo.split("/")[-1].replace("-GGUF", "")
-                gguf_filename = f"{repo_name}-{hf_variant}.gguf"
+        # Resolve the filename from the variant (shared with the pre-teardown header probe)
+        gguf_filename, gguf_extra_shards = _resolve_variant_gguf_files(
+            hf_repo, hf_variant, hf_token
+        )
 
         # Prefer the existing model. Updates use force=True to fetch a new revision.
         if not force:
@@ -8829,22 +8950,207 @@ class LlamaCppBackend:
     # https://huggingface.co/collections/unsloth/unsloth-diffusion-ggufs.
     # Matched exactly (not a substring) so a chat arch containing "wan"/"sd1"
     # (e.g. "taiwan") isn't misrouted to Images.
-    _DIFFUSION_ARCHES = frozenset(
+    _IMAGE_ARCHES = frozenset(
         (
             "qwen_image",
             "flux",
-            "sd1",
-            "sdxl",
-            "sd3",
-            "aura",
-            "hidream",
-            "cosmos",
-            "ltxv",
-            "hyvid",
-            "wan",
-            "lumina2",
         )
     )
+    # Archs shared by more than one family, so the header alone does NOT say whether the
+    # Images page can run the file: Z-Image's DiT is a Lumina2 derivative, so its GGUFs
+    # declare "lumina2" too (measured on unsloth/Z-Image-Turbo-GGUF/z-image-turbo-Q2_K.gguf
+    # and on calcuis/lumina-gguf). ``routes.models._arch_to_task`` resolves these from the
+    # repo id and the filename and tags anything that does not resolve
+    # ``image-diffusion-unsupported``, which hides the row from the Images picker -- so the
+    # refusal has to run the SAME resolution before it names that page. Reachable today:
+    # ``neta-art/neta-lumina-gguf/checkpoint-e3_s9658-*.gguf`` declares "lumina2" and
+    # neither its repo id nor its filename resolves to a family ("lumina-2" is not aliased
+    # to bare "lumina"), so the picker refuses it while this branch was sending the user
+    # there. Mirrors ``routes.models._AMBIGUOUS_DIFFUSION_GGUF_ARCHS``.
+    _AMBIGUOUS_IMAGE_ARCHES = frozenset(("lumina2",))
+    # Text-to-video architectures the Video page can actually offer. Split from the image
+    # set so the refusal names the Video page: sending someone with a Wan / LTX-2 GGUF to
+    # Images is a second dead end.
+    _VIDEO_ARCHES = frozenset(
+        (
+            "ltxv",
+            "wan",
+        )
+    )
+    # Media archs Studio recognises but NO page can run, so the refusal must not promise
+    # one. Mirrors ``routes.models._UNSUPPORTED_DIFFUSION_GGUF_ARCHS``, which tags these
+    # GGUFs ``image-diffusion-unsupported`` and thereby hides them from the Images picker
+    # AND the Video one -- naming either page sends the user to an empty list.
+    #   * "cosmos": no VideoFamily exists at all (``detect_video_family`` returns None for
+    #     every cosmos repo id and for override="cosmos"), and the cosmos GGUFs actually
+    #     published are Cosmos-Predict2-14B-Text2Image, an IMAGE model the Images page
+    #     cannot assemble either.
+    #   * "hyvid": HunyuanVideo 1.0 has no VideoFamily, and the HunyuanVideo-1.5 GGUFs that
+    #     do map to one are still tagged unsupported by the picker (that family ships no
+    #     ``gguf_repo``), so no hyvid GGUF is selectable on the Video page today.
+    #   * "sd1" / "sd3" / "sdxl" / "aura" / "hidream": tagged unsupported for the same
+    #     reason on the image side. The Images page cannot assemble a pipeline around any
+    #     of them, so "use the Images page" was the same empty promise the video split was
+    #     opened to remove -- it just predates it.
+    # Kept inside _DIFFUSION_ARCHES: the pre-launch refusal still fires, it just stops
+    # naming a destination it cannot deliver. This set is the whole mirror rather than
+    # only the archs the video split moved, because a partial mirror leaves the identical
+    # dead end standing on the other half.
+    _UNRUNNABLE_MEDIA_ARCHES = frozenset(
+        (
+            "cosmos",
+            "hyvid",
+            "sd1",
+            "sd3",
+            "sdxl",
+            "aura",
+            "hidream",
+        )
+    )
+    _DIFFUSION_ARCHES = (
+        _IMAGE_ARCHES | _AMBIGUOUS_IMAGE_ARCHES | _VIDEO_ARCHES | _UNRUNNABLE_MEDIA_ARCHES
+    )
+
+    # Not architectures: the literal placeholders calcuis / gguf-org's "gguf-connector"
+    # writes into general.architecture for its diffusion GGUFs (gguf-org/flux2-dev-gguf
+    # and calcuis/cosmos-predict2-gguf both declare "pig"). ComfyUI-GGUF's loader special
+    # cases the same two strings -- ``if arch_str in [None, "pig", "cow"]`` -- and falls
+    # back to sniffing the tensor names. llama.cpp knows neither, so these GGUFs are just
+    # as unloadable as any other diffusion file; without this they slip past the arch sets
+    # and die in llama-server as the opaque failure this preflight exists to prevent.
+    _PLACEHOLDER_ARCHES = frozenset(("pig", "cow"))
+
+    @staticmethod
+    def _ambiguous_image_arch_is_pickable(
+        gguf_path: Optional[str], model_identifier: Optional[str]
+    ) -> bool:
+        """Whether the Images page would actually OFFER this shared-arch GGUF.
+
+        The same three questions ``routes.models._arch_to_task`` asks in its
+        ``_AMBIGUOUS_DIFFUSION_GGUF_ARCHS`` branch, over the same evidence (repo id, then
+        filename): does a family resolve at all, can a GGUF transformer be assembled for
+        it, and can an engine on THIS host build it. Answering differently here is the
+        thing to avoid -- the picker's answer is what decides whether the row the refusal
+        points at exists.
+
+        Imported lazily, and inside the function: ``routes`` imports this module, so the
+        canonical classifier cannot be imported from here, but the helpers underneath it
+        (``core.inference.diffusion_families`` / ``diffusion_engine_router``) are already
+        reached this way by the no-architecture branch below.
+
+        Fails OPEN on a probe error, like every other family probe on the listing side:
+        naming the page is a nicety, and losing it over a broken import would be a worse
+        answer than the one this method exists to stop."""
+        try:
+            from core.inference.diffusion_engine_router import family_buildable_here
+            from core.inference.diffusion_families import (
+                detect_family_for_pick,
+                family_gguf_loadable,
+            )
+
+            for needle in (model_identifier, os.path.basename(gguf_path or "")):
+                if not needle:
+                    continue
+                fam = detect_family_for_pick(needle)
+                if fam is not None:
+                    return family_gguf_loadable(fam) and family_buildable_here(
+                        fam, model_kind = "gguf"
+                    )
+            return False
+        except Exception as e:  # noqa: BLE001 -- never lose the page over a probe failure
+            logger.debug("Family probe failed for ambiguous image arch: %s", e)
+            return True
+
+    def _non_chat_gguf_refusal(self, gguf_path: str) -> Optional[str]:
+        """Why this GGUF cannot be a chat model, decided from its own header BEFORE
+        llama-server is launched; None when there is no such verdict.
+
+        Two things go wrong without it. A media GGUF opened in a chat spends the whole
+        download-and-launch path only to die in llama-server's loader, and what the user
+        sees is "llama-server failed to start" with no hint that the file was never a chat
+        model and no pointer to the page that does run it (the reported Video-model case:
+        loaded from the Model Hub into a chat, failed opaquely, no log in the UI).
+
+        The header alone is enough to be certain, in two ways:
+
+        * A declared architecture in the image / video sets. llama.cpp has no such
+          architectures, so this is exactly the failure it would hit, one launch earlier.
+        * NO ``general.architecture`` at all. That key is mandatory for anything
+          llama.cpp can load, and the video GGUFs Unsloth publishes (MiniMax-H3) carry a
+          bare tensor header with zero KV pairs, so they never reach the arch test above.
+          Gated on ``_gguf_header_parsed`` so a read that FAILED -- truncated download,
+          I/O error, a format this parser does not understand -- is never mistaken for a
+          file that declares nothing, and still gets its chance in llama-server.
+
+        Naming the destination page is the point, so when the architecture does not say
+        which it is, the family detectors are asked about the repo id and the filename."""
+        if not getattr(self, "_gguf_header_parsed", False):
+            return None
+        arch = (self._architecture or "").strip().lower()
+        if arch in self._PLACEHOLDER_ARCHES:
+            # A placeholder that names no architecture at all: treat it exactly like a GGUF
+            # that declares none, so the name-based branch below still names a page.
+            arch = ""
+        if arch:
+            if arch in self._UNRUNNABLE_MEDIA_ARCHES:
+                return (
+                    f"This is an image / video generation GGUF (architecture '{arch}'), "
+                    "which cannot run as a chat model. Unsloth Studio cannot run this "
+                    "architecture at all: neither the Images page nor the Video page "
+                    "accepts it."
+                )
+            if arch in self._VIDEO_ARCHES:
+                return (
+                    f"This is a text-to-video GGUF (architecture '{arch}'), which cannot "
+                    "run as a chat model. Open it from the Video page instead."
+                )
+            if arch in self._IMAGE_ARCHES:
+                return (
+                    f"This is an image-generation GGUF (architecture '{arch}'), which "
+                    "cannot run as a chat model. Open it from the Images page instead."
+                )
+            if arch in self._AMBIGUOUS_IMAGE_ARCHES:
+                if self._ambiguous_image_arch_is_pickable(gguf_path, self._model_identifier):
+                    return (
+                        f"This is an image-generation GGUF (architecture '{arch}'), which "
+                        "cannot run as a chat model. Open it from the Images page instead."
+                    )
+                return (
+                    f"This is an image-generation GGUF (architecture '{arch}'), which "
+                    "cannot run as a chat model. Studio could not tell which model family "
+                    f"this file belongs to -- '{arch}' is shared by several -- so the "
+                    "Images page cannot assemble it either."
+                )
+            return None
+
+        # No architecture declared: not loadable by llama-server whatever it is. Say which
+        # page runs it when the identifiers make that clear.
+        needles = [n for n in (self._model_identifier, os.path.basename(gguf_path or "")) if n]
+        try:
+            from core.inference.video_families import detect_video_family
+            if any(detect_video_family(n) is not None for n in needles):
+                return (
+                    "This is a text-to-video model, not a chat model: its GGUF carries no "
+                    "llama.cpp model metadata, so llama-server cannot load it. Open it "
+                    "from the Video page instead."
+                )
+        except Exception as e:  # noqa: BLE001 -- naming the page is a nicety, never a gate
+            logger.debug("Video family probe failed during non-chat GGUF preflight: %s", e)
+        try:
+            from core.inference.diffusion_families import detect_family
+            if any(detect_family(n) is not None for n in needles):
+                return (
+                    "This is an image-generation model, not a chat model: its GGUF carries "
+                    "no llama.cpp model metadata, so llama-server cannot load it. Open it "
+                    "from the Images page instead."
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Image family probe failed during non-chat GGUF preflight: %s", e)
+        return (
+            "This GGUF carries no llama.cpp model metadata (no general.architecture), so "
+            "llama-server cannot load it as a chat model. Image and video GGUFs are "
+            "packaged this way -- try the Images or Video page, or pick a chat GGUF."
+        )
 
     # Distro package names for the shared libraries the Linux prebuilt links,
     # so the loader failure below can say what to install.
@@ -9054,12 +9360,40 @@ class LlamaCppBackend:
         arch_match = re.search(r"unknown model architecture:\s*'([^']+)'", lowered)
         if arch_match:
             arch = arch_match.group(1)
-            if arch in LlamaCppBackend._DIFFUSION_ARCHES:
+            if arch in LlamaCppBackend._UNRUNNABLE_MEDIA_ARCHES:
+                return (
+                    f"'{arch}' is an image / video generation GGUF, which llama-server "
+                    "cannot run as a chat/completion model. Unsloth Studio cannot run "
+                    "this architecture at all: neither the Images page nor the Video "
+                    "page accepts it."
+                )
+            if arch in LlamaCppBackend._VIDEO_ARCHES:
+                return (
+                    f"'{arch}' is a text-to-video GGUF, which llama-server "
+                    "cannot run as a chat/completion model. Open it from "
+                    "Unsloth's Video page instead of a chat."
+                )
+            if arch in LlamaCppBackend._IMAGE_ARCHES or (
+                arch in LlamaCppBackend._AMBIGUOUS_IMAGE_ARCHES
+                and LlamaCppBackend._ambiguous_image_arch_is_pickable(
+                    gguf_path, model_identifier
+                )
+            ):
                 return (
                     f"'{arch}' is a diffusion (image-generation) GGUF, which "
                     "llama-server cannot run as a chat/completion model. Use "
                     "Unsloth's Images page to generate with local diffusion "
                     "GGUFs such as FLUX and Qwen-Image."
+                )
+            if arch in LlamaCppBackend._AMBIGUOUS_IMAGE_ARCHES:
+                # Same shared-arch resolution as the pre-launch refusal: nothing in the
+                # repo id or filename says which family this is, so the Images picker
+                # tags it image-diffusion-unsupported and the row is not there to open.
+                return (
+                    f"'{arch}' is a diffusion (image-generation) GGUF, which "
+                    "llama-server cannot run as a chat/completion model. Unsloth Studio "
+                    f"could not tell which model family this file is -- '{arch}' is "
+                    "shared by several -- so the Images page cannot assemble it either."
                 )
             if is_ollama:
                 return (
@@ -10313,6 +10647,54 @@ class LlamaCppBackend:
             ):
                 raise ValueError(_PARAVIRTUAL_DIFFUSION_NO_NGL_ERROR)
 
+            # An image / video GGUF already on disk is refused HERE, before the teardown
+            # below: the header answers the question without llama-server, so there is no
+            # reason to make the user pay their resident chat model for it.
+            if gguf_path and not hf_repo and Path(gguf_path).is_file():
+                _early_non_chat = self._non_chat_gguf_refusal_for_path(gguf_path, model_identifier)
+                if _early_non_chat:
+                    logger.error(
+                        "Refusing non-chat GGUF before teardown: %s (%s)",
+                        _early_non_chat,
+                        gguf_path,
+                    )
+                    raise ValueError(_early_non_chat)
+
+            # And the same refusal for a REPO load, which is the one the Model Hub actually
+            # sends: /load carries an opaque model_path that the route resolves to hf_repo
+            # for every Hub model, so leaving this to the post-download check meant the
+            # reported case -- a video model opened into a chat -- killed the live model
+            # first. The file does not exist yet, but the verdict does not need it: a
+            # header-sized byte range decides it (see _remote_non_chat_gguf_refusal), and
+            # downloading tens of GB just to refuse would cost more than the teardown this
+            # is saving. When a preflight above already fetched the file, judge that
+            # instead -- same verdict, no request. Fails open into the post-download check
+            # below, which stays as the backstop.
+            if hf_repo:
+                _early_non_chat = (
+                    self._non_chat_gguf_refusal_for_path(_preflight_model_path, model_identifier)
+                    if _preflight_model_path
+                    else self._remote_non_chat_gguf_refusal(
+                        hf_repo = hf_repo,
+                        hf_variant = hf_variant,
+                        hf_token = hf_token,
+                        model_identifier = model_identifier,
+                    )
+                )
+                if _early_non_chat:
+                    logger.error(
+                        "Refusing non-chat GGUF before teardown: %s (%s)",
+                        _early_non_chat,
+                        hf_repo,
+                    )
+                    raise ValueError(_early_non_chat)
+
+            # A probe can take a bounded moment on a slow Hub, so re-read the cancel flag
+            # rather than tearing down a healthy server for a load that was called off.
+            if _load_cancelled():
+                logger.info("Load cancelled before teardown")
+                return False
+
             # ── Phase 1: kill old process (under lock, fast) ──────────
             _replaying_cpu_fallback = intent.cpu_fallback
             with self._lock:
@@ -10480,6 +10862,14 @@ class LlamaCppBackend:
             if _load_cancelled():
                 logger.info("Load cancelled after download phase")
                 return False
+
+            # An image / video GGUF cannot be a chat model. Refuse from the header rather
+            # than launching llama-server to watch it die as "llama-server failed to
+            # start", and name the page that does run it.
+            non_chat = self._non_chat_gguf_refusal(model_path)
+            if non_chat:
+                logger.error("Refusing non-chat GGUF: %s (%s)", non_chat, model_path)
+                raise ValueError(non_chat)
 
             # Block-diffusion GGUFs (DiffusionGemma) cannot run on llama-server;
             # serve them with the diffusion runner (same OpenAI-compat interface).

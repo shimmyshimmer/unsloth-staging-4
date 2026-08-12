@@ -217,6 +217,11 @@ export function useSelectedModelView({
         capabilities: selectedDiscoverRow.capabilities,
         license: detectLicense(selectedDiscoverRow.result.tags),
         pipelineTag: selectedDiscoverRow.result.pipelineTag,
+        // The matched on-device row, as every field above already resolves: a Discover pick
+        // for a downloaded GGUF repo resolves to that cached / local row, and its inventory
+        // task is the only place the modality is recorded when the Hub metadata carries no
+        // pipeline tag or only the generic text-generation one.
+        task: selectedCachedRow?.task ?? selectedLocalRow?.task ?? null,
         libraryName: selectedDiscoverRow.result.libraryName,
         gated: selectedDiscoverRow.result.gated,
         private: selectedDiscoverRow.result.private,
@@ -287,6 +292,7 @@ export function useSelectedModelView({
         ),
         license: detectLicense(mergedTags),
         pipelineTag: mergedPipelineTag,
+        task: selectedCachedRow.task ?? null,
         libraryName: mergedLibraryName,
         gated: selectedHfResult?.gated,
         private: selectedHfResult?.private,
@@ -363,6 +369,7 @@ export function useSelectedModelView({
           ),
           license: detectLicense(mergedTags),
           pipelineTag: mergedPipelineTag,
+          task: selectedLocalRow.task ?? null,
           libraryName: mergedLibraryName,
           gated: selectedHfResult?.gated,
           private: selectedHfResult?.private,
@@ -415,6 +422,7 @@ export function useSelectedModelView({
         ),
         license: detectLicense(mergedTags),
         pipelineTag: mergedPipelineTag,
+        task: selectedLocalRow.task ?? null,
         libraryName: mergedLibraryName,
         gated: localHubMetadata?.gated,
         private: localHubMetadata?.private,
