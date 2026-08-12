@@ -60,23 +60,19 @@ jobs:
           codesign -dv "$BIN" 2>&1 || true
           vtool -show-build "$BIN" 2>&1 || true
           ls -la "$(dirname "$BIN")"
-          # The backend's own deps (structlog, ...) live in the installed venv,
-          # not in the runner's setup-python.
-          VENV_PY="${STUDIO_HOME:-$HOME/.unsloth}/unsloth_studio/bin/python"
-          [ -x "$VENV_PY" ] || VENV_PY="$(find "$UNSLOTH_HOME" -type f -path '*/bin/python' 2>/dev/null | head -1)"
-          echo "VENV_PY=$VENV_PY" >> "$GITHUB_ENV"
-          "$VENV_PY" -V
+      # Import deps for the backend module the assertion loads. Same list the
+      # per-OS jobs install; the runtime under test is the one installed above.
+      - name: Install backend import deps
+        run: python -m pip install -r studio/backend/requirements/studio.txt
       - name: Assert the child environment (with the fix)
-        # Block scalar: a run: value starting with a quote is a quoted YAML
-        # scalar, and the rest of the line then breaks the parse.
         run: |
-          "$VENV_PY" .github/scripts/assert_llama_dyld_env.py
+          python .github/scripts/assert_llama_dyld_env.py
       - name: Assert the same check FAILS before the fix
         run: |
           cp studio/backend/core/inference/llama_cpp.py /tmp/llama_cpp_fixed.py
           git show origin/main:studio/backend/core/inference/llama_cpp.py \
             > studio/backend/core/inference/llama_cpp.py
-          if "$VENV_PY" .github/scripts/assert_llama_dyld_env.py; then
+          if python .github/scripts/assert_llama_dyld_env.py; then
             cp /tmp/llama_cpp_fixed.py studio/backend/core/inference/llama_cpp.py
             echo "::error::the pre-fix revision passed, so this job proves nothing"
             exit 1
