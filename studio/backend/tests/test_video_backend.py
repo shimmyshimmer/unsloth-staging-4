@@ -3134,9 +3134,7 @@ def test_h3_native_load_claims_the_companion_repos_before_acquiring_the_binary(
         seen.append(backend._loading.asset_repos)
         return "/existing/sd-cli"
 
-    backend, fam, _downloads = _h3_load_with_no_usable_binary(
-        monkeypatch, tmp_path, ensure = _ensure
-    )
+    backend, fam, _downloads = _h3_load_with_no_usable_binary(monkeypatch, tmp_path, ensure = _ensure)
     backend._loading = video_mod._VideoLoadingState(
         repo_id = "leejet/MiniMax-H3-GGUF", base_repo = fam.base_repo
     )
@@ -3179,9 +3177,7 @@ def test_h3_native_load_stops_on_an_already_cancelled_load_before_acquiring(monk
         ensures.append(kwargs)
         return "/existing/sd-cli"
 
-    backend, fam, downloads = _h3_load_with_no_usable_binary(
-        monkeypatch, tmp_path, ensure = _ensure
-    )
+    backend, fam, downloads = _h3_load_with_no_usable_binary(monkeypatch, tmp_path, ensure = _ensure)
     cancelled = threading.Event()
     cancelled.set()
 
