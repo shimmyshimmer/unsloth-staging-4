@@ -1,0 +1,98 @@
+name: "staging-8574 arch vs OS"
+# Settles what actually selects the new loader branch: the operating system or
+# the CPU architecture. Runs the same assertion on ARM macOS, INTEL macOS, ARM
+# Windows, ARM Linux and x86 Linux. If the selector were architecture, the two
+# ARM non-Macs would take the macOS branch and the Intel Mac would not. If it is
+# the operating system, both Macs take it and neither ARM non-Mac does.
+on:
+  push:
+    branches: ["pr-8574-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15        # Apple Silicon
+            expect_darwin_branch: "yes"
+          - os: macos-13        # Intel Mac
+            expect_darwin_branch: "yes"
+          - os: windows-11-arm  # ARM, not a Mac
+            expect_darwin_branch: "no"
+          - os: ubuntu-24.04-arm # ARM, not a Mac
+            expect_darwin_branch: "no"
+          - os: ubuntu-24.04    # x86, not a Mac
+            expect_darwin_branch: "no"
+    name: ${{ matrix.os }} (expects darwin branch = ${{ matrix.expect_darwin_branch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio python-multipart
+
+      - name: The selector is the OS, and the machine reports its real arch
+        env:
+          EXPECT: ${{ matrix.expect_darwin_branch }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=studio/backend python - <<'PY'
+          import os, platform, sys, tempfile, pathlib
+          from core.inference.llama_cpp import LlamaCppBackend, _loader_path_var
+
+          arch = platform.machine()
+          expect_darwin = os.environ["EXPECT"] == "yes"
+          print(f"platform={sys.platform} machine={arch} expect_darwin_branch={expect_darwin}")
+
+          # 1. The loader variable is chosen by OS.
+          want = {"darwin": "DYLD_LIBRARY_PATH", "win32": "PATH"}.get(sys.platform, "LD_LIBRARY_PATH")
+          assert _loader_path_var() == want, (_loader_path_var(), want)
+
+          # 2. The darwin branch is taken exactly when this is a Mac, whatever the arch.
+          took_darwin = sys.platform == "darwin"
+          assert took_darwin == expect_darwin, (sys.platform, arch, expect_darwin)
+
+          # 3. And the child environment agrees.
+          d = pathlib.Path(tempfile.mkdtemp()) / "build" / "bin"
+          d.mkdir(parents = True)
+          (d / "llama-server").write_bytes(b"\x00\x00\x00\x00")
+          env = LlamaCppBackend._llama_server_env_for_binary(str(d / "llama-server"))
+          if expect_darwin:
+              assert "DYLD_LIBRARY_PATH" in env, "a Mac did not get the dyld path"
+              assert str(d) in env["DYLD_LIBRARY_PATH"].split(os.pathsep), env["DYLD_LIBRARY_PATH"]
+          else:
+              assert "DYLD_LIBRARY_PATH" not in env, f"{arch} on {sys.platform} took the macOS branch"
+
+          # 4. Idempotent: repeated builds do not grow the path.
+          again = LlamaCppBackend._llama_server_env_for_binary(str(d / "llama-server"))
+          assert again == env, "child environment is not stable across calls"
+          print("PASS: the selector is the operating system, not the CPU architecture")
+          PY
+
+      - name: Changed-area tests
+        run: |
+          set -uo pipefail
+          rc=0
+          PYTHONPATH=studio/backend python -m pytest \
+            studio/backend/tests/test_llama_cpp_darwin_loader_env.py \
+            studio/backend/tests/test_llama_cpp_start_failure_classification.py \
+            studio/backend/tests/test_rag_embed_llama_server.py \
+            studio/backend/tests/test_gpu_init_crash_message.py \
+            studio/backend/tests/test_llama_cpp_mtp_detection.py \
+            -q --tb=short > out.txt 2>&1 || rc=$?
+          tail -40 out.txt
+          exit "$rc"
