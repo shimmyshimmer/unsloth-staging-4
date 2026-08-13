@@ -53,7 +53,12 @@ jobs:
         shell: wsl-bash {0}
         run: |
           set -euo pipefail
-          ./.venv/bin/python -m pytest tests/test_installer_system32_guard.py -q --tb=short
+          # The one deselected test drives the whole CLI through Click's test
+          # runner, so it needs every command module's dependencies. It is about
+          # argv capture rather than the platform, and Linux CI already runs it;
+          # what this job is here to show is the guard's behaviour on WSL.
+          ./.venv/bin/python -m pytest tests/test_installer_system32_guard.py -q --tb=short \
+            --deselect tests/test_installer_system32_guard.py::test_cli_guard_reads_the_invocation_not_the_hosts_argv
 
       - name: The guard must be a no-op on this platform
         shell: wsl-bash {0}
