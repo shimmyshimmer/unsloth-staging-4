@@ -3113,7 +3113,7 @@ def _h3_load_with_no_usable_binary(monkeypatch, tmp_path, *, ensure):
     monkeypatch.setattr("utils.hf_xet_fallback.hf_hub_download_with_xet_fallback", _download)
 
     backend = VideoBackend()
-    fam = _detect_load_family("leejet/MiniMax-H3-GGUF", None, "minimax-h3")
+    fam = _detect_load_family("unsloth/MiniMax-H3-GGUF", None, "minimax-h3")
     assert fam is not None
     return backend, fam, downloads
 
@@ -3135,7 +3135,7 @@ def test_h3_native_load_claims_the_companion_repos_before_acquiring_the_binary(
 
     backend, fam, _downloads = _h3_load_with_no_usable_binary(monkeypatch, tmp_path, ensure = _ensure)
     backend._loading = video_mod._VideoLoadingState(
-        repo_id = "leejet/MiniMax-H3-GGUF", base_repo = fam.base_repo
+        repo_id = "unsloth/MiniMax-H3-GGUF", base_repo = fam.base_repo
     )
     backend._load_token = 7
 
@@ -3156,7 +3156,7 @@ def test_h3_native_load_claims_the_companion_repos_before_acquiring_the_binary(
         fam = fam,
         token = 7,
         cancel_event = threading.Event(),
-        repo_id = "leejet/MiniMax-H3-GGUF",
+        repo_id = "unsloth/MiniMax-H3-GGUF",
         gguf_filename = "minimax_h3_fl2va-Q4_K_M.gguf",
     )
 
@@ -3183,7 +3183,7 @@ def test_h3_native_load_stops_on_an_already_cancelled_load_before_acquiring(monk
             fam = fam,
             token = None,
             cancel_event = cancelled,
-            repo_id = "leejet/MiniMax-H3-GGUF",
+            repo_id = "unsloth/MiniMax-H3-GGUF",
             gguf_filename = "minimax_h3_fl2va-Q4_K_M.gguf",
         )
     assert ensures == []
@@ -3234,7 +3234,7 @@ def test_h3_native_load_rejects_a_user_binary_swapped_during_the_download(monkey
             fam = fam,
             token = None,
             cancel_event = threading.Event(),
-            repo_id = "leejet/MiniMax-H3-GGUF",
+            repo_id = "unsloth/MiniMax-H3-GGUF",
             gguf_filename = "minimax_h3_fl2va-Q4_K_M.gguf",
         )
     assert backend._state is None
@@ -3252,7 +3252,7 @@ def test_h3_native_load_vets_the_binary_before_downloading_the_bundle(monkeypatc
             fam = fam,
             token = None,
             cancel_event = threading.Event(),
-            repo_id = "leejet/MiniMax-H3-GGUF",
+            repo_id = "unsloth/MiniMax-H3-GGUF",
             gguf_filename = "minimax_h3_fl2va-Q4_K_M.gguf",
         )
     assert downloads == []
@@ -3270,7 +3270,7 @@ def test_h3_native_load_refuses_a_missing_binary_before_downloading(monkeypatch,
             fam = fam,
             token = None,
             cancel_event = threading.Event(),
-            repo_id = "leejet/MiniMax-H3-GGUF",
+            repo_id = "unsloth/MiniMax-H3-GGUF",
             gguf_filename = "minimax_h3_fl2va-Q4_K_M.gguf",
         )
     assert downloads == []
