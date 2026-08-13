@@ -557,8 +557,51 @@ with sync_playwright() as p:
                     }""",
                     timeout = 30_000,
                 )
+                page.evaluate(
+                    """() => {
+                        const node = document.querySelector('[data-testid="stt-model-results"]');
+                        window.__wheelSeen = 0;
+                        node.addEventListener('wheel', () => { window.__wheelSeen += 1; }, true);
+                    }"""
+                )
+
+                def probe(tag):
+                    m = page.evaluate(
+                        """() => {
+                            const n = document.querySelector('[data-testid="stt-model-results"]');
+                            if (!n) return null;
+                            return {st: n.scrollTop, sh: n.scrollHeight, ch: n.clientHeight,
+                                    wheels: window.__wheelSeen,
+                                    kids: n.children.length,
+                                    txt: (n.innerText || '').replace(/\\s+/g, ' ').slice(0, 70)};
+                        }"""
+                    )
+                    info(f"PROBE {tag}: {m}")
+                    return m
+
+                probe("A-after-overflow-wait")
+                results.hover()
+                probe("B-after-hover")
+                page.mouse.wheel(0, 700)
+                page.wait_for_timeout(400)
+                probe("C-after-wheel-1")
+                # Let the debounced Hugging Face search settle, then wheel again.
+                page.wait_for_timeout(6_000)
+                probe("D-settled")
                 results.hover()
                 page.mouse.wheel(0, 700)
+                page.wait_for_timeout(400)
+                probe("E-after-wheel-2")
+                # Synthetic wheel straight at the node: does the listener scroll it?
+                page.evaluate(
+                    """() => {
+                        const n = document.querySelector('[data-testid="stt-model-results"]');
+                        n.dispatchEvent(new WheelEvent('wheel', {deltaY: 700, deltaMode: 0,
+                                                                bubbles: true, cancelable: true}));
+                    }"""
+                )
+                page.wait_for_timeout(300)
+                probe("F-after-synthetic-wheel")
                 page.wait_for_function(
                     """() => {
                         const node = document.querySelector('[data-testid="stt-model-results"]');
