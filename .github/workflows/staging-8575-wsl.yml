@@ -44,9 +44,9 @@ jobs:
           set -uo pipefail
           python3 -m venv .venv
           ./.venv/bin/python -m pip install -q --upgrade pip
-          # typer too: importing the unsloth_cli package pulls it in, and the
-          # point of the next step is to import the guard the way the CLI does.
-          ./.venv/bin/python -m pip install -q pytest typer pyyaml
+          # The guard module itself imports only os, but the suite imports the
+          # whole CLI package, which pulls these in.
+          ./.venv/bin/python -m pip install -q pytest typer pyyaml pydantic
           echo "PIP_RC=$?"
 
       - name: Run the guard suite inside WSL
@@ -60,9 +60,15 @@ jobs:
         run: |
           set -euo pipefail
           ./.venv/bin/python - <<'PY'
-          import os, sys
-          sys.path.insert(0, ".")
-          from unsloth_cli import _system_dir_guard as guard
+          import importlib.util, os, sys
+
+          # By file, not by package: the guard runs before the CLI imports
+          # anything, and it has to work with nothing but the standard library.
+          spec = importlib.util.spec_from_file_location(
+              "_system_dir_guard", "unsloth_cli/_system_dir_guard.py"
+          )
+          guard = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(guard)
 
           # Every shape that would be rewritten on Windows, in one environment.
           env = {
