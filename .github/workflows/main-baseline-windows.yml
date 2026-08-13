@@ -1,7 +1,7 @@
 name: "main-baseline windows-latest"
 on:
   push:
-    branches: ["pr-8702-xplat-ci"]
+    branches: ["main-baseline-8702"]
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
