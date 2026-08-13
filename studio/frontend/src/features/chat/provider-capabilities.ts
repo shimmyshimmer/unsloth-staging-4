@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-import { providerModelSupportsStudioTools } from "./external-providers";
+import {
+  LEGACY_CUSTOM_PROVIDER_TYPE,
+  normalizeCustomMaxOutputTokens,
+  providerModelSupportsStudioTools,
+} from "./external-providers";
 
 /**
  * Per-provider sampling parameter capability matrix.
@@ -72,8 +76,8 @@ export function clampReasoningEffortToLevels(
 }
 
 /**
- * Fallback cap for unknown providers / models. Prefer
- * `getExternalMaxOutputTokens(providerType, modelId)` for the real cap.
+ * Fallback cap for unknown providers / models and Custom connections without
+ * an explicit per-connection override.
  */
 export const EXTERNAL_MAX_OUTPUT_TOKENS = 32768;
 
@@ -134,13 +138,21 @@ const EXTERNAL_MAX_OUTPUT_TOKENS_BY_MODEL: Array<{
 
 /**
  * Documented per-model output cap; unknown ids fall back to
- * `EXTERNAL_MAX_OUTPUT_TOKENS` (32k). OpenRouter `provider/model` ids have the
- * prefix stripped before matching.
+ * `EXTERNAL_MAX_OUTPUT_TOKENS` (32k). Generic Custom connections use only their
+ * explicit per-connection override and never inspect the model id. OpenRouter
+ * `provider/model` ids have the prefix stripped before matching.
  */
 export function getExternalMaxOutputTokens(
   providerType: string | null | undefined,
   modelId: string | null | undefined,
+  customMaxOutputTokens?: number | null,
 ): number {
+  if (providerType === LEGACY_CUSTOM_PROVIDER_TYPE) {
+    return (
+      normalizeCustomMaxOutputTokens(providerType, customMaxOutputTokens) ??
+      EXTERNAL_MAX_OUTPUT_TOKENS
+    );
+  }
   if (!providerType || !modelId) return EXTERNAL_MAX_OUTPUT_TOKENS;
   const normalized = modelId.trim().toLowerCase();
   if (!normalized) return EXTERNAL_MAX_OUTPUT_TOKENS;
@@ -163,6 +175,38 @@ export function getExternalMaxOutputTokens(
     }
   }
   return EXTERNAL_MAX_OUTPUT_TOKENS;
+}
+
+/**
+ * The lowered Max Tokens a live settings panel should write back, or null to leave the
+ * value alone.
+ *
+ * Split out of the settings panel's effect so the decision is testable without a DOM.
+ * The two availability guards are load-bearing, because the caller PERSISTS what this
+ * returns and this only ever lowers. `isExternalModel` is derived from the checkpoint
+ * string alone, while `maxTokensMax` comes from the resolved provider, and the two
+ * disagree whenever the provider is momentarily unavailable: connections toggled off,
+ * a cold browser where settings hydrate before the provider sync lands, or a
+ * connection disabled or deleted while selected. In each of those the cap collapses to
+ * the 32,768 fallback, and clamping there would silently destroy a configured
+ * override the moment the provider list blinked. No provider means the cap is unknown,
+ * not 32,768.
+ *
+ * Returning the cap itself (never a smaller value) is what makes this converge in a
+ * single pass: feeding the result back in yields null.
+ */
+export function resolveExternalMaxTokensClamp(input: {
+  settingsHydrated: boolean;
+  hasActiveExternalProvider: boolean;
+  isExternalModel: boolean;
+  maxTokens: number;
+  maxTokensMax: number;
+}): number | null {
+  if (!input.settingsHydrated || !input.hasActiveExternalProvider) return null;
+  if (!input.isExternalModel || input.maxTokens <= input.maxTokensMax) {
+    return null;
+  }
+  return input.maxTokensMax;
 }
 
 function _inferProviderFromOpenrouterId(

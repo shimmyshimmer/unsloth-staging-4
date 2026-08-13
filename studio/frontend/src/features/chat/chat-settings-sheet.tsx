@@ -99,6 +99,7 @@ import {
   getExternalMinOutputTokens,
   providerSupportsBuiltinCodeExecution,
   providerSupportsFastMode,
+  resolveExternalMaxTokensClamp,
 } from "./provider-capabilities";
 import {
   isLocalModelPath,
@@ -725,6 +726,7 @@ export function ChatSettingsPanel({
       ? getExternalMaxOutputTokens(
           externalProviderType,
           externalSelection?.modelId,
+          activeExternalProvider?.maxOutputTokens,
         )
       : isGguf && baseContext
         ? baseContext
@@ -760,15 +762,59 @@ export function ChatSettingsPanel({
     };
   }
 
+  // Lower a live Max Tokens that no longer fits the active connection's cap. The
+  // decision itself lives in `resolveExternalMaxTokensClamp`, which documents why a
+  // missing provider must NOT be read as the 32,768 fallback.
+  useEffect(() => {
+    const clampedMaxTokens = resolveExternalMaxTokensClamp({
+      settingsHydrated,
+      hasActiveExternalProvider: activeExternalProvider != null,
+      isExternalModel,
+      maxTokens: params.maxTokens,
+      maxTokensMax,
+    });
+    if (clampedMaxTokens == null) {
+      return;
+    }
+    const nextParams = { ...params, maxTokens: clampedMaxTokens };
+    const nextSource = isSamePresetConfig(activePresetBaseline, nextParams)
+      ? getPresetSource(activePreset)
+      : "modified";
+    setActivePresetSource(nextSource);
+    onParamsChange(nextParams);
+  }, [
+    activeExternalProvider,
+    activePreset,
+    activePresetBaseline,
+    isExternalModel,
+    maxTokensMax,
+    onParamsChange,
+    params,
+    settingsHydrated,
+    setActivePresetSource,
+  ]);
+
+  function applyPresetParamsWithinCurrentLimits(
+    presetParams: Parameters<typeof applyPresetParams>[1],
+  ): InferenceParams {
+    const nextParams = applyPresetParams(params, presetParams);
+    // Same reason the clamp effect waits for a resolved provider: with none,
+    // `maxTokensMax` is the 32,768 fallback rather than this connection's real cap,
+    // and applying a preset then would lower the value for good.
+    if (!isExternalModel || activeExternalProvider == null) return nextParams;
+    return {
+      ...nextParams,
+      maxTokens: Math.min(nextParams.maxTokens, maxTokensMax),
+    };
+  }
+
   function applyPreset(name: string) {
     if (!settingsHydrated) {
       return;
     }
     const p = presets.find((pr) => pr.name === name);
     if (p) {
-      onParamsChange({
-        ...applyPresetParams(params, p.params),
-      });
+      onParamsChange(applyPresetParamsWithinCurrentLimits(p.params));
       if (p.loadConfig) {
         applyPresetLoadConfig(p.loadConfig);
       }
@@ -828,9 +874,9 @@ export function ChatSettingsPanel({
     setCustomPresets(next);
     if (activePreset === name) {
       if (fallbackPreset) {
-        onParamsChange({
-          ...        applyPresetParams(params, fallbackPreset.params),
-        });
+        onParamsChange(
+          applyPresetParamsWithinCurrentLimits(fallbackPreset.params),
+        );
         if (fallbackPreset.loadConfig) {
           applyPresetLoadConfig(fallbackPreset.loadConfig);
         }
