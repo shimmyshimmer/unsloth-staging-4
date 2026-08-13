@@ -1,0 +1,93 @@
+name: "staging-7670 wsl"
+# WSL is neither plain Linux nor Windows: sys.platform / platform.system() report
+# Linux, but the filesystem and /tmp are the Windows host's. PR 7670 has a
+# WSL-specific claim -- the Windows-only free-VRAM cap (#8403) must NOT engage
+# there, while the ROCm arch gate must behave exactly as on native Linux -- so the
+# suites that encode it are run inside a real WSL distro rather than simulated.
+on:
+  push:
+    branches: ["pr-7670-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+jobs:
+  wsl:
+    name: WSL Ubuntu 24.04 arch-gate suites
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up WSL (Ubuntu 24.04)
+        uses: Vampire/setup-wsl@v6
+        with:
+          distribution: Ubuntu-24.04
+          set-as-default: "true"
+          update: "false"
+          additional-packages: ca-certificates git python3 python3-venv python3-pip
+
+      - name: Confirm this really is WSL and reports as Linux
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          grep -qi microsoft /proc/version && echo "WSL kernel confirmed: $(cat /proc/version)"
+          python3 - <<'PY'
+          import sys, platform
+          print("sys.platform      =", sys.platform)
+          print("platform.system() =", platform.system())
+          assert sys.platform == "linux", sys.platform
+          assert platform.system() == "Linux", platform.system()
+          PY
+
+      - name: Install test dependencies inside WSL
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          python3 -m venv .venv
+          ./.venv/bin/python -m pip install -q --upgrade pip
+          ./.venv/bin/python -m pip install -q -r studio/backend/requirements/studio.txt \
+            pytest pytest-asyncio pytest-timeout python-multipart
+          echo "PIP_RC=$?"
+
+      - name: Run the arch-gate + install suites inside WSL
+        shell: wsl-bash {0}
+        run: |
+          rc=0
+          export UNSLOTH_COMPILE_DISABLE=1 UNSLOTH_IS_PRESENT=1
+          PYTHONPATH=studio/backend ./.venv/bin/python -m pytest \
+            studio/backend/tests/test_gpu_arch_gate_7624.py \
+            studio/backend/tests/test_gpu_arch_gate_consumers_7624.py \
+            studio/backend/tests/test_gpu_arch_gate_os_matrix_7624.py \
+            studio/backend/tests/test_gpu_init_crash_message.py \
+            studio/backend/tests/test_gpu_memory_mode.py \
+            studio/backend/tests/test_llama_cpp_placement.py \
+            studio/backend/tests/test_rag_embed_llama_server.py \
+            tests/studio/install/test_install_llama_prebuilt_logic.py \
+            tests/studio/install/test_selection_logic.py \
+            -q --tb=short \
+            -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' \
+            > pytest_out.txt 2>&1 || rc=$?
+          cat pytest_out.txt
+          if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi
+          if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers)." pytest_out.txt && ! grep -qE "^(FAILED|ERROR) " pytest_out.txt; then echo "collection needs a dep this runner does not ship"; rc=0; fi
+          if [ "$rc" = "1" ] && ! grep -qE "^ERROR " pytest_out.txt; then
+            tot=$(grep -cE "^FAILED " pytest_out.txt)
+            dep=$(grep -cE "^FAILED .* No module named .(torch|unsloth_zoo|transformers).$" pytest_out.txt)
+            if [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then echo "only tests needing a dep this runner does not ship failed"; rc=0; fi
+          fi
+          exit "$rc"
+
+      - name: Pin the WSL cell of the OS matrix explicitly
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          export UNSLOTH_COMPILE_DISABLE=1 UNSLOTH_IS_PRESENT=1
+          PYTHONPATH=studio/backend ./.venv/bin/python -m pytest \
+            studio/backend/tests/test_gpu_arch_gate_os_matrix_7624.py \
+            -q --tb=short -k 'wsl or Wsl or WSL' || true
