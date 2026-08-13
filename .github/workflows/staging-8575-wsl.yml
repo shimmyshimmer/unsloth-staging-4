@@ -44,7 +44,9 @@ jobs:
           set -uo pipefail
           python3 -m venv .venv
           ./.venv/bin/python -m pip install -q --upgrade pip
-          ./.venv/bin/python -m pip install -q pytest
+          # typer too: importing the unsloth_cli package pulls it in, and the
+          # point of the next step is to import the guard the way the CLI does.
+          ./.venv/bin/python -m pip install -q pytest typer
           echo "PIP_RC=$?"
 
       - name: Run the guard suite inside WSL
