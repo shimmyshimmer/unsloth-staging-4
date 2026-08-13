@@ -1,0 +1,187 @@
+name: "staging-8592 desktop build (unsigned)"
+
+# Unsigned replica of the release-desktop.yml build job for PR unslothai/unsloth#8592.
+# The PR changes studio/src-tauri (process.rs, update.rs) and install.ps1, which the
+# Windows bundle ships, so the question is whether the desktop app still builds and
+# bundles on all three platforms. Signing is dropped deliberately: the staging repo has
+# no Apple, Azure or Tauri signing secrets, and createUpdaterArtifacts=false is what
+# removes the need for the Tauri key.
+#
+# The Windows leg also scans what was built with Defender, MAPS on, gated by an EICAR
+# positive control so a dead scanner cannot pass as a clean verdict. That covers the one
+# genuinely new artifact in this PR: bin\unsloth.cmd, a batch file whose whole job is to
+# start an interpreter with a -c payload, which is the shape heuristics score.
+
+on:
+  push:
+    branches: ["pr-8592-xplat-ci"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            label: linux deb
+            bundles: deb
+          - platform: macos-14
+            label: macos dmg (aarch64)
+            bundles: dmg
+          - platform: windows-latest
+            label: windows nsis
+            bundles: nsis
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install pinned Tauri CLI
+        run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+
+      - name: Install frontend dependencies
+        working-directory: studio/frontend
+        run: npm install --no-fund --no-audit
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust unit tests
+        working-directory: studio/src-tauri
+        run: cargo test -- --test-threads=4
+
+      - name: Build the bundle (unsigned)
+        working-directory: studio
+        shell: bash
+        run: |
+          npx --prefix . tauri build -v --bundles ${{ matrix.bundles }} \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: List what was produced
+        shell: bash
+        run: |
+          find studio/src-tauri/target -maxdepth 5 -path '*bundle*' -type f \
+            \( -name '*.deb' -o -name '*.dmg' -o -name '*.exe' -o -name '*.msi' \) -print
+
+      - name: Scan the bundles and the new .cmd shim with Defender
+        if: matrix.platform == 'windows-latest'
+        timeout-minutes: 25
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $atp = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Advanced Threat Protection'
+          if (Test-Path $atp) { Remove-ItemProperty -Path $atp -Name 'ForceDefenderPassiveMode' -ErrorAction SilentlyContinue }
+          Start-Service -Name WinDefend -ErrorAction SilentlyContinue
+          foreach ($x in @((Get-MpPreference).ExclusionPath)) {
+            if ($x) { Remove-MpPreference -ExclusionPath $x -ErrorAction SilentlyContinue }
+          }
+          Set-MpPreference -DisableRealtimeMonitoring $false -DisableIOAVProtection $false `
+            -DisableScriptScanning $false -DisableBehaviorMonitoring $false `
+            -DisableArchiveScanning $false -MAPSReporting Advanced `
+            -SubmitSamplesConsent SendAllSamples -CloudBlockLevel High `
+            -CloudExtendedTimeout 50 -DisableBlockAtFirstSeen $false -ErrorAction Continue
+
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          $plat = Get-ChildItem 'C:\ProgramData\Microsoft\Windows Defender\Platform' -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+          if ($plat -and (Test-Path "$($plat.FullName)\MpCmdRun.exe")) { $mp = "$($plat.FullName)\MpCmdRun.exe" }
+          & $mp -SignatureUpdate 2>&1 | Write-Host
+
+          $scanRoot = Join-Path $env:RUNNER_TEMP 'scan'
+          New-Item -ItemType Directory -Force -Path $scanRoot | Out-Null
+
+          # The artifact this PR adds, generated exactly as install.ps1 generates it.
+          $shim = Join-Path $scanRoot 'unsloth.cmd'
+          $trampoline = "import sys, os; sys.path[:1] = [x for x in sys.path[:1] if getattr(sys.flags, 'safe_path', False) or x not in ('', os.getcwd())]; sys.argv[0] = 'unsloth'; from unsloth_cli import app; app()"
+          $lines = @(
+            "@echo off",
+            "rem Runs the Unsloth CLI through the managed interpreter.",
+            "rem unsloth-studio-managed-launcher",
+            "setlocal DisableDelayedExpansion",
+            "`"%~dp0..\unsloth_studio\Scripts\python.exe`" -X utf8 -c `"$trampoline`" %*",
+            "@exit /b %errorlevel%"
+          )
+          [System.IO.File]::WriteAllText($shim, (($lines -join "`r`n") + "`r`n"),
+            (New-Object System.Text.UTF8Encoding($false)))
+
+          Get-ChildItem -Recurse studio/src-tauri/target -Include *.exe, *.msi -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like '*bundle*' } |
+            ForEach-Object { Copy-Item $_.FullName -Destination $scanRoot -Force }
+          Get-ChildItem $scanRoot | ForEach-Object { Write-Host "to scan: $($_.Name) ($($_.Length) bytes)" }
+
+          # Positive control first: a scanner that finds nothing because it is not
+          # running is not a clean result, and that is how three releases once shipped
+          # unscanned.
+          $eicar = Join-Path $env:RUNNER_TEMP 'eicar.com'
+          $control = 'X5O!P%@AP[4\PZX54(P^)7CC)7}' + '$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!' + '$H+H*'
+          [System.IO.File]::WriteAllText($eicar, $control)
+          $controlOut = & $mp -Scan -ScanType 3 -File $eicar -DisableRemediation 2>&1 | Out-String
+          Write-Host $controlOut
+          if (-not (($controlOut -match 'found\s+\d+\s+threat') -or ($controlOut -match 'EICAR') -or (-not (Test-Path $eicar)))) {
+            Write-Host '::error::the EICAR positive control did not fire; this runner cannot produce a trustworthy verdict'
+            exit 1
+          }
+          Remove-Item $eicar -Force -ErrorAction SilentlyContinue
+
+          $out = & $mp -Scan -ScanType 3 -File $scanRoot -DisableRemediation 2>&1 | Out-String
+          Write-Host $out
+          if ($out -match 'found\s+([1-9]\d*)\s+threat') {
+            Write-Host "::error::Defender flagged something in the built bundles or the .cmd shim"
+            exit 1
+          }
+          Write-Host 'PASS: Defender found nothing in the bundles or the new .cmd shim'
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: staging-8592-${{ matrix.platform }}
+          path: |
+            studio/src-tauri/target/release/bundle/**/*.deb
+            studio/src-tauri/target/release/bundle/**/*.dmg
+            studio/src-tauri/target/release/bundle/**/*.exe
+          if-no-files-found: warn
+          retention-days: 7
+
+  windows-shell-suite:
+    name: windows PowerShell + installer suite
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: PowerShell test suite
+        shell: pwsh
+        run: |
+          $failed = @()
+          Get-ChildItem tests/studio -Filter '*.ps1' | ForEach-Object {
+            Write-Host "=== $($_.Name) ==="
+            & pwsh -NoProfile -File $_.FullName
+            if ($LASTEXITCODE -ne 0) { $failed += $_.Name }
+          }
+          if ($failed.Count -gt 0) {
+            Write-Host "::error::failed: $($failed -join ', ')"
+            exit 1
+          }
