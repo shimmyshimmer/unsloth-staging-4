@@ -1,0 +1,94 @@
+name: "staging-8575 wsl"
+# WSL is neither plain Linux nor Windows: sys.platform reports linux, while the
+# filesystem is the Windows host's. PR 8575 turns on nothing there -- the guard is
+# platform-gated and the Rust pinning only engages for a working directory under
+# System32 -- so the claim to test is that a real WSL distro sees no change at all.
+on:
+  push:
+    branches: ["pr-8575-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+jobs:
+  wsl:
+    name: WSL Ubuntu 24.04 working-directory guard
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up WSL (Ubuntu 24.04)
+        uses: Vampire/setup-wsl@v6
+        with:
+          distribution: Ubuntu-24.04
+          set-as-default: "true"
+          update: "false"
+          additional-packages: ca-certificates git python3 python3-venv python3-pip
+
+      - name: Confirm this really is WSL and reports as Linux
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          grep -qi microsoft /proc/version && echo "WSL kernel confirmed: $(cat /proc/version)"
+          python3 -c "import sys, platform; print(sys.platform, platform.system()); assert sys.platform == 'linux'"
+
+      - name: Install test dependencies inside WSL
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          python3 -m venv .venv
+          ./.venv/bin/python -m pip install -q --upgrade pip
+          ./.venv/bin/python -m pip install -q pytest
+          echo "PIP_RC=$?"
+
+      - name: Run the guard suite inside WSL
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          ./.venv/bin/python -m pytest tests/test_installer_system32_guard.py -q --tb=short
+
+      - name: The guard must be a no-op on this platform
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          ./.venv/bin/python - <<'PY'
+          import os, sys
+          sys.path.insert(0, ".")
+          from unsloth_cli import _system_dir_guard as guard
+
+          # Every shape that would be rewritten on Windows, in one environment.
+          env = {
+              "HF_HOME": "cache",
+              "PYTHONPATH": "lib:/opt/lib",
+              "UNSLOTH_LLAMA_CPP_PATH": "~/llama.cpp",
+              "XDG_CACHE_HOME": "/var/cache/unsloth",
+              "LLAMA_ARG_MODEL": "models/qwen.gguf",
+              "MLX_HOSTFILE": '["127.0.0.1"]',
+              "UNSLOTH_ALLOW_LOCAL_PREQUANT_PATH": "1",
+              "USERPROFILE": os.path.expanduser("~"),
+          }
+          before_env = dict(env)
+          before_path = list(sys.path)
+          before_cwd = os.getcwd()
+
+          for argv in (
+              ["studio", "--api-only", "-H", "127.0.0.1", "-p", "8888"],
+              ["train", "--dataset", "./data.json"],
+              ["studio", "update"],
+              ["--help"],
+              [],
+          ):
+              out = guard.check_working_directory(argv, env, sys.platform)
+              assert out == (None, None, False), (argv, out)
+
+          assert env == before_env, env
+          assert sys.path == before_path
+          assert os.getcwd() == before_cwd
+          print("WSL: guard is a no-op for every invocation shape, env and sys.path untouched")
+          PY
