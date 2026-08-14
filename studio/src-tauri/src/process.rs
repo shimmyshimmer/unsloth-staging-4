@@ -12,12 +12,43 @@ use tauri::{AppHandle, Emitter, Manager};
 
 const MAX_LOG_LINES: usize = 1000;
 
-// An AppImage can be launched from an activated Python environment. Keep the
-// host library path the thin bundle needs, but do not let PYTHONHOME/PYTHONPATH
-// shadow the managed Studio environment.
+// The complete AppImage's library path belongs only to its GTK/WebKit GUI.
+// Never leak AppDir entries—or activated Python overrides—into the managed
+// host Python environment. Caller-provided host paths remain available for
+// CUDA and private runtime discovery.
+#[cfg(target_os = "linux")]
+fn scrub_appimage_library_path() -> Option<std::ffi::OsString> {
+    let appdir = std::env::var_os("APPDIR")?;
+    let library_path = std::env::var_os("LD_LIBRARY_PATH")?;
+    let host_paths: Vec<_> = std::env::split_paths(&library_path)
+        .filter(|path| !path.starts_with(&appdir))
+        .collect();
+    if host_paths.is_empty() {
+        None
+    } else {
+        std::env::join_paths(host_paths).ok()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn apply_scrubbed_appimage_library_path(cmd: &mut Command) {
+    match scrub_appimage_library_path() {
+        Some(library_path) => {
+            cmd.env("LD_LIBRARY_PATH", library_path);
+        }
+        None => {
+            cmd.env_remove("LD_LIBRARY_PATH");
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn scrub_appimage_python_env(cmd: &mut Command) {
     if std::env::var_os("APPIMAGE").is_some() {
+        apply_scrubbed_appimage_library_path(cmd);
+
+        cmd.env_remove("GIO_MODULE_DIR");
+        cmd.env_remove("GIO_EXTRA_MODULES");
         cmd.env_remove("PYTHONHOME");
         cmd.env_remove("PYTHONPATH");
     }
@@ -26,8 +57,99 @@ pub(crate) fn scrub_appimage_python_env(cmd: &mut Command) {
 #[cfg(target_os = "linux")]
 pub(crate) fn scrub_appimage_python_env_tokio(cmd: &mut tokio::process::Command) {
     if std::env::var_os("APPIMAGE").is_some() {
+        match scrub_appimage_library_path() {
+            Some(library_path) => {
+                cmd.env("LD_LIBRARY_PATH", library_path);
+            }
+            None => {
+                cmd.env_remove("LD_LIBRARY_PATH");
+            }
+        }
+        cmd.env_remove("GIO_MODULE_DIR");
+        cmd.env_remove("GIO_EXTRA_MODULES");
+
         cmd.env_remove("PYTHONHOME");
         cmd.env_remove("PYTHONPATH");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod appimage_environment_tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn appimage_isolated_path() -> &'static OsStr {
+        OsStr::new("/tmp/.mount_Unsloth/usr/lib")
+    }
+
+    #[test]
+    fn std_managed_child_drops_only_appdir_and_python_paths() {
+        let _guard = env_lock();
+        let old_appimage = std::env::var_os("APPIMAGE");
+        let old_appdir = std::env::var_os("APPDIR");
+        let old_library_path = std::env::var_os("LD_LIBRARY_PATH");
+        std::env::set_var("APPIMAGE", "/tmp/Unsloth.AppImage");
+        std::env::set_var("APPDIR", "/tmp/.mount_Unsloth");
+        std::env::set_var(
+            "LD_LIBRARY_PATH",
+            "/tmp/.mount_Unsloth/usr/lib:/opt/cuda/lib64:/private/runtime",
+        );
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env("PYTHONHOME", "/activated/python")
+            .env("PYTHONPATH", "/activated/modules")
+            .env("GIO_MODULE_DIR", "/tmp/.mount_Unsloth/usr/lib/gio/modules")
+            .env("GIO_EXTRA_MODULES", "/usr/lib/gio/modules");
+        scrub_appimage_python_env(&mut cmd);
+        let output = cmd.output().expect("run isolated child");
+        let env = String::from_utf8(output.stdout).unwrap();
+        assert!(env.contains("LD_LIBRARY_PATH=/opt/cuda/lib64:/private/runtime"));
+        assert!(!env.contains(appimage_isolated_path().to_string_lossy().as_ref()));
+        assert!(!env.contains("PYTHONHOME="));
+        assert!(!env.contains("PYTHONPATH="));
+
+        assert!(!env.contains("GIO_MODULE_DIR="));
+        assert!(!env.contains("GIO_EXTRA_MODULES="));
+        for (key, old_value) in [
+            ("APPIMAGE", old_appimage),
+            ("APPDIR", old_appdir),
+            ("LD_LIBRARY_PATH", old_library_path),
+        ] {
+            match old_value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn native_package_child_keeps_caller_environment() {
+        let _guard = env_lock();
+        let old_appimage = std::env::var_os("APPIMAGE");
+        std::env::remove_var("APPIMAGE");
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env("LD_LIBRARY_PATH", appimage_isolated_path())
+            .env("PYTHONHOME", "/activated/python")
+            .env("PYTHONPATH", "/activated/modules")
+            .env("GIO_MODULE_DIR", "/native/gio/modules")
+            .env("GIO_EXTRA_MODULES", "/native/gio/extra-modules");
+        scrub_appimage_python_env(&mut cmd);
+        let output = cmd.output().expect("run native-package child");
+        let env = String::from_utf8(output.stdout).unwrap();
+        assert!(env.contains("LD_LIBRARY_PATH=/tmp/.mount_Unsloth/usr/lib"));
+        assert!(env.contains("PYTHONHOME=/activated/python"));
+        assert!(env.contains("PYTHONPATH=/activated/modules"));
+
+        assert!(env.contains("GIO_MODULE_DIR=/native/gio/modules"));
+        assert!(env.contains("GIO_EXTRA_MODULES=/native/gio/extra-modules"));
+        if let Some(value) = old_appimage {
+            std::env::set_var("APPIMAGE", value);
+        }
     }
 }
 
