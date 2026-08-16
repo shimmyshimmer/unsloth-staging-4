@@ -5,7 +5,15 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { useChatPreferencesStore } from "../src/features/chat/stores/chat-preferences-store.ts";
+import { registerBundlerResolver } from "./helpers/kit.ts";
+
+// The store now reaches a relative import written without its extension, which
+// bare node only resolves through this. Registered before the dynamic import,
+// since a static one would be linked first.
+registerBundlerResolver();
+const { useChatPreferencesStore } = await import(
+  "../src/features/chat/stores/chat-preferences-store.ts"
+);
 
 test("deleting a chat leaves its files alone until asked", () => {
   // Files are the destructive half of a delete, so an install that never saw

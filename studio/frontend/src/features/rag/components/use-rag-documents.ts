@@ -5,13 +5,20 @@ import { consumeNativePathToken } from "@/features/native-intents";
 import { toast } from "@/lib/toast";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  PROJECT_SOURCES_CHANGED_EVENT,
+  PROJECT_WORK_CHANGED_EVENT,
   deleteDocument,
   getJob,
+  noteProjectWork,
+  projectWorkCount,
+  reconcileProjectFolderJobs,
   streamJobEvents,
+  subscribeProjectSourcesBroadcast,
   uploadKnowledgeBaseDocument,
   uploadProjectDocument,
   uploadThreadDocument,
 } from "../api/rag-api";
+import { useRagAvailabilityStore } from "../api/rag-availability";
 import {
   type RagDocument,
   type TerminalJobStatus,
@@ -22,6 +29,10 @@ import { resolveVisionOverrides } from "./vision-overrides";
 export interface TrackedDocument extends RagDocument {
   progress?: number | null;
 }
+
+/** Matches the backend's folder scan interval, so a job it starts is counted
+ * within one period of appearing. */
+const FOLDER_RECONCILE_INTERVAL_MS = 30_000;
 
 /** A browser File, or a desktop drop addressed by its native path token. */
 export type RagUploadItem =
@@ -62,6 +73,9 @@ export type RagDocumentScope =
 
 type Lister = () => Promise<RagDocument[]>;
 
+/** Attempts a mutation's reconciling list gets before the gate is released. */
+const REFRESH_RETRIES = 3;
+
 export function useRagDocuments(
   scope: RagDocumentScope | null,
   lister: Lister,
@@ -92,6 +106,13 @@ export function useRagDocuments(
   // True while upload() runs, so the scope-change effect can tell a real switch
   // from lazy thread materialization mid-upload (which must not reset).
   const uploadInFlightRef = useRef(false);
+  // Refreshes are fired from several places at once (a mutation invalidates
+  // before and after, the poll ticks, the scope changes). Two list requests can
+  // complete out of order, so only the newest is allowed to publish: an earlier
+  // one landing last would put the pre-mutation list back and, with it, drop the
+  // indexing state the composer gates sends on.
+  const refreshSeq = useRef(0);
+  const refreshInFlight = useRef(false);
 
   const scopeKey = scope
     ? scope.type === "kb"
@@ -203,14 +224,20 @@ export function useRagDocuments(
     [patchDoc],
   );
 
+  /** Resolves to whether the list is now known: true when this request
+   * published it, or when a newer one took over and owns the answer. False
+   * only when the request still being awaited failed. */
   const refresh = useCallback(
-    async (opts?: { quiet?: boolean }) => {
-      if (!scopeKey) return;
+    async (opts?: { quiet?: boolean; silentErrors?: boolean }) => {
+      if (!scopeKey) return true;
+      const requestId = ++refreshSeq.current;
+      refreshInFlight.current = true;
       if (!opts?.quiet) setLoading(true);
       try {
         // Merge server truth with local progress so a refresh mid-index keeps a
         // live "running %" chip. Failed docs hidden (toast warned at upload).
         const rows = (await lister()).filter((row) => row.status !== "failed");
+        if (refreshSeq.current !== requestId) return true;
         setDocuments((prev) => {
           const merged = rows.map((row) => {
             const tracked = prev.find((p) => p.id === row.id);
@@ -228,15 +255,58 @@ export function useRagDocuments(
           );
           return [...merged, ...pendingLocal];
         });
+        return true;
       } catch (err) {
-        toast.error("Failed to load documents", {
-          description: err instanceof Error ? err.message : String(err),
-        });
+        // A superseded request's failure describes a scope that is no longer
+        // shown, and a host where RAG cannot run answers 503 to every one of
+        // these: neither is worth a toast per composer opened.
+        if (refreshSeq.current !== requestId) return true;
+        if (
+          !opts?.silentErrors &&
+          !useRagAvailabilityStore.getState().isUnavailable()
+        ) {
+          toast.error("Failed to load documents", {
+            description: err instanceof Error ? err.message : String(err),
+          });
+        }
+        return false;
       } finally {
-        if (!opts?.quiet) setLoading(false);
+        // Whoever is newest clears it. A superseded request clearing it would
+        // report the list as known while the one that will publish is still
+        // out, and the composer gates sends on that.
+        if (refreshSeq.current === requestId) {
+          refreshInFlight.current = false;
+          setLoading(false);
+        }
       }
     },
     [scopeKey, lister],
+  );
+
+  // Retry a project list that came back empty because the request failed. One
+  // failed read leaves the composer with no rows, nothing indexing and nothing
+  // polling, while the source it is missing is still being chunked. Counted as
+  // work throughout, so a send waits for the answer rather than for the toast.
+  const loadProjectSources = useCallback(
+    async (projectId: string, opts?: { quiet?: boolean }) => {
+      noteProjectWork(projectId, 1);
+      try {
+        for (let attempt = 0; attempt < REFRESH_RETRIES; attempt += 1) {
+          const last = attempt === REFRESH_RETRIES - 1;
+          // True for a request that published, and for one a newer request has
+          // already outranked.
+          if (await refresh({ quiet: opts?.quiet, silentErrors: !last })) return;
+          if (!last) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, 1000 * (attempt + 1)),
+            );
+          }
+        }
+      } finally {
+        noteProjectWork(projectId, -1);
+      }
+    },
+    [refresh],
   );
 
   // A real switch (thread/KB swap) resets + reloads; first acquiring a scope just
@@ -250,16 +320,32 @@ export function useRagDocuments(
       for (const controller of jobs.values()) controller.abort();
       jobs.clear();
       sigByDocId.current.clear();
+      // Stand down any refresh still in flight for the old scope. Clearing to a
+      // null scope starts no replacement request to outrank it, so without this
+      // its response would repopulate the list that is about to be cleared.
+      refreshSeq.current += 1;
       // Scope changes intentionally clear the old scope before fetching the new
       // one. Keep this synchronous so React StrictMode's setup/cleanup replay
       // cannot cancel the only refresh after prevScopeKeyRef has advanced.
       setDocuments([]);
       if (scope) {
         // eslint-disable-next-line react-hooks/set-state-in-effect
-        void refresh();
+        void (scope.type === "project"
+          ? loadProjectSources(scope.projectId)
+          : refresh());
+      } else {
+        // Nothing is coming for the scope just dropped, and the request that
+        // was is now behind the sequence, so it will not clear these itself.
+        // Left set, the composer reads the list as still unknown and holds
+        // every send.
+        refreshInFlight.current = false;
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        setLoading(false);
       }
     } else if (prev === null && scope && !uploadInFlightRef.current) {
-      void refresh();
+      void (scope.type === "project"
+        ? loadProjectSources(scope.projectId)
+        : refresh());
     }
     return () => {
       // Preserve in-flight tracking when cleanup is the materialization flip,
@@ -275,15 +361,78 @@ export function useRagDocuments(
   // concurrent connections, so streams past the cap may never deliver a terminal
   // frame and leave a chip spinning. While anything is indexing, reconcile against
   // the document list (one request covers every doc) so chips always resolve.
-  const hasIndexing = documents.some(
-    (d) => d.status === "pending" || d.status === "running",
-  );
+  // Work on this project running elsewhere: an upload from the other instance,
+  // or a folder sync. Neither has a row here until it lands.
+  const [workElsewhere, setWorkElsewhere] = useState(0);
+  const workScopeId = scope?.type === "project" ? scope.projectId : null;
+  useEffect(() => {
+    if (!workScopeId) {
+      setWorkElsewhere(0);
+      return;
+    }
+    const read = () => setWorkElsewhere(projectWorkCount(workScopeId));
+    read();
+    // Before the reconcile below: it takes its own lease before its first await,
+    // and an event fired ahead of this listener would be missed, leaving the
+    // composer sendable for the length of the lookup.
+    window.addEventListener(PROJECT_WORK_CHANGED_EVENT, read);
+    // A sync already running on this project has no watcher here after a
+    // reload, and its rows do not exist yet, so nothing else would gate on it.
+    void reconcileProjectFolderJobs(workScopeId);
+    // The backend also enqueues a job per auto-syncing folder on its own timer,
+    // with nothing to announce it. Keep asking while the project is open, or a
+    // scan that starts after this mount gates nothing.
+    const reconcile = setInterval(() => {
+      void reconcileProjectFolderJobs(workScopeId);
+    }, FOLDER_RECONCILE_INTERVAL_MS);
+    // Work in another tab arrives over the same channel.
+    subscribeProjectSourcesBroadcast();
+    return () => {
+      clearInterval(reconcile);
+      window.removeEventListener(PROJECT_WORK_CHANGED_EVENT, read);
+    };
+  }, [workScopeId]);
+
+  const hasIndexing =
+    workElsewhere > 0 ||
+    documents.some((d) => d.status === "pending" || d.status === "running");
   useEffect(() => {
     if (!scopeKey || !hasIndexing) return;
-    const id = setInterval(() => void refresh({ quiet: true }), 4000);
+    // Skip a tick while one is still out. Starting another would retire it
+    // through the sequence gate, and a list slower than the interval would
+    // then never publish: the row this is watching never reaches completed and
+    // a queued send waits forever.
+    const id = setInterval(() => {
+      if (!refreshInFlight.current) {
+        void refresh({ quiet: true });
+      }
+    }, 4000);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scopeKey, hasIndexing]);
+
+  // A project's sources are shown by two independent instances (the composer's
+  // bar and the Sources panel), so each has to pick up the other's mutations.
+  const projectScopeId = scope?.type === "project" ? scope.projectId : null;
+  useEffect(() => {
+    if (!projectScopeId) return;
+    const onChanged = (event: Event) => {
+      const changed = (event as CustomEvent<{ projectId?: string }>).detail
+        ?.projectId;
+      if (changed !== projectScopeId) return;
+      // The refresh an invalidation triggers is quiet, so it does not take the
+      // loading gate, and the mutation that fired it has already released its
+      // own. Count it as work for as long as it runs, or between the two this
+      // instance reports nothing indexing and lets a send go out ahead of the
+      // rows it is about to receive.
+      void loadProjectSources(projectScopeId, { quiet: true });
+    };
+    subscribeProjectSourcesBroadcast();
+    window.addEventListener(PROJECT_SOURCES_CHANGED_EVENT, onChanged);
+    return () =>
+      window.removeEventListener(PROJECT_SOURCES_CHANGED_EVENT, onChanged);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectScopeId]);
 
   // POST one file, then swap its optimistic chip (`tempId`) to the real id; drop
   // the chip if the backend deduped. `seenIds` holds ids present/added this batch.
@@ -372,6 +521,17 @@ export function useRagDocuments(
       // job tracking and optimistic chips alone.
       uploadInFlightRef.current = true;
       setUploading(true);
+      // Published before the first await so the other instance gates from the
+      // moment the upload starts, not once the bytes are in.
+      // The composer passes its project scope explicitly, since the hook's own
+      // can still be null on the render that starts the upload.
+      const knownScope =
+        overrideScope instanceof Promise ? null : (overrideScope ?? scope);
+      const uploadingProjectId =
+        knownScope?.type === "project" ? knownScope.projectId : null;
+      if (uploadingProjectId) {
+        noteProjectWork(uploadingProjectId, 1);
+      }
       try {
         // Show an optimistic chip per file before awaiting the thread id;
         // materialization is a round-trip and gating chips behind it makes a slow
@@ -430,6 +590,9 @@ export function useRagDocuments(
       } finally {
         setUploading(false);
         uploadInFlightRef.current = false;
+        if (uploadingProjectId) {
+          noteProjectWork(uploadingProjectId, -1);
+        }
       }
     },
     [scope, uploadOne, sigBlocksReupload],
@@ -442,6 +605,14 @@ export function useRagDocuments(
       // Forget the dedup signature so re-uploading re-indexes.
       const prevSig = sigByDocId.current.get(documentId);
       sigByDocId.current.delete(documentId);
+      // The chip goes at once but the source is still there until the DELETE
+      // returns, and the sources probe is only invalidated after it does, so a
+      // send in between can still retrieve what the composer says is gone.
+      const removingProjectId =
+        scope?.type === "project" ? scope.projectId : null;
+      if (removingProjectId) {
+        noteProjectWork(removingProjectId, 1);
+      }
       try {
         await deleteDocument(
           documentId,
@@ -453,10 +624,22 @@ export function useRagDocuments(
         toast.error("Delete failed", {
           description: err instanceof Error ? err.message : String(err),
         });
+      } finally {
+        if (removingProjectId) {
+          noteProjectWork(removingProjectId, -1);
+        }
       }
     },
     [documents, scope],
   );
 
-  return { documents, loading, uploading, refresh, upload, remove };
+  return {
+    documents,
+    loading,
+    uploading,
+    hasIndexing,
+    refresh,
+    upload,
+    remove,
+  };
 }

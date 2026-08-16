@@ -1023,6 +1023,9 @@ export const ru = {
       modelDisclaimer: "Показывать предупреждение о модели",
       modelDisclaimerDescription:
         "Показывать сообщение «LLM могут ошибаться» под полем ввода.",
+      projectAttachments: "Общий доступ к файлам в проекте",
+      projectAttachmentsDescription:
+        "Поведение по умолчанию для файлов, прикрепленных в чате, который относится к проекту: индексировать их для всего проекта, чтобы любой чат в нем мог их использовать. Каждый чат может изменить это в меню вложений.",
       thinking: {
         collapseByDefault: "Сворачивать размышления по умолчанию",
         collapseByDefaultDescription:
