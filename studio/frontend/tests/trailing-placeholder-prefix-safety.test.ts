@@ -359,3 +359,45 @@ test("the corpus is run through the placement the adapter actually ships", () =>
     );
   }
 });
+
+// ------------------------------------------------------------- continuation ---
+
+/**
+ * A whole run, the way the adapter does it: the buffer starts at whatever a
+ * Continue was seeded with, and the strip is skipped entirely unless this run
+ * appended reply text of its own.
+ */
+function replayRun(seed: string, chunks: readonly string[]): string {
+  let buffer = seed;
+  let produced = false;
+  for (const chunk of chunks) {
+    buffer += chunk;
+    produced = true;
+  }
+  return produced ? stripTrailingTemplatePlaceholder(buffer) : buffer;
+}
+
+const SEEDED_PARTIAL = "greet(`Hi, ${name}";
+
+test("a continuation that adds nothing leaves the seeded partial alone", () => {
+  // A Continue run is seeded with the previous run's partial. If it finishes
+  // without a text or reasoning delta, having emitted only a tool call, the
+  // buffer holds nothing but that partial. The partial is the middle of a reply
+  // someone is still writing, so trimming its tail is #9098 one step in: the
+  // user presses Continue again and the text is already gone.
+  assert.equal(replayRun(SEEDED_PARTIAL, []), SEEDED_PARTIAL);
+  // And the strip would have cut it, so the gate is what saves it rather than
+  // the input happening not to match.
+  assert.equal(stripTrailingTemplatePlaceholder(SEEDED_PARTIAL), "greet(`Hi,");
+});
+
+test("a continuation that does add text is finished normally", () => {
+  // The gate must not turn into "continuations are never trimmed". A Continue
+  // that writes the rest of the answer produces a finished reply like any
+  // other, artefact and all.
+  assert.equal(replayRun(SEEDED_PARTIAL, ["!", "`)"]), "greet(`Hi, ${name}!`)");
+  assert.equal(
+    replayRun("The answer is 42.", [" ${", "answer}"]),
+    "The answer is 42.",
+  );
+});

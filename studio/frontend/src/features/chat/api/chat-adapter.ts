@@ -4678,6 +4678,12 @@ export function createOpenAIStreamAdapter(
       // What the cap is measured against: only grows, unlike cumulativeText,
       // and counts tool-argument deltas, which never reach it.
       let streamedChars = 0;
+      // Whether this run appended reply text of its own. A continuation is
+      // SEEDED below with the previous run's partial, and that partial is the
+      // middle of a reply someone is still writing rather than the end of a
+      // finished one, so a run that adds nothing to it must not have its tail
+      // trimmed. Read by the trailing-fragment strip after the stream.
+      let producedReplyText = false;
       const continuationPartial = continuation?.partial ?? "";
       // Local backends (and a self-hosted vLLM / llama-server, which get the flags)
       // resume at the exact token boundary, so their output is already the rest of the
@@ -6331,6 +6337,7 @@ export function createOpenAIStreamAdapter(
                 cumulativeText += delta;
               }
               streamedChars += reasoning.length + delta.length;
+              producedReplyText = true;
               // The trailing ${...} strip used to run here, on every arrival.
               // It now runs once, on the finished reply, below the loop. See
               // the comment there.
@@ -6435,7 +6442,13 @@ export function createOpenAIStreamAdapter(
         // whole and this runs on the resumed reply instead. Before the
         // <think> close below, so a fragment at the end of an unterminated
         // reasoning block is still the end of the reply when it is tested.
-        if (isExternalRequest) {
+        //
+        // `producedReplyText` covers the same case one step in: a continuation
+        // that finishes without a text or reasoning delta, having emitted only
+        // a tool call, leaves the buffer holding nothing but the seeded partial.
+        // That partial is a prefix too, so a run that added nothing to it takes
+        // no trim.
+        if (isExternalRequest && producedReplyText) {
           cumulativeText = stripTrailingTemplatePlaceholder(cumulativeText);
         }
         // If the stream ended while we were still inside a

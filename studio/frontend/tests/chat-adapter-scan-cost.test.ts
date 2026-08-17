@@ -303,7 +303,10 @@ const SSE_LOOP_END = "} catch (streamError) {";
 const STRIP_CALL_SITE = "stripTrailingTemplatePlaceholder(cumulativeText)";
 const STRIP_CALL_ANYWHERE = /stripTrailingTemplatePlaceholder\(/;
 const STRIP_CALL_SITES = /stripTrailingTemplatePlaceholder\(cumulativeText\)/g;
-const EXTERNAL_GATE = /if \(isExternalRequest\) \{\s*cumulativeText =\s*$/;
+const EXTERNAL_GATE =
+  /if \(isExternalRequest && producedReplyText\) \{\s*cumulativeText =\s*$/;
+const FLAG_NEXT_TO_APPEND =
+  /streamedChars \+= reasoning\.length \+ delta\.length;\s*producedReplyText = true;/;
 
 test("the adapter strips the trailing fragment through the bounded scan", () => {
   const source = withoutComments(ADAPTER);
@@ -376,12 +379,26 @@ test("the trailing strip runs on the finished reply, not on every arrival", () =
   );
 
   const strip = source.indexOf(STRIP_CALL_SITE);
-  // Still external-only. Local GGUF replies never leaked the fragment and must
-  // not start losing template literals to a strip that stopped being gated.
+  // Still external-only, and still only where this run wrote reply text of its
+  // own. Local GGUF replies never leaked the fragment and must not start losing
+  // template literals to a strip that stopped being gated; a continuation that
+  // adds nothing holds the previous run's PARTIAL, which is a prefix, so
+  // trimming its tail would be #9098 one step in.
   assert.match(
-    source.slice(Math.max(0, strip - 120), strip),
+    source.slice(Math.max(0, strip - 140), strip),
     EXTERNAL_GATE,
-    "the strip is no longer gated on the request being external",
+    "the strip is no longer gated on an external request that produced text",
+  );
+
+  // The flag has to be set where the reply grows, not somewhere a skipped
+  // arrival can miss, and nowhere else.
+  const flagWrites = source.match(/producedReplyText = true;/g) ?? [];
+  assert.equal(flagWrites.length, 1, "one place sets producedReplyText");
+  const loopWithFlag = regionOf(SSE_LOOP_START, SSE_LOOP_END);
+  assert.match(
+    loopWithFlag,
+    FLAG_NEXT_TO_APPEND,
+    "producedReplyText must be set next to the append, inside the loop",
   );
 
   // After the loop and before the reply is turned into content, so the finished
