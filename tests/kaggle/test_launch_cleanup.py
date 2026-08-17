@@ -75,6 +75,24 @@ def _runner(tmp_path: Path, body: str) -> subprocess.Popen:
     )
 
 
+# Every wait below is a guard against a launcher that never dies, not a latency
+# target. These tests each drive a real subprocess that spawns further processes,
+# and the repo suite now runs four of them at once on a four-core runner, where
+# the SIGINT case was observed to need more than 30 seconds of wall clock purely
+# to be scheduled. A wedged launcher still fails this, just later; a starved one
+# no longer reports a defect it does not have.
+_DEATH_BUDGET_SEC = 120
+
+# The stall the launcher sits in while a test signals it. It has to OUTLAST the
+# budget above, which is the whole reason both are named here rather than written
+# at each site. A handler that swallows its signal leaves the process asleep and
+# then resuming: with a stall shorter than the budget it wakes up, runs finish(),
+# deletes the kernels through the ordinary path and exits inside the wait, so the
+# deletion tests pass on a launcher that ignored the signal entirely. Reported on
+# this PR, against a first version that raised the budget past a 60 second stall.
+_STALL_SEC = 900
+
+
 def _await_ready(proc: subprocess.Popen) -> None:
     """Wait for the runner to say it is where the test wants it, past whatever
     the launcher logged on the way there."""
@@ -364,7 +382,7 @@ def _waiting_launcher(outdir: Path) -> str:
             "        launch.push = _push",
             "        def _wait(*a, **kw):",
             "            print('READY', flush=True)",
-            "            time.sleep(60)",
+            "            time.sleep(%d)" % _STALL_SEC,
             "        launch.wait = _wait",
             "        sys.argv = ['launch.py', '--notebook', 'a.ipynb', '--user', 'me',",
             f"                    '--outdir', {str(outdir)!r}]",
@@ -382,7 +400,7 @@ def test_a_signalled_launcher_deletes_its_kernels(tmp_path, signame):
     try:
         _await_ready(proc)
         proc.send_signal(getattr(signal, signame))
-        proc.wait(timeout = 30)
+        proc.wait(timeout = _DEATH_BUDGET_SEC)
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -391,6 +409,13 @@ def test_a_signalled_launcher_deletes_its_kernels(tmp_path, signame):
     ), f"{signame} left the kernel behind; it would bill to its ceiling"
     # And the registry agrees, so no later sweep chases a kernel that is gone.
     assert json.loads((tmp_path / "inflight.json").read_text()) == []
+    # On the signal path, not on the way out of an ordinary run. Without this the
+    # deletion above is satisfied by finish() doing its usual work, so a handler
+    # that swallowed the signal and let the launcher finish normally would pass.
+    assert proc.returncode == -getattr(signal, signame), (
+        f"the kernel was deleted, but the launcher exited {proc.returncode} rather than "
+        f"dying of {signame}, so nothing here says the signal is what did it"
+    )
 
 
 def test_the_exit_status_still_says_it_was_killed(tmp_path):
@@ -400,13 +425,77 @@ def test_the_exit_status_still_says_it_was_killed(tmp_path):
     try:
         _await_ready(proc)
         proc.send_signal(signal.SIGTERM)
-        proc.wait(timeout = 30)
+        proc.wait(timeout = _DEATH_BUDGET_SEC)
     finally:
         if proc.poll() is None:
             proc.kill()
     assert (
         proc.returncode == -signal.SIGTERM
     ), f"expected death by SIGTERM, got returncode {proc.returncode}"
+
+
+def test_the_exit_status_survives_a_release_that_fails(tmp_path):
+    """The way the status above was actually observed to come back 0.
+
+    A delete that raises inside the handler used to propagate out of it, into
+    whatever the main thread was doing. main() catches BaseException and reaches
+    release() by RETURNING, so a first delete that failed and a second that
+    worked -- which is what a transient OSError out of a subprocess spawn on a
+    loaded runner looks like -- turned a cancelled run into `exit 0`. Caught on
+    a contended runner, not by inspection, and reproduced by failing the first
+    delete only.
+
+    The kernel is still deleted, by the retry. What this pins is that the exit
+    status does not depend on the delete having worked at all.
+    """
+    proc = _runner(
+        tmp_path,
+        _waiting_launcher(tmp_path / "out").replace(
+            "        launch.main()",
+            "\n".join(
+                [
+                    "        _calls = []",
+                    "        _real_delete = launch.delete_kernel",
+                    "        def _flaky_delete(slug):",
+                    "            _calls.append(slug)",
+                    "            if len(_calls) == 1:",
+                    "                raise OSError(11, 'Resource temporarily unavailable')",
+                    "            return _real_delete(slug)",
+                    "        launch.delete_kernel = _flaky_delete",
+                    "        launch.main()",
+                ]
+            ),
+        ),
+    )
+    try:
+        _await_ready(proc)
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout = _DEATH_BUDGET_SEC)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == -signal.SIGTERM, (
+        f"a release() that raised turned SIGTERM into returncode {proc.returncode}; "
+        f"a cancelled job would read as a completed one"
+    )
+    # And the retry still did the budget control the handler exists for.
+    assert any("me/k-1" in c for c in _deletions(tmp_path))
+
+
+def test_the_stall_outlasts_the_death_budget():
+    """The relationship the signal tests rest on, asserted rather than assumed.
+
+    Every test above signals a launcher that is asleep and then waits a bounded
+    time for it to die. If the sleep is the shorter of the two, a launcher that
+    ignored its signal simply wakes up, finishes normally and exits inside the
+    wait, and the tests pass on the behaviour they exist to forbid. Tuning either
+    number without the other is easy and silent, so this fails instead.
+    """
+    assert _STALL_SEC > _DEATH_BUDGET_SEC, (
+        f"a launcher that swallows its signal wakes after {_STALL_SEC}s and exits "
+        f"normally inside the {_DEATH_BUDGET_SEC}s wait, so the signal tests would "
+        f"pass without any signal handling at all"
+    )
 
 
 def test_an_unhandled_exception_still_deletes(tmp_path):
@@ -430,7 +519,7 @@ def test_an_unhandled_exception_still_deletes(tmp_path):
         raise RuntimeError("boom")
     """,
     )
-    proc.wait(timeout = 30)
+    proc.wait(timeout = _DEATH_BUDGET_SEC)
     assert any("me/k-1" in c for c in _deletions(tmp_path))
     assert json.loads((tmp_path / "inflight.json").read_text()) == []
 
@@ -444,13 +533,13 @@ def test_kill_9_leaves_it_for_the_sweep(tmp_path):
         f"""
         launch._inflight_add("me/k-9")
         print("READY", flush=True)
-        time.sleep(60)
+        time.sleep({_STALL_SEC})
     """,
     )
     try:
         assert proc.stdout.readline().strip() == "READY"
         proc.send_signal(signal.SIGKILL)
-        proc.wait(timeout = 30)
+        proc.wait(timeout = _DEATH_BUDGET_SEC)
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -569,7 +658,7 @@ def test_a_kernel_pushed_before_the_signal_is_still_deleted(tmp_path):
             "            if len(calls) == 1:",
             "                return {'ok': True, 'slug': slug, 'attempts': attempted}",
             "            print('READY', flush=True)",
-            "            time.sleep(60)",
+            "            time.sleep(%d)" % _STALL_SEC,
             "        launch.push = _push",
             "        sys.argv = ['launch.py', '--notebook', 'a.ipynb', '--notebook', 'b.ipynb',",
             f"                    '--user', 'me', '--outdir', {str(tmp_path / 'out')!r}]",
@@ -580,7 +669,7 @@ def test_a_kernel_pushed_before_the_signal_is_still_deleted(tmp_path):
     try:
         _await_ready(proc)
         proc.send_signal(signal.SIGTERM)
-        proc.wait(timeout = 30)
+        proc.wait(timeout = _DEATH_BUDGET_SEC)
     finally:
         if proc.poll() is None:
             proc.kill()
