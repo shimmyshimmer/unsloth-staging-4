@@ -274,6 +274,40 @@ function withoutComments(source: string): string {
     .join("\n");
 }
 
+/**
+ * The adapter between two anchors, without its comments.
+ *
+ * The length bound is not decoration: editing an end anchor's line slides the
+ * region to the next match hundreds of lines away, and the assertions below go
+ * on passing against the wrong slice.
+ */
+function regionOf(from: string, to: string, maxChars = 120_000): string {
+  const start = ADAPTER.indexOf(from);
+  const end = start === -1 ? -1 : ADAPTER.indexOf(to, start);
+  if (start === -1 || end === -1) {
+    throw new Error(
+      `the region anchors ${JSON.stringify(from)} .. ${JSON.stringify(to)} are gone; this test needs rewriting`,
+    );
+  }
+  if (end - start >= maxChars) {
+    throw new Error(
+      `the region from ${JSON.stringify(from)} to ${JSON.stringify(to)} is ${end - start} chars; an anchor has drifted and this test needs rewriting`,
+    );
+  }
+  return withoutComments(ADAPTER.slice(start, end));
+}
+
+/** Anchors and shapes this file matches against the adapter source. */
+const SSE_LOOP_START = "for await (const chunk of stream) {";
+const SSE_LOOP_END = "} catch (streamError) {";
+const STRIP_CALL_SITE = "stripTrailingTemplatePlaceholder(cumulativeText)";
+const STRIP_CALL_ANYWHERE = /stripTrailingTemplatePlaceholder\(/;
+const STRIP_CALL_SITES = /stripTrailingTemplatePlaceholder\(cumulativeText\)/g;
+const EXTERNAL_GATE =
+  /if \(isExternalRequest && producedReplyText\) \{\s*cumulativeText =\s*$/;
+const FLAG_NEXT_TO_APPEND =
+  /streamedChars \+= reasoning\.length \+ delta\.length;\s*producedReplyText = true;/;
+
 test("the adapter strips the trailing fragment through the bounded scan", () => {
   const source = withoutComments(ADAPTER);
   assert.match(source, /stripTrailingTemplatePlaceholder\(cumulativeText\)/);
@@ -313,13 +347,76 @@ test("the adapter asks the tracker once per arrival, not inside a condition", ()
   );
   assert.match(source, /&&\s*!textEndsInsideThink\s*\)/);
 
-  const strip = source.indexOf("stripTrailingTemplatePlaceholder(cumulativeText)");
   const update = source.indexOf("thinkTags.update(cumulativeText)");
   const ask = source.indexOf("!textEndsInsideThink");
-  assert.equal(strip !== -1 && update !== -1 && ask !== -1, true);
+  assert.equal(update !== -1 && ask !== -1, true);
   assert.equal(
-    strip < update && update < ask,
+    update < ask,
     true,
-    "the tracker must be updated after the strip and before the buffer is asked about",
+    "the tracker must be updated before the buffer is asked about",
+  );
+});
+
+test("the trailing strip runs on the finished reply, not on every arrival", () => {
+  // #9098. The pattern is anchored at the end, so running it once per arrival
+  // tested "ends with ${...}" against every PREFIX of the reply. The one
+  // arrival whose buffer ended at `...${name}` was cut, and reassigning the
+  // result made the cut permanent: "return `Hi, ${name}!`" arrived as
+  // "return `Hi,!`". Nothing about the pattern can fix that, only where it runs.
+  const loop = regionOf(SSE_LOOP_START, SSE_LOOP_END);
+  assert.doesNotMatch(
+    loop,
+    STRIP_CALL_ANYWHERE,
+    "the strip is back inside the SSE loop, where it sees prefixes of the reply rather than the reply",
+  );
+
+  const source = withoutComments(ADAPTER);
+  const calls = source.match(STRIP_CALL_SITES) ?? [];
+  assert.equal(
+    calls.length,
+    1,
+    "one call site: the finished reply is stripped once, and a second site would be a second chance to cut a prefix",
+  );
+
+  const strip = source.indexOf(STRIP_CALL_SITE);
+  // Still external-only, and still only where this run wrote reply text of its
+  // own. Local GGUF replies never leaked the fragment and must not start losing
+  // template literals to a strip that stopped being gated; a continuation that
+  // adds nothing holds the previous run's PARTIAL, which is a prefix, so
+  // trimming its tail would be #9098 one step in.
+  assert.match(
+    source.slice(Math.max(0, strip - 140), strip),
+    EXTERNAL_GATE,
+    "the strip is no longer gated on an external request that produced text",
+  );
+
+  // The flag has to be set where the reply grows, not somewhere a skipped
+  // arrival can miss, and nowhere else.
+  const flagWrites = source.match(/producedReplyText = true;/g) ?? [];
+  assert.equal(flagWrites.length, 1, "one place sets producedReplyText");
+  const loopWithFlag = regionOf(SSE_LOOP_START, SSE_LOOP_END);
+  assert.match(
+    loopWithFlag,
+    FLAG_NEXT_TO_APPEND,
+    "producedReplyText must be set next to the append, inside the loop",
+  );
+
+  // After the loop and before the reply is turned into content, so the finished
+  // text is what gets stripped and what gets saved.
+  const loopEnd = source.indexOf(SSE_LOOP_END);
+  assert.notEqual(loopEnd, -1);
+  assert.equal(
+    loopEnd < strip,
+    true,
+    "the strip must sit after the SSE loop, not inside it",
+  );
+  const finalBuild = source.indexOf(
+    "buildAssistantContent(mergeContinuation(cumulativeText))",
+    strip,
+  );
+  assert.equal(
+    finalBuild > strip,
+    true,
+    "the finished reply is built before the strip runs, so the strip cannot reach what is saved",
   );
 });
