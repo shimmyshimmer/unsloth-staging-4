@@ -90,12 +90,17 @@ jobs:
           Set-Content -LiteralPath (Join-Path $bareTarget 'keepme.txt') -Value 'do not delete'
           $bareLink = Join-Path $bare 'link'
           cmd /c mklink /J "$bareLink" "$bareTarget" | Out-Host
-          Remove-Item -LiteralPath $bareLink -Recurse -Force -ErrorAction SilentlyContinue
+          # Measurements, not assertions: both of these are ways of deleting a
+          # junction that the guard deliberately does not use, and on 5.1 either
+          # can throw in a way -ErrorAction cannot suppress, so catch and record.
+          try { Remove-Item -LiteralPath $bareLink -Recurse -Force -ErrorAction SilentlyContinue }
+          catch { Write-Host "unguarded -Recurse threw: $($_.Exception.GetType().Name)" }
           Write-Host "unguarded -Recurse: target intact=$(Test-Path -LiteralPath (Join-Path $bareTarget 'keepme.txt')) link gone=$(-not (Test-Path -LiteralPath $bareLink))"
           # And the same without -Recurse, which is what the guard used to do.
           $bareLink2 = Join-Path $bare 'link2'
           cmd /c mklink /J "$bareLink2" "$bareTarget" | Out-Host
-          Remove-Item -LiteralPath $bareLink2 -Force -ErrorAction SilentlyContinue
+          try { Remove-Item -LiteralPath $bareLink2 -Force -ErrorAction SilentlyContinue }
+          catch { Write-Host "unguarded no -Recurse threw: $($_.Exception.GetType().Name)" }
           Write-Host "unguarded no -Recurse: target intact=$(Test-Path -LiteralPath (Join-Path $bareTarget 'keepme.txt')) link gone=$(-not (Test-Path -LiteralPath $bareLink2))"
 
           $root = Join-Path $env:RUNNER_TEMP 'sweep'
