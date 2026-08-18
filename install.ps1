@@ -15,6 +15,29 @@
 function Install-UnslothStudio {
     $ErrorActionPreference = "Stop"
 
+    # Same opt-in phase timing as studio/setup.ps1 (see the note there). It has to start
+    # HERE, not only in the child: `install.ps1 --local --no-torch` is what Windows CI
+    # actually runs, and the uv bootstrap plus the whole Unsloth dependency install happen
+    # in this script before it hands off around the Invoke-ManagedUnslothCli call. Timing
+    # only the child would leave the larger half of the 260-291s unattributed and restart
+    # the clock at the handoff, which is precisely the question the switch exists to answer.
+    #
+    # The start is published to the child as UTC ticks so its numbers continue this clock
+    # instead of counting from their own zero. `[bool]` alone is not enough: in PowerShell
+    # every non-empty string is true, so UNSLOTH_INSTALL_TIMING=0 would enable it.
+    $script:StudioTimingEnabled = [bool]($env:UNSLOTH_INSTALL_TIMING) -and ($env:UNSLOTH_INSTALL_TIMING -ne '0')
+    $script:StudioTimingSw = [System.Diagnostics.Stopwatch]::StartNew()
+    # Saved and restored like every other handoff variable in this script, because the
+    # documented `irm ... | iex` entry point runs in the CALLER's process: an origin left
+    # behind there outlives this install. The next run in that session would refuse to
+    # replace it and a later `unsloth studio update` would inherit it, so both would
+    # report seconds since the FIRST install rather than since they started.
+    $script:PreviousInstallTimingT0 = $env:UNSLOTH_INSTALL_TIMING_T0
+    $script:HadPreviousInstallTimingT0 = ($null -ne $script:PreviousInstallTimingT0)
+    if ($script:StudioTimingEnabled) {
+        $env:UNSLOTH_INSTALL_TIMING_T0 = [System.DateTime]::UtcNow.Ticks.ToString()
+    }
+
     # The user's PowerShell profile has already run by the time this does, and the documented
     # piped web entry point documented in the README has no script file to re-launch
     # with -NoProfile, so each way a profile can reach in here is cut individually below.
@@ -801,6 +824,15 @@ public static class UnslothStudioFinalPathV2
             [Parameter(Mandatory = $true)][string]$Value,
             [string]$Color = "Green"
         )
+        # Prefix the VALUE, before the sinks diverge, so both branches carry the timing
+        # without touching their formatting. Inline and Test-Path-guarded rather than a
+        # helper call: this function is sliced out and run ON ITS OWN by
+        # tests/python/test_windows_setup_output_encoding.py, where neither a helper nor
+        # the $script: state above exists, and reading an unset $script: variable under a
+        # caller's Set-StrictMode is fatal rather than empty.
+        if ((Test-Path Variable:script:StudioTimingEnabled) -and $script:StudioTimingEnabled) {
+            $Value = ("[{0,7:N1}s] " -f $script:StudioTimingSw.Elapsed.TotalSeconds) + $Value
+        }
         if ($script:StudioVtOk -and -not $env:NO_COLOR) {
             $dim = Get-StudioAnsi Dim
             $rst = Get-StudioAnsi Reset
@@ -835,6 +867,10 @@ public static class UnslothStudioFinalPathV2
             [Parameter(Mandatory = $true)][string]$Message,
             [string]$Color = "DarkGray"
         )
+        # Same reasoning as `step` above: prefix once, inline, guarded.
+        if ((Test-Path Variable:script:StudioTimingEnabled) -and $script:StudioTimingEnabled) {
+            $Message = ("[{0,7:N1}s] " -f $script:StudioTimingSw.Elapsed.TotalSeconds) + $Message
+        }
         if ($script:StudioVtOk -and -not $env:NO_COLOR) {
             $msgCol = switch ($Color) {
                 'Yellow' { (Get-StudioAnsi Warn) }
@@ -5753,6 +5789,12 @@ exit 0
             Exit-StudioInstallMutex -Mutex $studioRuntimeMutexes[$i]
         }
         Exit-StudioInstallMutex -Mutex $studioInstallMutex
+        # In the finally, so a failed install does not leave the origin behind either.
+        if ($script:HadPreviousInstallTimingT0) {
+            $env:UNSLOTH_INSTALL_TIMING_T0 = $script:PreviousInstallTimingT0
+        } else {
+            Remove-Item Env:UNSLOTH_INSTALL_TIMING_T0 -ErrorAction SilentlyContinue
+        }
     }
     if ($null -ne $studioAutoStartProcess) {
         $studioAutoStartProcess.WaitForExit()
