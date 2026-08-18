@@ -679,7 +679,28 @@ async def delete_threads(
     # In a worker: right after an upgrade this also runs the legacy move, and a
     # cross-filesystem copy on the event loop stops every other request.
     removed, kept = await _remove_sandboxes(payload.ids, payload.delete_files)
+    # Archived turns are keyed by thread id and unreferenced once the thread is gone, so
+    # drop them rather than leaking a scope per deleted chat.
+    await run_in_threadpool(_remove_conversation_archives, payload.ids)
     return {"status": "deleted", "sandboxes_removed": removed, "sandboxes_kept": kept}
+
+
+def _remove_conversation_archives(thread_ids) -> None:
+    """Drop each deleted thread's archived turns. Never raises."""
+    try:
+        from core.rag import conversation_archive
+    except Exception:
+        return
+    for thread_id in thread_ids or []:
+        # As next to the sandbox removal: the rows went first and the sandbox pass ran in
+        # between, so another tab can have recreated this id and already be archiving
+        # turns under it. That chat is alive, and its memory is not this delete's to take.
+        if get_chat_thread(str(thread_id)) is not None:
+            continue
+        try:
+            conversation_archive.delete_for_thread(str(thread_id))
+        except Exception:
+            logger.warning("Could not remove the conversation archive for %s", thread_id)
 
 
 async def _remove_sandboxes(thread_ids, delete_files: bool) -> "tuple[int, list[str]]":
@@ -1005,6 +1026,8 @@ async def delete_project(
     # By run id: the rows are gone by now, so there is nothing left to look up.
     _cancel_research_runs(request, list(project.get("activeResearchRunIds") or []))
     _cancel_active_generations(member_ids)
+    # The project's chats go with it, so their archives have to as well.
+    await run_in_threadpool(_remove_conversation_archives, member_ids)
     if project.get("sandboxPath"):
         from core.inference.tools import (
             finish_workspace_delete_when_idle,
@@ -1294,6 +1317,11 @@ async def clear_history(
         _cancel_active_generations(late)
     # By id: the rows went with the threads, so nothing can look them up now.
     _cancel_research_runs(request, cleared_runs)
+    # Same archive cleanup as DELETE /threads. Without it "Clear all chats" leaves every
+    # conversation searchable in rag.db, and a reused thread id reads the old archive.
+    await run_in_threadpool(
+        _remove_conversation_archives, list(dict.fromkeys(thread_ids + cleared))
+    )
     # "Clear all chats" is the common bulk delete, so it has to clean up the
     # same folders DELETE /threads does; otherwise every sandbox is stranded.
     # delete_files matches DELETE /threads: off by default, since the files are

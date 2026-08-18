@@ -24,6 +24,27 @@ RRF_K = int(os.environ.get("RAG_RRF_K", "60"))
 THREAD_WHOLE_DOC = os.environ.get("RAG_THREAD_WHOLE_DOC", "1") == "1"
 WHOLE_DOC_MAX_TOKENS = int(os.environ.get("RAG_WHOLE_DOC_MAX_TOKENS", "6000"))
 
+# Conversation archive: turns evicted by the rolling context window go to a per-thread
+# searchable scope and the relevant ones are recalled on the turn that evicted them. Off
+# restores plain eviction. Only applies once the window evicts, which is itself opt-in
+# per request via context_overflow="truncate_oldest".
+CONVERSATION_ARCHIVE = os.environ.get("RAG_CONVERSATION_ARCHIVE", "1") == "1"
+CONVERSATION_ARCHIVE_TOP_K = int(os.environ.get("RAG_CONVERSATION_ARCHIVE_TOP_K", "4"))
+# Room held back during the fit for the turns recalled straight after it. Sized to
+# CONVERSATION_ARCHIVE_TOP_K * CHUNK_TOKENS with slack for the wrapper text.
+CONVERSATION_RECALL_RESERVE_TOKENS = int(
+    os.environ.get("RAG_CONVERSATION_RECALL_RESERVE_TOKENS", "2048")
+)
+# Shape the archive's lexical query: require the identifier-like tokens first, drop
+# function words from the fallback. Off restores the plain OR-of-every-token that every
+# other RAG scope uses, and the candidate set is then identical to before.
+CONVERSATION_QUERY_FOCUS = os.environ.get("RAG_CONVERSATION_QUERY_FOCUS", "1") == "1"
+# "chronological" presents recalled turns oldest first, labelled with their position, and
+# says a later turn supersedes an earlier one. "relevance" restores the previous
+# rendering byte for byte. Presentation only: neither setting changes which turns are
+# selected, which is what keeps "what did I originally say" working.
+CONVERSATION_RECALL_ORDER = os.environ.get("RAG_CONVERSATION_RECALL_ORDER", "chronological")
+
 UPLOAD_EXTS = {".pdf", ".txt", ".md", ".markdown", ".docx", ".html", ".htm"}
 # Reject uploads larger than this, so one pathological file can't drive unbounded parse
 # + vision work at ingest. 0 disables the cap. Default 200 MB.
