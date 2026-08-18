@@ -1984,6 +1984,9 @@ const VISIBLE_MODEL_RUNTIME_KEYS = [
   "loadedNUbatch",
   "tensorParallel",
   "loadedTensorParallel",
+  "loadedDisableVision",
+  "disableVision",
+  "loadedVisionDisabledByUser",
   "gpuMemoryMode",
   "loadedGpuMemoryMode",
   "loadedCpuFallback",
@@ -2667,6 +2670,9 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
     gpu_memory_mode?: "auto" | "manual";
     cache_type_kv?: string | null;
     tensor_parallel?: boolean | null;
+    // The projector is part of what the guard has to size: a load that skips
+    // it needs ~1 GB less, and charging for it would refuse loads that fit.
+    disable_vision?: boolean | null;
     // The estimate charges a drafter whose size differs by mode (a DSpark
     // sidecar is ~11 GB, and Auto reaches it), so this preflight has to be told
     // what the load will send or it sizes a different model.
@@ -2850,6 +2856,8 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
     const effectiveTensorParallel = isDiffusion
       ? false
       : config.tensorParallel;
+    // The diffusion runner has no projector to skip, so the toggle is inert there.
+    const effectiveDisableVision = isDiffusion ? false : config.disableVision;
     const effectiveGpuIds =
       config.selectedGpuIds !== undefined
         ? reconcilePersistedGpuIds(
@@ -2884,6 +2892,7 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
         gguf_variant: candidate.ggufVariant,
         cache_type_kv: config.kvCacheDtype,
         tensor_parallel: effectiveTensorParallel,
+        disable_vision: effectiveDisableVision,
         // The same values the load below sends.
         speculative_type: effectiveSpeculativeType,
         spec_draft_n_max: effectiveSpecDraftNMax,
@@ -2935,6 +2944,7 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
       speculative_type: effectiveSpeculativeType,
       spec_draft_n_max: effectiveSpecDraftNMax,
       tensor_parallel: effectiveTensorParallel,
+      disable_vision: effectiveDisableVision,
       // GGUF-only: the safetensors fallback loads via HF auto-placement (no
       // explicit pins). The split ratio is deliberately never remembered
       // (positionally bound to an exact GPU set), so auto-load leaves llama.cpp's
@@ -3077,6 +3087,13 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
               : (resolvedExtraArgs ?? null),
           tensorParallel: loadResp.tensor_parallel ?? false,
           loadedTensorParallel: loadResp.tensor_parallel ?? false,
+          loadedDisableVision: loadResp.disable_vision ?? false,
+          // Repaired from the echo alongside tensorParallel: this load picked its
+          // own model and config, so a stale true would show Vision off over a
+          // loaded projector, and the next Apply would send it.
+          disableVision: loadResp.disable_vision ?? false,
+          loadedVisionDisabledByUser:
+            loadResp.vision_disabled_by_user ?? false,
           ...loadedGpuMemoryFields(loadResp),
           loadedCustomContextLength: keepCustomCtx,
           defaultChatTemplate: loadResp.chat_template ?? null,
@@ -3116,6 +3133,13 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
           loadedLlamaExtraArgs: null,
           tensorParallel: loadResp.tensor_parallel ?? false,
           loadedTensorParallel: loadResp.tensor_parallel ?? false,
+          loadedDisableVision: loadResp.disable_vision ?? false,
+          // Cleared, not carried, like the GGUF-only knobs above: a safetensors
+          // load has no projector, and a stale true would stage it for the next
+          // model that has one.
+          disableVision: false,
+          loadedVisionDisabledByUser:
+            loadResp.vision_disabled_by_user ?? false,
           // Non-GGUF response: clears any stale GPU baseline a prior manual-GPU
           // GGUF load left, matching the interactive/status sibling load paths.
           ...loadedGpuMemoryFields(loadResp),
@@ -3430,6 +3454,11 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
         loadedNUbatch: null,
         tensorParallel: loadResp.tensor_parallel ?? false,
         loadedTensorParallel: loadResp.tensor_parallel ?? false,
+        loadedDisableVision: loadResp.disable_vision ?? false,
+        // The request above omits disable_vision, so the echo is what the load
+        // ran with; adopting it stops a previous model's Vision-off carrying over.
+        disableVision: loadResp.disable_vision ?? false,
+        loadedVisionDisabledByUser: loadResp.vision_disabled_by_user ?? false,
         ...loadedGpuMemoryFields(loadResp),
         // Drives the GPU Memory controls' diffusion gate; set alongside the
         // GPU fields on every load path so the gate can't read stale.
@@ -4508,6 +4537,7 @@ export function createOpenAIStreamAdapter(
           loadedIsMultimodal: runtime.loadedIsMultimodal,
           modelLoaded: !!params.checkpoint && !runtime.modelLoading,
           loadError: runtime.lastModelLoadError,
+          visionDisabledByUser: runtime.loadedVisionDisabledByUser,
         });
         if (imageGateReason) {
           toast.error(imageGateReason);
