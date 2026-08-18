@@ -9,6 +9,7 @@ import {
 } from "@/components/assistant-ui/think-aria-label";
 import { Button } from "@/components/ui/button";
 import { BulbIcon } from "@/lib/bulb-icon";
+import { MenuDismissGuard } from "@/lib/menu-dismiss-guard";
 import { MicIcon } from "@/lib/mic-icon";
 import { Tick02Icon } from "@/lib/tick-icon";
 import { cn } from "@/lib/utils";
@@ -2149,6 +2150,7 @@ export function SharedComposer({
           {/* Same + menu as single-chat (ComposerToolsMenu), wired to the
               compare composer's own file/audio inputs and tools. */}
           <DropdownMenu
+            modal={false}
             onOpenChange={(open) => {
               if (open) void refreshRecentPrompts();
             }}
@@ -2170,6 +2172,7 @@ export function SharedComposer({
               className="unsloth-plus-menu w-[244px]"
               onCloseAutoFocus={(event) => event.preventDefault()}
             >
+              <MenuDismissGuard />
               <DropdownMenuItem onSelect={() => fileInputRef.current?.click()}>
                 <HugeiconsIcon icon={AttachmentIcon} strokeWidth={2} />
                 Add photos &amp; files
@@ -2413,7 +2416,7 @@ export function SharedComposer({
         <div className="ml-auto mr-0.5 flex items-center gap-1.5">
           {showReasoningControl ? (
             isEffort || supportsPreserveThinking ? (
-              <DropdownMenu>
+              <DropdownMenu modal={false}>
                 <DropdownMenuTrigger asChild={true}>
                   <button
                     type="button"
@@ -2449,6 +2452,7 @@ export function SharedComposer({
                     narrowEffortMenu ? "min-w-40" : "min-w-44",
                   )}
                 >
+                  <MenuDismissGuard />
                   {isEffort ? (
                     <>
                       {effectiveSupportsReasoningOff && (

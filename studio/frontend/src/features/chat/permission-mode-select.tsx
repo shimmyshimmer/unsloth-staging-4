@@ -24,6 +24,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ChevronDownStandardIcon } from "@/lib/chevron-icons";
+import { MenuDismissGuard } from "@/lib/menu-dismiss-guard";
 import { SparklesGlyph } from "@/lib/sparkles-icon";
 import { Tick02Icon } from "@/lib/tick-icon";
 import { cn } from "@/lib/utils";
@@ -195,6 +196,44 @@ export function PermissionModeDropdown({
 
   return (
     <>
+      {/* This dropdown stays MODAL, like the preset menu above it in the settings
+      panel, and unlike the ten menus this branch leaves off the modal layer. The
+      composer pill below is a separate component and stays non-modal, so the hot
+      chat path is unaffected.
+
+      Why: `ChatSettingsPanel` renders this in the Tools section
+      (chat-settings-sheet.tsx), between `ConfirmToolCallsToggle` and two
+      `ParamSlider`s. Radix Slider commits in onPointerDown -> onSlideStart ->
+      updateValues -> onValueChange (radix-ui/primitives slider.tsx), and
+      `ParamSlider` wires that into the store, so the press that dismisses a
+      non-modal menu also lands a value. `MenuDismissGuard` only cancels the later
+      click, which is too late, and cancelling the pointerdown was measured and
+      rejected on this branch because it kills every drag that starts from a React
+      onPointerDown.
+
+      Measured on chromium at 1440x900 with a default install (no saved presets),
+      real page.mouse press and release. Both trees put the menu at the identical
+      rect, flipped to side="top" by avoidCollisions: x 1112, y 329, 300x315. Two
+      Sampling sliders sit under it; "Max Tool Calls Per Message" sits 101 px clear
+      below its bottom edge and "Max Tool Call Duration" 169 px, both fully visible.
+      Pressing the first one:
+
+        merge base (modal)  elementFromPoint HTML, body pointer-events none, 25 -> 25
+        head  (non-modal)   elementFromPoint slider-track,               25 -> 40
+
+      The 40 reached chat_settings in studio.db and survived a full reload. So this
+      is not a repaint, it is a persisted generation setting the user did not ask
+      for, and it is reachable out of the box rather than only with saved presets.
+
+      The other instance, General settings (features/settings/tabs/general-tab.tsx),
+      has no slider on its tab and is inside a modal Dialog either way; keeping one
+      shape for both is simpler than a prop, and neither call site is the hot path
+      this branch is about.
+
+      The MenuDismissGuard below stays mounted for the same reason it does on the
+      preset menu: Radix mounts content whenever the menu is open, modal or not, so
+      it arms alongside the shield rather than instead of it, both swallow the same
+      click, and the protection survives if this is ever flipped back. */}
       <DropdownMenu>
         <DropdownMenuTrigger asChild={true}>
           <Button
@@ -222,6 +261,7 @@ export function PermissionModeDropdown({
           className="w-[300px]"
           avoidCollisions={true}
         >
+          <MenuDismissGuard />
           <DropdownMenuLabel>
             How should tool calls be approved?
           </DropdownMenuLabel>
@@ -263,7 +303,7 @@ export function PermissionModeComposerPill({
   const fullAccess = permissionMode === "full";
 
   return (
-    <DropdownMenu>
+    <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild={true}>
         <button
           type="button"
@@ -292,6 +332,7 @@ export function PermissionModeComposerPill({
         avoidCollisions={true}
         className="unsloth-plus-menu w-[300px]"
       >
+        <MenuDismissGuard />
         <DropdownMenuLabel>
           How should tool calls be approved?
         </DropdownMenuLabel>
