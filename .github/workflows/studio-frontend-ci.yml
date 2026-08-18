@@ -156,36 +156,6 @@ jobs:
         run: npm test
 
 
-      - name: Install Chromium for browser smokes
-        working-directory: ${{ github.workspace }}
-        run: |
-          python3 -m pip install 'playwright>=1.45,<2' pytest
-          python3 -m playwright install --with-deps chromium
-
-      # Cheap and browserless, but it imports the harnesses, which import playwright, so it has
-      # to sit after the install. Covers the Windows teardown branch no runner here executes.
-      - name: Dev-server lifecycle tests
-        working-directory: ${{ github.workspace }}
-        run: |
-          python3 -m pytest tests/studio/test_playwright_server_lifecycle.py \
-            tests/studio/test_autoscroll_harness_contract.py -q
-
-      - name: Browser smoke for ANSI tool output
-        working-directory: ${{ github.workspace }}
-        env:
-          PW_BROWSER: chromium
-        run: python3 tests/studio/playwright_strip_ansi_smoke.py
-
-      # Each harness owns its vite dev server, like the ANSI smoke above. Starting one here
-      # would background npm, so $! is the wrapper and killing it orphans the node child.
-      - name: Browser smoke for chat autoscroll
-        working-directory: ${{ github.workspace }}
-        run: python3 tests/studio/playwright_chat_autoscroll.py
-
-      - name: Browser smoke for research freeze
-        working-directory: ${{ github.workspace }}
-        run: python3 tests/studio/playwright_research_freeze.py
-
       - name: Build
         run: npm run build
 
@@ -216,6 +186,49 @@ jobs:
       # everything Vite preloads for it, fetched and executed before first paint.
       - name: Startup bundle budget
         run: npm run bundle:check
+
+      # Smokes go last: every step carries an implicit success(), so running them ahead of
+      # the build gates let one red smoke skip the build and all three bundle assertions.
+      # Costs nothing here, since each smoke starts its own vite server and reads no dist/.
+      - name: Install Chromium for browser smokes
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 -m pip install 'playwright>=1.45,<2' pytest
+          python3 -m playwright install --with-deps chromium
+
+      # Browserless, but imports the harnesses (hence playwright), so it sits after the
+      # install. Covers the Windows teardown branch no runner here executes.
+      - name: Dev-server lifecycle tests
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 -m pytest tests/studio/test_playwright_server_lifecycle.py \
+            tests/studio/test_autoscroll_harness_contract.py -q
+
+      - name: Browser smoke for ANSI tool output
+        working-directory: ${{ github.workspace }}
+        env:
+          PW_BROWSER: chromium
+        run: python3 tests/studio/playwright_strip_ansi_smoke.py
+
+      # Each harness owns its vite server: starting one here backgrounds npm, so $! is the
+      # wrapper and killing it orphans the node child.
+      - name: Browser smoke for chat autoscroll
+        working-directory: ${{ github.workspace }}
+        run: python3 tests/studio/playwright_chat_autoscroll.py
+
+      - name: Browser smoke for research freeze
+        working-directory: ${{ github.workspace }}
+        run: python3 tests/studio/playwright_research_freeze.py
+
+      # Screenshot and serialized DOM the harnesses write on failure; small, kept only then.
+      - name: Upload browser smoke artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: studio-frontend-smoke-artifacts
+          path: logs/playwright-*
+          retention-days: 3
+          if-no-files-found: ignore
 
       - name: Biome (non-blocking until accumulated drift is cleared)
         continue-on-error: true
