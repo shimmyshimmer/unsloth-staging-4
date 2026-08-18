@@ -115,9 +115,17 @@ jobs:
           (Get-Item -LiteralPath $stale -Force).LastWriteTime = (Get-Date).AddDays(-3)
           $link = Join-Path $roots 'ust-2-link'
           cmd /c mklink /J "$link" "$target" | Out-Host
+          # Age the junction. A timestamp write through the link lands on the
+          # TARGET, not the reparse point, so age both and then report what the
+          # sweep will actually read -- the sweep skips anything inside its cutoff,
+          # and a junction that still looks fresh would never reach the guard.
           (Get-Item -LiteralPath $link -Force).LastWriteTime = (Get-Date).AddDays(-3)
+          (Get-Item -LiteralPath $target -Force).LastWriteTime = (Get-Date).AddDays(-3)
           $fresh = Join-Path $roots 'ust-3-fresh'
           New-Item -ItemType Directory -Path $fresh -Force | Out-Null
+          foreach ($e in @(Get-ChildItem -LiteralPath $roots -Directory -Filter "ust-*")) {
+              Write-Host "sweep sees $($e.Name) lastWrite=$($e.LastWriteTime.ToString('s')) reparse=$([bool]($e.Attributes -band [System.IO.FileAttributes]::ReparsePoint))"
+          }
 
           $env:SWEEP_ROOT = $roots
           & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\.github\staging9178\sweep_junction.ps1 | Out-Host
