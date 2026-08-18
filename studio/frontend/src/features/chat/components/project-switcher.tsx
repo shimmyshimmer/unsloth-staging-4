@@ -9,6 +9,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Folder01Icon } from "@hugeicons/core-free-icons";
+import { MenuDismissGuard } from "@/lib/menu-dismiss-guard";
 import { Tick02Icon } from "@/lib/tick-icon";
 import { ChevronDownStandardIcon } from "@/lib/chevron-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
@@ -38,7 +39,7 @@ export function ProjectSwitcher({
   const [open, setOpen] = useState(false);
 
   return (
-    <DropdownMenu open={active && open} onOpenChange={(o) => setOpen(active && o)}>
+    <DropdownMenu open={active && open} onOpenChange={(o) => setOpen(active && o)} modal={false}>
       <DropdownMenuTrigger asChild={true}>
         <button
           type="button"
@@ -77,6 +78,7 @@ export function ProjectSwitcher({
         sideOffset={0}
         className="unsloth-plus-menu ring-0 min-w-56 max-w-72 font-heading"
       >
+        <MenuDismissGuard />
         {/* Scroll the list here, not the container, so the rounded corners on
             the scrollbar side are not squared off. */}
         <div className="max-h-72 overflow-y-auto">
