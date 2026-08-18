@@ -2,6 +2,14 @@ name: "staging-9178 macos-14"
 on:
   push:
     branches: ["pr-9178-xplat-ci"]
+    # macOS is capped at five concurrent jobs account-wide, so tests/studio/
+    # test_macos_slots_per_commit.py requires every macOS push trigger to say what
+    # it depends on. These are exactly the files unslothai/unsloth#9178 touches.
+    paths:
+      - "install.ps1"
+      - "tests/python/test_windows_installer_addtype_fallback.py"
+      - "tests/python/test_windows_installer_concurrency_guard.py"
+      - ".github/workflows/staging-9178-macos-14.yml"
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

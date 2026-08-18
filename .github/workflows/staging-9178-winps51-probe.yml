@@ -91,7 +91,12 @@ jobs:
           $bareLink = Join-Path $bare 'link'
           cmd /c mklink /J "$bareLink" "$bareTarget" | Out-Host
           Remove-Item -LiteralPath $bareLink -Recurse -Force -ErrorAction SilentlyContinue
-          Write-Host "unguarded -Recurse on a junction left the target intact: $(Test-Path -LiteralPath (Join-Path $bareTarget 'keepme.txt'))"
+          Write-Host "unguarded -Recurse: target intact=$(Test-Path -LiteralPath (Join-Path $bareTarget 'keepme.txt')) link gone=$(-not (Test-Path -LiteralPath $bareLink))"
+          # And the same without -Recurse, which is what the guard used to do.
+          $bareLink2 = Join-Path $bare 'link2'
+          cmd /c mklink /J "$bareLink2" "$bareTarget" | Out-Host
+          Remove-Item -LiteralPath $bareLink2 -Force -ErrorAction SilentlyContinue
+          Write-Host "unguarded no -Recurse: target intact=$(Test-Path -LiteralPath (Join-Path $bareTarget 'keepme.txt')) link gone=$(-not (Test-Path -LiteralPath $bareLink2))"
 
           $root = Join-Path $env:RUNNER_TEMP 'sweep'
           $target = Join-Path $root 'precious'
