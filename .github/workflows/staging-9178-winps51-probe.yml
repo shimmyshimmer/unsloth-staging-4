@@ -1,0 +1,136 @@
+name: "staging-9178 Windows PowerShell 5.1 probe"
+
+# Everything else about unslothai/unsloth#9140 was verified from Linux under
+# pwsh 7. The two behaviours this fix turns on cannot be observed there:
+#
+#   * Windows PowerShell 5.1 compiles Add-Type by writing the source into %TEMP%
+#     and shelling out to csc.exe. pwsh 7 uses in-memory Roslyn and never touches
+#     %TEMP%, so neither the reported failure nor the private-%TEMP% retry can be
+#     reproduced off 5.1.
+#   * Remove-Item -Recurse follows a junction on 5.1 and deletes what it points
+#     at. pwsh 7 fixed that, so the guard cannot be shown to matter off 5.1.
+#
+# Both run against the real thing here, on Windows PowerShell 5.1. The probe
+# bodies live in .github/staging9178/*.ps1 because a PowerShell here-string
+# terminator has to sit at column 0, which a YAML block scalar cannot express.
+
+on:
+  push:
+    branches: ["pr-9178-xplat-ci"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  winps51:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: powershell   # Windows PowerShell 5.1, NOT pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Confirm this really is Windows PowerShell 5.1
+        run: |
+          $PSVersionTable | Format-List | Out-String | Write-Host
+          if ($PSVersionTable.PSEdition -ne 'Desktop') { throw "not Windows PowerShell: $($PSVersionTable.PSEdition)" }
+          if ($PSVersionTable.PSVersion.Major -ne 5) { throw "not 5.x: $($PSVersionTable.PSVersion)" }
+
+      - name: Extract the helper chains from both revisions
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git fetch --quiet origin main
+          git show origin/main:install.ps1 | Set-Content -Encoding UTF8 "$env:RUNNER_TEMP\old-install.ps1"
+          & .\.github\staging9178\extract.ps1
+
+      - name: The pre-fix installer reproduces issue 9140 here
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\.github\staging9178\reproduce_old.ps1
+          Write-Host ($out -join "`n")
+          if ($out -notcontains 'OLD:threw') { throw "the pre-fix installer did NOT reproduce the reported failure" }
+
+      - name: The fixed installer takes its lock with the compiler dead
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\.github\staging9178\lock_with_dead_compiler.ps1
+          Write-Host ($out -join "`n")
+          if ($out -notcontains 'NEW:locked=True') { throw "the fixed installer failed to take the lock" }
+
+      - name: The private %TEMP% retry recovers a REAL csc.exe compile
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $blocker = Join-Path $env:RUNNER_TEMP 'blocker'
+          Set-Content -LiteralPath $blocker -Value 'not a directory'
+          $env:DEAD_TEMP = Join-Path $blocker 'temp'
+          $out = & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\.github\staging9178\retry_real_csc.ps1
+          Write-Host ($out -join "`n")
+          if ($out -notcontains 'RETRY:native=True') { throw "the private %TEMP% retry did not recover the compile" }
+          if ($out -notcontains 'RETRY:type=True') { throw "the native type was not loaded" }
+          if ($out -notcontains "RETRY:tmp=$env:DEAD_TEMP") { throw "%TEMP% was not restored to the inherited value" }
+          if (-not ($out -match '^RETRY:resolve=.+')) { throw "the recovered helper could not resolve a path" }
+
+      - name: A junction in the sweep costs the link, never its target
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Establish how this host actually behaves first, so the guard is measured
+          # against the real hazard rather than an assumption about it.
+          $bare = Join-Path $env:RUNNER_TEMP 'bare'
+          $bareTarget = Join-Path $bare 'precious'
+          New-Item -ItemType Directory -Path $bareTarget -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $bareTarget 'keepme.txt') -Value 'do not delete'
+          $bareLink = Join-Path $bare 'link'
+          cmd /c mklink /J "$bareLink" "$bareTarget" | Out-Host
+          Remove-Item -LiteralPath $bareLink -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "unguarded -Recurse on a junction left the target intact: $(Test-Path -LiteralPath (Join-Path $bareTarget 'keepme.txt'))"
+
+          $root = Join-Path $env:RUNNER_TEMP 'sweep'
+          $target = Join-Path $root 'precious'
+          New-Item -ItemType Directory -Path $target -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $target 'keepme.txt') -Value 'do not delete'
+          $roots = Join-Path $root 'roots'
+          New-Item -ItemType Directory -Path $roots -Force | Out-Null
+          $stale = Join-Path $roots 'ust-1-plain'
+          New-Item -ItemType Directory -Path $stale -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $stale 'junk.txt') -Value 'x'
+          (Get-Item -LiteralPath $stale -Force).LastWriteTime = (Get-Date).AddDays(-3)
+          $link = Join-Path $roots 'ust-2-link'
+          cmd /c mklink /J "$link" "$target" | Out-Host
+          (Get-Item -LiteralPath $link -Force).LastWriteTime = (Get-Date).AddDays(-3)
+          $fresh = Join-Path $roots 'ust-3-fresh'
+          New-Item -ItemType Directory -Path $fresh -Force | Out-Null
+
+          $env:SWEEP_ROOT = $roots
+          & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\.github\staging9178\sweep_junction.ps1 | Out-Host
+          $targetKept = Test-Path -LiteralPath (Join-Path $target 'keepme.txt')
+          $linkGone = -not (Test-Path -LiteralPath $link)
+          $staleGone = -not (Test-Path -LiteralPath $stale)
+          $freshKept = Test-Path -LiteralPath $fresh
+          Write-Host "targetKept=$targetKept linkGone=$linkGone staleGone=$staleGone freshKept=$freshKept"
+          if (-not $targetKept) { throw "the sweep deleted THROUGH the junction" }
+          if (-not $linkGone) { throw "the sweep left the stale junction behind" }
+          if (-not $staleGone) { throw "the sweep did not remove an ordinary stale directory" }
+          if (-not $freshKept) { throw "the sweep removed a directory that is not stale" }
+
+      - name: A healthy host is byte-identical to the pre-fix installer
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:HELPERS_FILE = "$env:RUNNER_TEMP\new-helpers.ps1"
+          $newOut = & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\.github\staging9178\mutex_names.ps1
+          $env:HELPERS_FILE = "$env:RUNNER_TEMP\old-helpers.ps1"
+          $oldOut = & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\.github\staging9178\mutex_names.ps1
+          Write-Host "new:`n$($newOut -join "`n")"
+          Write-Host "old:`n$($oldOut -join "`n")"
+          if (($newOut -join '|') -ne ($oldOut -join '|')) {
+              throw "install mutex names DIVERGED from the pre-fix installer on a healthy host"
+          }
+          Write-Host "install mutex names are byte-identical to the pre-fix installer"
