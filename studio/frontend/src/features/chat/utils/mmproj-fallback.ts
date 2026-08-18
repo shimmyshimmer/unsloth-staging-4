@@ -4,8 +4,13 @@
 import type { MmprojFallbackReason } from "../types/api";
 
 const MMPROJ_FALLBACK_MESSAGES: Record<MmprojFallbackReason, string> = {
+  // Covers both routes to the same placement: the fit estimate predicting the
+  // projector will not fit in VRAM alongside the model, and a GPU startup failure
+  // recovered by retrying on CPU. Worded for the outcome rather than the route,
+  // since "could not start on the GPU" is untrue of the predicted case, which
+  // never attempts a GPU load.
   cpu_offload:
-    "The vision projector could not start on the GPU, so Studio moved it to system memory. Image input remains available, but image processing may be slower.",
+    "Studio is running the vision projector in system memory, because it does not fit in VRAM alongside the model. Image input remains available, but image processing may be slower.",
   projector_incompatible:
     "The vision projector is incompatible with the installed llama.cpp build, so Studio reloaded this model in text-only mode. Update Studio, then reload the model to restore image input.",
   projector_startup_failure:
