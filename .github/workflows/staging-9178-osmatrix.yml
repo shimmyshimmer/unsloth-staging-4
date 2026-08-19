@@ -1,7 +1,8 @@
 name: "staging-9178 OS matrix"
+# Dispatch only. tests/studio/test_macos_slots_per_commit.py caps how many macOS
+# jobs a push may schedule, and this matrix runs three of them; its evidence was
+# collected in one dispatched run and does not need to repeat on every commit.
 on:
-  push:
-    branches: ["pr-9178-xplat-ci"]
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
