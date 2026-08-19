@@ -42,6 +42,12 @@ jobs:
       - name: Installer, uninstaller and runtime gate suites
         run: |
           rc=0
+          # test_studio_install_workspace_guard.py drives install.sh through bash.
+          # On a Windows runner that is Git Bash against Windows paths, and it fails
+          # on shell semantics that have nothing to do with what this matrix is
+          # measuring. install.sh is not part of the change under test.
+          extra="tests/test_studio_install_workspace_guard.py"
+          case "${{ matrix.os }}" in windows-*) extra="" ;; esac
           PYTHONPATH=studio/backend python -m pytest \
             tests/python/test_windows_installer_addtype_fallback.py \
             tests/python/test_windows_installer_concurrency_guard.py \
@@ -49,7 +55,7 @@ jobs:
             tests/studio/test_installer_av_shapes.py \
             tests/test_installer_interactive_prompts.py \
             tests/test_installer_system32_guard.py \
-            tests/test_studio_install_workspace_guard.py \
+            $extra \
             -q --tb=short > pytest_out.txt 2>&1 || rc=$?
           cat pytest_out.txt
           if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi

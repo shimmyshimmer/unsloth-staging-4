@@ -9,7 +9,12 @@
 # and comparing against that would only re-measure the absence of Win32.
 $ErrorActionPreference = 'Stop'
 
-$names = @('Write-StudioLine','Test-StudioDirectoryUsable','Remove-StudioStalePrivateTempDirectories',
+# Per revision, because the point of the change is that the new one has helpers
+# the old one never had. Feeding the new list to the old file finds nothing and
+# the probe then compares two CommandNotFound failures.
+$oldNames = @('Write-StudioLine','Get-StudioFinalPath','Get-StudioPathHash','Get-StudioInstallMutexName',
+              'Enter-StudioNamedMutex','Enter-StudioInstallMutex','Exit-StudioInstallMutex')
+$newNames = @('Write-StudioLine','Test-StudioDirectoryUsable','Remove-StudioStalePrivateTempDirectories',
            'Get-StudioPrivateTempRoots','New-StudioPrivateTempDirectory','Set-StudioPrivateTempOwner',
            'Initialize-StudioTempEnvironment','Restore-StudioTempEnvironment','Write-StudioFinalPathDegraded',
            'Initialize-StudioFinalPathNativeType','Resolve-StudioLinkTarget','Get-StudioSubstTarget',
@@ -18,7 +23,7 @@ $names = @('Write-StudioLine','Test-StudioDirectoryUsable','Remove-StudioStalePr
            'Enter-StudioInstallMutex','Exit-StudioInstallMutex')
 
 function Get-Names {
-    param([string]$Source, [string[]]$Paths, [string]$TypeSuffix)
+    param([string]$Source, [string[]]$Paths, [string]$TypeSuffix, [string[]]$Names)
     # LF, always. Git checks these out with CRLF on Windows, and the extraction
     # regex below ends "\n    \}\n": with CRLF there is a \r before every newline,
     # so every match fails, the child gets a script with no functions in it, and
@@ -31,7 +36,7 @@ function Get-Names {
     $body = @()
     $body += '$script:StudioStdoutRedirected = $true'
     $missing = @()
-    foreach ($n in $names) {
+    foreach ($n in $Names) {
         $m = [regex]::Match($src, "    function $n \{.*?\n    \}\n", 'Singleline')
         if ($m.Success) { $body += $m.Value } else { $missing += $n }
     }
@@ -89,8 +94,8 @@ $paths = @(
     '\\?\' + (Join-Path $base 'Studio')
 )
 
-$before = Get-Names -Source "$env:RUNNER_TEMP\old-install.ps1" -Paths $paths -TypeSuffix 'old'
-$after = Get-Names -Source "$env:RUNNER_TEMP\new-install.ps1" -Paths $paths -TypeSuffix 'new'
+$before = Get-Names -Source "$env:RUNNER_TEMP\old-install.ps1" -Paths $paths -TypeSuffix 'old' -Names $oldNames
+$after = Get-Names -Source "$env:RUNNER_TEMP\new-install.ps1" -Paths $paths -TypeSuffix 'new' -Names $newNames
 
 $mismatch = 0
 foreach ($p in $paths) {
