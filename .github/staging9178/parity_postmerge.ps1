@@ -19,15 +19,25 @@ $names = @('Write-StudioLine','Test-StudioDirectoryUsable','Remove-StudioStalePr
 
 function Get-Names {
     param([string]$Source, [string[]]$Paths, [string]$TypeSuffix)
-    $src = Get-Content -Raw -LiteralPath $Source
+    # LF, always. Git checks these out with CRLF on Windows, and the extraction
+    # regex below ends "\n    \}\n": with CRLF there is a \r before every newline,
+    # so every match fails, the child gets a script with no functions in it, and
+    # BOTH sides then "agree" by throwing CommandNotFound. That is a green that
+    # measures nothing, which is worse than a red. Measured: the first run of this
+    # probe reported PARITY:mismatches=0 of 16 with all 16 pairs being THREW.
+    $src = (Get-Content -Raw -LiteralPath $Source) -replace "`r`n", "`n"
     # The two revisions define the same C# type name, and a session can only hold
     # one. Each side therefore runs in its OWN child process.
     $body = @()
     $body += '$script:StudioStdoutRedirected = $true'
+    $missing = @()
     foreach ($n in $names) {
         $m = [regex]::Match($src, "    function $n \{.*?\n    \}\n", 'Singleline')
-        if ($m.Success) { $body += $m.Value }
+        if ($m.Success) { $body += $m.Value } else { $missing += $n }
     }
+    # Loudly. A missing helper is the difference between comparing two identities
+    # and comparing two failures.
+    if ($missing.Count -gt 0) { throw ("$Source is missing: " + ($missing -join ', ')) }
     $body += 'foreach ($p in $args) {'
     $body += '    $r = try { Get-StudioInstallMutexName -Path $p } catch { "THREW:" + $_.Exception.Message }'
     $body += '    Write-Output ("{0}`t{1}" -f $p, $r)'
@@ -39,6 +49,14 @@ function Get-Names {
     foreach ($line in @($out)) {
         $parts = ([string]$line) -split "`t", 2
         if ($parts.Count -eq 2) { $table[$parts[0]] = $parts[1] }
+    }
+    if ($table.Count -eq 0) { throw "$Source produced no identities at all" }
+    foreach ($v in $table.Values) {
+        # A real mutex name, or nothing. "THREW:" compares equal to "THREW:" and
+        # would report a clean parity run that proved nothing.
+        if ([string]$v -notmatch '^Global\\UnslothStudioInstall-[0-9a-f]{64}$') {
+            throw "$Source did not produce a mutex name: $v"
+        }
     }
     return $table
 }

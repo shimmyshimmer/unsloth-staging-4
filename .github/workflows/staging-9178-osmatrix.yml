@@ -12,6 +12,8 @@ defaults:
   run:
     shell: bash
 
+# Images from LIVE_MACOS_IMAGES in tests/studio/test_macos_slots_per_commit.py:
+# macos-14 and macos-13 are retired and would not be scheduled at all.
 # Two questions, one matrix. On the platforms the change touches (Windows, both
 # shells) the installer suites are the point. On the platforms it does not touch
 # at all (macOS x86 and arm, two Ubuntu releases, WSL) the point is that nothing
@@ -25,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, windows-2022, macos-14, macos-13, ubuntu-latest, ubuntu-22.04]
+        os: [windows-latest, windows-2022, macos-15, macos-15-intel, ubuntu-latest, ubuntu-22.04]
     env:
       UNSLOTH_COMPILE_DISABLE: '1'
       UNSLOTH_IS_PRESENT: '1'
@@ -65,8 +67,8 @@ jobs:
           fi
 
   mlx:
-    name: "macos-14 mlx"
-    runs-on: macos-14
+    name: "macos-15 mlx"
+    runs-on: macos-15
     timeout-minutes: 40
     env:
       UNSLOTH_COMPILE_DISABLE: '1'
