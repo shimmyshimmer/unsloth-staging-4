@@ -1,0 +1,127 @@
+name: "staging-9178 OS matrix"
+on:
+  push:
+    branches: ["pr-9178-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+
+# Two questions, one matrix. On the platforms the change touches (Windows, both
+# shells) the installer suites are the point. On the platforms it does not touch
+# at all (macOS x86 and arm, two Ubuntu releases, WSL) the point is that nothing
+# moved: install.ps1 is Windows-only, so any change in behaviour there would mean
+# the change reached further than it claims.
+jobs:
+  suites:
+    name: "${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-2022, macos-14, macos-13, ubuntu-latest, ubuntu-22.04]
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - name: Installer, uninstaller and runtime gate suites
+        run: |
+          rc=0
+          PYTHONPATH=studio/backend python -m pytest \
+            tests/python/test_windows_installer_addtype_fallback.py \
+            tests/python/test_windows_installer_concurrency_guard.py \
+            tests/python/test_studio_runtime_gate.py \
+            tests/studio/test_installer_av_shapes.py \
+            tests/test_installer_interactive_prompts.py \
+            tests/test_installer_system32_guard.py \
+            tests/test_studio_install_workspace_guard.py \
+            -q --tb=short > pytest_out.txt 2>&1 || rc=$?
+          cat pytest_out.txt
+          if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi
+          exit "$rc"
+      - name: Uninstaller checks, where a PowerShell exists
+        if: always()
+        run: |
+          if command -v pwsh > /dev/null 2>&1; then
+              for f in tests/studio/test_uninstall_*.ps1; do
+                  echo "== $f"
+                  pwsh -NoProfile -File "$f"
+              done
+          else
+              echo "no pwsh on this runner"
+          fi
+
+  mlx:
+    name: "macos-14 mlx"
+    runs-on: macos-14
+    timeout-minutes: 40
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      # Apple silicon is the one place MLX exists. The change cannot reach it,
+      # which is exactly what this job is here to show rather than assume.
+      - run: python -m pip install mlx || echo "mlx unavailable on this runner"
+      - run: |
+          python - <<'PY'
+          try:
+              import mlx.core as mx
+              print("mlx ok", mx.default_device())
+          except Exception as exc:
+              print("mlx not importable:", exc)
+          PY
+      - run: |
+          rc=0
+          PYTHONPATH=studio/backend python -m pytest \
+            tests/python/test_windows_installer_addtype_fallback.py \
+            tests/python/test_studio_runtime_gate.py \
+            -q --tb=short > pytest_out.txt 2>&1 || rc=$?
+          cat pytest_out.txt
+          if [ "$rc" = "5" ]; then echo "no tests ran"; rc=0; fi
+          exit "$rc"
+
+  wsl:
+    name: "windows-latest wsl"
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: Vampire/setup-wsl@v3
+        with:
+          distribution: Ubuntu-22.04
+          additional-packages: python3 python3-pip python3-venv
+      - name: Suites inside WSL
+        shell: wsl-bash {0}
+        run: |
+          cd "$(wslpath "$GITHUB_WORKSPACE")"
+          python3 -m pip install --break-system-packages pytest pytest-asyncio pytest-timeout || python3 -m pip install pytest pytest-asyncio pytest-timeout
+          rc=0
+          python3 -m pytest \
+            tests/python/test_windows_installer_addtype_fallback.py \
+            tests/python/test_windows_installer_concurrency_guard.py \
+            -q --tb=short > pytest_out.txt 2>&1 || rc=$?
+          cat pytest_out.txt
+          if [ "$rc" = "5" ]; then echo "no tests ran (no pwsh in this WSL image)"; rc=0; fi
+          exit "$rc"
