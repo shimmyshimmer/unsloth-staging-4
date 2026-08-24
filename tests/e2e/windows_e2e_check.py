@@ -91,7 +91,7 @@ def scenario_c_npm_shim_through_node(tmp):
     # Byte-exact cmd-shim v7 template, matching test_start.py's _npm_node_cmd_shim.
     # The blank \r\n separators matter: without them _NPM_NODE_CMD_SHIMS does not
     # match and the parser silently falls through to spawning the .cmd itself.
-    (tmp / "npmagent.cmd").write_text(
+    (tmp / "npmagent.cmd").write_bytes(
         "@ECHO off\r\n"
         "GOTO start\r\n"
         ":find_dp0\r\n"
@@ -109,9 +109,8 @@ def scenario_c_npm_shim_through_node(tmp):
         ")\r\n"
         "\r\n"
         "endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "
-        '"%_prog%"  "%dp0%\\node_modules\\fakeagent\\index.js" %*\r\n',
-        encoding = "utf-8",
-    )
+        '"%_prog%"  "%dp0%\\node_modules\\fakeagent\\index.js" %*\r\n'
+    ).encode()
     argv = _resolved_launch_command(str(shim), [])
     completed = run(argv)
     # The point of this scenario is the cmd.exe BYPASS, so a .cmd argv[0] is a
