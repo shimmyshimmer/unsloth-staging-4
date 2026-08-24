@@ -88,6 +88,9 @@ def scenario_c_npm_shim_through_node(tmp):
     (package / "index.js").write_text(f'console.log("{MARKER}");\n', encoding = "utf-8")
     shim = tmp / "npmagent"
     shim.write_text(NPM_POSIX_SHIM, encoding = "utf-8")
+    # Byte-exact cmd-shim v7 template, matching test_start.py's _npm_node_cmd_shim.
+    # The blank \r\n separators matter: without them _NPM_NODE_CMD_SHIMS does not
+    # match and the parser silently falls through to spawning the .cmd itself.
     (tmp / "npmagent.cmd").write_text(
         "@ECHO off\r\n"
         "GOTO start\r\n"
@@ -97,23 +100,29 @@ def scenario_c_npm_shim_through_node(tmp):
         ":start\r\n"
         "SETLOCAL\r\n"
         "CALL :find_dp0\r\n"
+        "\r\n"
         'IF EXIST "%dp0%\\node.exe" (\r\n'
         '  SET "_prog=%dp0%\\node.exe"\r\n'
         ") ELSE (\r\n"
         '  SET "_prog=node"\r\n'
         "  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n"
         ")\r\n"
+        "\r\n"
         "endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "
         '"%_prog%"  "%dp0%\\node_modules\\fakeagent\\index.js" %*\r\n',
         encoding = "utf-8",
     )
     argv = _resolved_launch_command(str(shim), [])
     completed = run(argv)
-    ok = completed.returncode == 0 and MARKER in completed.stdout
+    # The point of this scenario is the cmd.exe BYPASS, so a .cmd argv[0] is a
+    # failure even if it happens to run: that is the fallback, not the parser.
+    bypassed = Path(argv[0]).suffix.lower() not in {".cmd", ".bat"}
+    ok = bypassed and completed.returncode == 0 and MARKER in completed.stdout
     record(
-        "C. npm shim runs via node",
+        "C. npm shim resolves to node, bypassing cmd.exe",
         ok,
-        f"argv[0]={Path(argv[0]).name} rc={completed.returncode} out={completed.stdout.strip()!r}",
+        f"argv[0]={Path(argv[0]).name} bypassed_cmd={bypassed} "
+        f"rc={completed.returncode} out={completed.stdout.strip()!r}",
     )
 
 
