@@ -14372,6 +14372,47 @@ def _extract_content_parts(messages: list) -> tuple[str, list[dict], "Optional[s
     )
 
 
+def _images_in_last_user_message(messages: list) -> int:
+    """Image parts on the newest user turn.
+
+    Per message, not per thread: earlier turns keep their own images, and only
+    the turn being answered decides whether one call carries several.
+    """
+    for msg in reversed(messages):
+        if msg.role != "user":
+            continue
+        if not isinstance(msg.content, list):
+            return 0
+        return sum(1 for part in msg.content if part.type == "image_url")
+    return 0
+
+
+def _legacy_image_is_distinct(payload) -> bool:
+    """Whether the top-level ``image_base64`` holds an image the messages do not.
+
+    Studio fills that field FROM the thread rather than from the turn:
+    ``findLatestUserImageBase64`` walks the whole history, and it copies the same
+    string ``collectImageParts`` built the content part from, so an echoed value
+    is byte-equal to one of the part payloads here. A value matching none of them
+    was attached by the caller to this request, and a single-image path would drop
+    it unannounced. Comparing the payload, rather than asking whether any part
+    exists, is what separates Studio's echo from a client attaching a new image to
+    a thread that already carries one.
+    """
+    if not payload.image_base64:
+        return False
+    for msg in payload.messages:
+        if not isinstance(msg.content, list):
+            continue
+        for part in msg.content:
+            if part.type != "image_url":
+                continue
+            url = part.image_url.url
+            if (url.partition(",")[2] or url) == payload.image_base64:
+                return False
+    return True
+
+
 # ── External provider proxy ──────────────────────────────────────
 
 
@@ -16196,6 +16237,20 @@ async def openai_chat_completions(
             if _wants_multiple_choices(payload):
                 _raise_unsupported_n("non-GGUF audio chat completions")
             _reject_audio_output_continuation(payload)
+            # generate_audio speaks the newest user TEXT, so an attached image is
+            # dropped without a word. Refuse here: this early return is the reason
+            # the text-only check further down never sees such a request. No
+            # monitor row is open yet (monitor_id is still None, and
+            # _monitored_generate_audio opens its own), so a bare raise leaves
+            # nothing running.
+            if _images_in_last_user_message(payload.messages) or _legacy_image_is_distinct(payload):
+                raise HTTPException(
+                    status_code = 400,
+                    detail = (
+                        "This model generates speech and does not read images."
+                        " Load a vision model to send one."
+                    ),
+                )
             return await _monitored_generate_audio(model_name)
 
         # ── Whisper without audio: return clear error ──
@@ -16227,6 +16282,27 @@ async def openai_chat_completions(
                     status_code = 400,
                     detail = "continue_final_message is not supported with audio input.",
                 )
+            # This branch flattens the messages and passes only the audio on, so any
+            # image attached to the turn is dropped on the floor. Refuse instead of
+            # answering from the audio alone and letting the caller believe the
+            # picture was looked at. Any count, not just several: one image is
+            # discarded here exactly as silently as two.
+            #
+            # The legacy top-level field counts only when it carries an image the
+            # thread does not already hold; see _legacy_image_is_distinct.
+            #
+            # An image on an EARLIER turn is deliberately not refused: this branch
+            # never forwarded history images, and turning that into a hard error
+            # would break asking by voice about a picture attached before.
+            # api_monitor directly rather than _reject, which is not bound this
+            # early in the handler.
+            if _images_in_last_user_message(payload.messages) or _legacy_image_is_distinct(payload):
+                _audio_image_detail = (
+                    "This model takes audio or an image in one message, not both."
+                    " Send the image on its own turn."
+                )
+                api_monitor.fail(monitor_id, _audio_image_detail)
+                raise HTTPException(status_code = 400, detail = _audio_image_detail)
             try:
                 audio_array = _decode_audio_base64(payload.audio_base64)
                 system_prompt, chat_messages, _ = _extract_content_parts(payload.messages)
@@ -18281,32 +18357,68 @@ async def openai_chat_completions(
     # Decode image (from content parts OR legacy field)
     image_b64 = extracted_image_b64 or payload.image_base64
     image = None
+    # Count the image PARTS the turn carries, not the ones extraction could decode.
+    # _extract_content_parts only yields base64 for a data URL, so a message holding
+    # several remote or empty image URLs has no image_b64 at all; counting decoded
+    # images would let exactly those slip past the refusal below and be flattened
+    # away as silently as before. A single undecodable image is left alone: it is
+    # not a multi-image call, and rejecting it would break clients that pass a
+    # remote URL today and get a text answer.
+    images_on_turn = _images_in_last_user_message(payload.messages)
 
-    if image_b64:
+    if image_b64 or images_on_turn > 1:
         try:
             model_info = backend.models.get(backend.active_model_name, {})
             if not model_info.get("is_vision"):
-                raise HTTPException(
-                    status_code = 400,
-                    detail = "Image provided but current model is text-only. Load a vision model.",
+                # Through _reject rather than a bare raise, like every rejection
+                # below it: the monitor row is open by here, and one left running
+                # keeps Studio reporting the backend as generating after the
+                # request has already been answered with a 400.
+                raise _reject(
+                    400,
+                    "Image provided but current model is text-only. Load a vision model.",
                 )
 
-            image = await asyncio.to_thread(
-                _decode_and_resize_image,
-                backend,
-                image_b64,
-            )
+            # A distinct legacy image is a second image the caller supplied, so it
+            # joins the structural count: one image part the extractor could not read
+            # (a remote or payloadless URL) plus a distinct top-level image is still
+            # two images with one of them dropped. The second clause covers the case
+            # the count alone misses, where the turn carries no part but an earlier
+            # one does: the selection below is `extracted_image_b64 or image_base64`,
+            # so the extracted image wins and the top-level one goes unmentioned.
+            _legacy_is_distinct = _legacy_image_is_distinct(payload)
+            if images_on_turn + int(_legacy_is_distinct) > 1 or (
+                extracted_image_b64 and _legacy_is_distinct
+            ):
+                raise _reject(
+                    400,
+                    (
+                        "This model takes one image per message. Attach one, or load a"
+                        " GGUF build of it, which accepts several."
+                    ),
+                )
+
+            if image_b64:
+                image = await asyncio.to_thread(
+                    _decode_and_resize_image,
+                    backend,
+                    image_b64,
+                )
 
         except HTTPException:
             raise
         except Exception as e:
-            raise log_and_http_error(
+            # log_and_http_error keeps the exception text server-side, but knows
+            # nothing about the monitor row; hand its public detail to _reject so
+            # a failed decode closes the row like the refusals above.
+            decode_error = log_and_http_error(
                 e,
                 400,
                 "Failed to decode image",
                 event = "inference.decode_image_failed",
                 log = logger,
             )
+            raise _reject(decode_error.status_code, decode_error.detail)
 
     # Classify capability flags from the loaded template.
     _sf_model_info = backend.models.get(backend.active_model_name, {})
