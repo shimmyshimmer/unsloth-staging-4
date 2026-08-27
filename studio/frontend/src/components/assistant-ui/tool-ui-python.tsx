@@ -11,6 +11,7 @@ import { isSandboxFileList, type SandboxFile } from "./sandbox-files";
 import {
   preferSanitizedFullToolOutput,
   useChatRuntimeStore,
+  useChatPreferencesStore,
   useToolAwaitingApproval,
   useToolOutputFor,
   useToolPaneScope,
@@ -179,30 +180,45 @@ const PythonToolUIImpl: ToolCallMessagePartComponent = ({
   // written even while the args status still reads as streaming.
   const awaitingApproval = useToolAwaitingApproval(toolCallId);
   const isWriting = isWritingCode && !awaitingApproval;
+  const collapseByDefault = useChatPreferencesStore(
+    (state) => state.collapseToolActivityByDefault,
+  );
+  const scriptCell = code ? (
+    <div className="mt-1 pl-5">
+      <ToolCodeCell
+        label="script"
+        code={code}
+        language="python"
+        downloadName="script.py"
+        streaming={isWriting}
+      />
+    </div>
+  ) : null;
 
   return (
     // Status, output and images collapse from history; the executed script
     // renders outside ToolFallbackContent so it stays visible on reopen
     // (#7165). Terminal keeps its command inside the collapsible -- a one-line
     // command is not the artifact a user comes back for, a script is.
-    <ToolFallbackRoot defaultOpen={isRunning}>
+    //
+    // That #7165 guarantee is structural only while collapseToolActivity is
+    // off. With it on the script moves inside the collapsible below, so a
+    // reopened chat shows the row collapsed and the script (and its download
+    // button) behind one click. That is the trade the preference buys, and
+    // awaitingApproval is the one case it does not get to make: a decision
+    // about a script has to be taken with the script on screen.
+    <ToolFallbackRoot
+      defaultOpen={isRunning}
+      awaitingApproval={awaitingApproval}
+    >
       <ToolFallbackTrigger
         toolName={firstLine ? `Python: ${firstLine}` : "Python"}
         status={status}
         icon={CodeIcon}
       />
-      {code && (
-        <div className="mt-1 pl-5">
-          <ToolCodeCell
-            label="script"
-            code={code}
-            language="python"
-            downloadName="script.py"
-            streaming={isWriting}
-          />
-        </div>
-      )}
+      {!collapseByDefault && scriptCell}
       <ToolFallbackContent>
+        {collapseByDefault && scriptCell}
         <div className="border-l-2 border-muted-foreground/20 pl-2">
           {/* Output */}
           {isRunning ? (
