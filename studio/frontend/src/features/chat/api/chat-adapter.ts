@@ -106,7 +106,11 @@ import {
   type CodexReasoningLedger,
 } from "../codex-reasoning";
 
-import { toolCallReplayArguments } from "../tool-call-arguments";
+import {
+  createBoundaryScan,
+  splitTopLevelJsonObjects,
+  toolCallReplayArguments,
+} from "../tool-call-arguments";
 import {
   findStreamedToolCallPartIndex,
   resolveToolCallPartId,
@@ -5270,6 +5274,121 @@ export function createOpenAIStreamAdapter(
       };
       // Tool call parts, cumulative; result lands on tool_end.
       const toolCallParts: PositionedToolCallPart[] = [];
+      // An id for a call the stream never gave one: a slot that turned out to
+      // hold several parallel calls (issue #9807). Counted, not random, so a
+      // rerun of the same stream reads the same way in a log.
+      let splitToolCallSeq = 0;
+      // A name that arrived at a slot whose object had closed, waiting for the
+      // arguments that say which call it names, and the metadata that arrived
+      // with it: Gemini stows the thought signature for the call being
+      // announced, so it travels with the name rather than landing on the call
+      // that has already closed.
+      const pendingNameByIndex = new Map<number | undefined, string>();
+      const pendingExtraByIndex = new Map<number | undefined, unknown>();
+      // Where the card would have gone had the announcement opened the call
+      // there and then. The backend orders by when a call was announced, so
+      // without this the transcript reads C before B while the backend runs B
+      // before C, and any text in between lands on the wrong side.
+      const pendingSlotByIndex = new Map<
+        number | undefined,
+        { at: number; cursor: number }
+      >();
+      // Resumable boundary scan per card, so an argument streamed in many
+      // fragments is scanned once rather than once per fragment.
+      const boundaryScans = new Map<
+        string,
+        ReturnType<typeof createBoundaryScan>
+      >();
+      // extra_content is typed `unknown` because it is whatever the provider
+      // hung off the call, so merging two of them has to check first.
+      const isPlainRecord = (v: unknown): v is Record<string, unknown> =>
+        typeof v === "object" && v !== null && !Array.isArray(v);
+      // A name waiting for arguments is waiting within one provider turn. The
+      // backend starts the next turn on this same response with the delta index
+      // restarted at 0, so a name left over would be prepended to whatever
+      // opens there, turning "C" into "BC" and hanging B's metadata on it. The
+      // backend's own pending state is per turn for the same reason.
+      // Metadata for a call that was announced by name and never opened. The
+      // backend still runs such a call, and its tool_start carries no
+      // extra_content, so the card it paints would persist without the thought
+      // signature the announcement brought and the replay would be rejected.
+      // Queued, not replaced: the same tool can be announced at two indices,
+      // and the backend runs both, so the second card would otherwise be
+      // painted with no signature while the first wore the wrong one.
+      const announcedExtraByName = new Map<string, unknown[]>();
+      const endProviderTurn = () => {
+        for (const [pendingIdx, pendingName] of pendingNameByIndex) {
+          const extra = pendingExtraByIndex.get(pendingIdx);
+          if (pendingName && extra !== undefined) {
+            const queued = announcedExtraByName.get(pendingName) ?? [];
+            queued.push(extra);
+            announcedExtraByName.set(pendingName, queued);
+          }
+        }
+        pendingNameByIndex.clear();
+        pendingExtraByIndex.clear();
+        pendingSlotByIndex.clear();
+      };
+      const scanArgsText = (partId: string, text: string) => {
+        let scan = boundaryScans.get(partId);
+        if (!scan) {
+          scan = createBoundaryScan();
+          boundaryScans.set(partId, scan);
+        }
+        return scan.feed(text);
+      };
+      const mintSplitToolCallId = (deltaIndex: number | undefined): string => {
+        let candidate = "";
+        do {
+          splitToolCallSeq += 1;
+          // No colon: a replayed id has to satisfy ^[a-zA-Z0-9_-]+$.
+          candidate = `tool_call_${deltaIndex ?? "x"}_${splitToolCallSeq}`;
+        } while (toolCallParts.some((p) => p.toolCallId === candidate));
+        return candidate;
+      };
+      /**
+       * Parts for the calls after the first, in a slot holding several. Nothing
+       * per-call is copied across: no result, no provenance, and the thought
+       * signature goes only to the call this delta closes, the last one.
+       */
+      const bornSplitToolCalls = (
+        extraSegments: string[],
+        toolName: string,
+        deltaIndex: number | undefined,
+        extraContent: unknown,
+      ): PositionedToolCallPart[] =>
+        extraSegments.map((segment, n) => {
+          const isLast = n === extraSegments.length - 1;
+          let segmentArgs: ToolCallMessagePart["args"] = {};
+          try {
+            segmentArgs = JSON.parse(segment) as ToolCallMessagePart["args"];
+          } catch {
+            segmentArgs = { _raw: segment } as ToolCallMessagePart["args"];
+          }
+          const bornId = mintSplitToolCallId(deltaIndex);
+          if (!codexRoundToolCallIds.includes(bornId)) {
+            codexRoundToolCallIds.push(bornId);
+          }
+          return {
+            type: "tool-call" as const,
+            toolCallId: bornId,
+            toolName,
+            argsText: segment,
+            args: segmentArgs,
+            textCursor: cumulativeText.length,
+            ...(isLast && extraContent !== undefined
+              ? { extra_content: extraContent }
+              : {}),
+            // Every segment but the last is spoken for: an id stamped on a
+            // later fragment must not reach back past the newest call in the
+            // slot. The last one is left claimable even when its object has
+            // closed, because a provider that bundles several calls into one
+            // delta can stamp the last one's real id in a delta of its own,
+            // and the loop decides claim against open by the name it carries.
+            ...(isLast ? {} : { _has_stable_id: true }),
+            ...(deltaIndex !== undefined ? { _delta_index: deltaIndex } : {}),
+          };
+        });
       // Raw tool_args accumulator per card: the backend forwards arguments while
       // the model is still WRITING them, and the partial parse below feeds the
       // card's args so the code renders live.
@@ -6316,6 +6435,14 @@ export function createOpenAIStreamAdapter(
                 chunk as unknown as { _toolEvent?: Record<string, unknown> }
               )._toolEvent;
               if (toolEvent !== undefined) {
+                // A tool event means the provider turn that asked for it has
+                // ended. finish_reason alone is not enough: an OpenAI-compatible
+                // upstream can end a turn with [DONE] or EOF and never send one,
+                // and the loop starts the next request anyway with the delta
+                // indices restarted, so a name waiting for arguments would be
+                // prepended to whatever opens there. Before the queue below is
+                // read, so this turn's announcements reach it.
+                endProviderTurn();
                 // Deep Research is an ordinary tool to every loop that runs it, so the handoff
                 // is read off the events they all publish rather than a bespoke frame. An
                 // ungated pair is not rendered: the research card is the reply, a tool pill
@@ -6485,15 +6612,38 @@ export function createOpenAIStreamAdapter(
                   const idx = toolCallParts.findIndex(
                     (p) => p.toolCallId === id,
                   );
+                  // Claimed once, whichever branch below runs: the announcement
+                  // it came from named this call and no other. A name resent
+                  // after its call closed carries metadata that the backend
+                  // merges into that call, and the id resolves to the card
+                  // already on screen, so reading the queue only when a card is
+                  // created dropped the signature the backend kept.
+                  const queued =
+                    announcedExtraByName.get(toolEvent.tool_name as string) ??
+                    [];
+                  const announcedExtra = queued.shift();
+                  if (queued.length === 0) {
+                    announcedExtraByName.delete(toolEvent.tool_name as string);
+                  }
                   if (idx !== -1) {
                     const existing = toolCallParts[
                       idx
                     ] as PositionedToolCallPart;
+                    const existingExtra = existing.extra_content;
                     toolCallParts[idx] = {
                       ...existing,
                       toolName: toolEvent.tool_name as string,
                       argsText: JSON.stringify(toolArgs),
                       args: toolArgs,
+                      ...(announcedExtra !== undefined
+                        ? {
+                            extra_content:
+                              isPlainRecord(existingExtra) &&
+                              isPlainRecord(announcedExtra)
+                                ? { ...existingExtra, ...announcedExtra }
+                                : announcedExtra,
+                          }
+                        : {}),
                       provenance: mergeToolProvenance(
                         existing.provenance,
                         toolProvenance,
@@ -6507,6 +6657,9 @@ export function createOpenAIStreamAdapter(
                       argsText: JSON.stringify(toolArgs),
                       args: toolArgs,
                       textCursor: cumulativeText.length,
+                      ...(announcedExtra !== undefined
+                        ? { extra_content: announcedExtra }
+                        : {}),
                       ...(toolProvenance ? { provenance: toolProvenance } : {}),
                     } as PositionedToolCallPart);
                   }
@@ -6922,6 +7075,16 @@ export function createOpenAIStreamAdapter(
                   const idx =
                     typeof call.index === "number" ? call.index : undefined;
                   const stableId = call.id;
+                  // The chunk is cast, not validated, and llama-server has
+                  // shipped `arguments` as a decoded object rather than the
+                  // string the API specifies. Reading it as a string aborted
+                  // the whole adapter, so hold it to the type the accumulator
+                  // is written against, which is what the backend already does
+                  // with its own isinstance check.
+                  const deltaArgs =
+                    typeof call.function?.arguments === "string"
+                      ? call.function.arguments
+                      : "";
                   // Unsloth's local Codex loop follows the OpenAI tool-call delta with
                   // tool_start/tool_end events. Resolve the backend id now so all three
                   // event shapes update one run-unique card instead of leaving the raw
@@ -6937,10 +7100,115 @@ export function createOpenAIStreamAdapter(
                     stablePartId,
                     idx,
                   );
-                  const existing =
+                  const matched =
                     existingIndex === -1
                       ? undefined
                       : toolCallParts[existingIndex];
+                  // A closed object cannot take more content, so a delta that
+                  // brings a name or arguments to a slot already holding one
+                  // whole object is opening the next parallel call. Splitting
+                  // the accumulated text only catches this once the arguments
+                  // land; a name-only delta would rename the finished call,
+                  // and a late id would claim it and glue onto it.
+                  const slotIsClosed = (() => {
+                    if (!matched?.argsText) return false;
+                    const held = scanArgsText(
+                      matched.toolCallId,
+                      matched.argsText,
+                    );
+                    return held.complete.length > 0 && !held.tail;
+                  })();
+                  // An id names its call, so a fragment repeating the id this
+                  // part already holds continues it however complete its
+                  // arguments look. llama-server grows the name across deltas,
+                  // and opening a call there gives two cards one id.
+                  const namesThisCall =
+                    !!stablePartId && matched?.toolCallId === stablePartId;
+                  // Whitespace after a closing brace is legal JSON and says
+                  // nothing about another call, and a next call opens with the
+                  // "{" of its own arguments object, so a fragment starting
+                  // with anything else is not one: cutting there would turn a
+                  // stray scalar suffix into a second call and run the tool
+                  // twice, where the scanner deliberately would not cut at all.
+                  const bringsArgs = deltaArgs.trim().startsWith("{");
+                  const closedSlot = slotIsClosed && !namesThisCall;
+                  // A name reaching a closed slot cannot be read yet: the same
+                  // tool called twice announces itself exactly as llama-server
+                  // resends a name it is still growing. Hold it until arguments
+                  // say which call it names, rather than renaming the finished
+                  // one.
+                  // An id, though, names a call outright, so one that is not the
+                  // closed call's own opens the next one even before its
+                  // arguments arrive: the conventional opening delta carries id
+                  // and name with empty arguments, and letting it claim the
+                  // finished card would draw the next call's arguments there.
+                  // An id at a closed slot opens the next call only when it
+                  // also names a different one. On its own, or repeating the
+                  // name the card holds, it is that call's real id stamped
+                  // late, and forking there leaves the finished card under its
+                  // provisional id beside an empty second one.
+                  const idNamesAnotherCall =
+                    !!stablePartId &&
+                    !!call.function?.name &&
+                    !!matched?.toolName &&
+                    // Not a prefix test: an id is strong evidence of its own
+                    // call, and a catalog holding both "web" and "web_search"
+                    // would have the second claim the first. Only the same
+                    // name, or none, reads as that call's id arriving late.
+                    call.function.name !== matched.toolName;
+                  const opensNextCall =
+                    closedSlot && (bringsArgs || idNamesAnotherCall);
+                  // Trailing whitespace is legal JSON belonging to the object
+                  // just closed, so the whitespace goes on the closed card. The
+                  // name on such a delta is still held rather than merged into
+                  // that card: it is either that call's name resent, which the
+                  // opening delta discards when it disagrees, or the next
+                  // call's announced early, and merging it gave the closed card
+                  // "alphabeta" and the new one no name at all.
+                  const defersToNextCall = closedSlot && !opensNextCall;
+                  const suppressName =
+                    defersToNextCall && !!call.function?.name;
+                  // Only once a name has announced the next call: metadata that
+                  // arrives alone belongs to the card that just closed, and
+                  // parking it there loses the signature outright when no
+                  // further call follows.
+                  if (suppressName && call.extra_content !== undefined) {
+                    // Announced with the name, so it describes the call being
+                    // announced. Left on the closed card it gives that call
+                    // another call's signature and the new call none, and
+                    // native replay rejects both.
+                    // Merged: a name streamed across several deltas can carry
+                    // metadata on more than one of them, and replacing drops
+                    // the signature an earlier fragment brought.
+                    const parkedBefore = pendingExtraByIndex.get(idx);
+                    pendingExtraByIndex.set(
+                      idx,
+                      isPlainRecord(parkedBefore) &&
+                        isPlainRecord(call.extra_content)
+                        ? { ...parkedBefore, ...call.extra_content }
+                        : call.extra_content,
+                    );
+                  }
+                  if (suppressName) {
+                    // Held across deltas, so a name streamed as "web" then
+                    // "_search" opens its call as "web_search" rather than as
+                    // whichever fragment arrived last.
+                    if (!pendingSlotByIndex.has(idx)) {
+                      pendingSlotByIndex.set(idx, {
+                        at: toolCallParts.length,
+                        cursor: cumulativeText.length,
+                      });
+                    }
+                    const pendingBefore = pendingNameByIndex.get(idx) ?? "";
+                    const fragment = call.function?.name ?? "";
+                    pendingNameByIndex.set(
+                      idx,
+                      fragment.startsWith(pendingBefore)
+                        ? fragment
+                        : pendingBefore + fragment,
+                    );
+                  }
+                  const existing = opensNextCall ? undefined : matched;
 
                   if (
                     stablePartId &&
@@ -6948,32 +7216,58 @@ export function createOpenAIStreamAdapter(
                   ) {
                     codexRoundToolCallIds.push(stablePartId);
                   }
-                  const argsFragment = call.function?.arguments ?? "";
+                  const argsFragment = deltaArgs;
                   streamedChars +=
                     argsFragment.length + (call.function?.name?.length ?? 0);
                   if (existing) {
                     const prevName = existing.toolName ?? "";
-                    const nextName = call.function?.name ?? prevName;
+                    const nextName = suppressName
+                      ? prevName
+                      : (call.function?.name ?? prevName);
                     const merged = (existing.argsText ?? "") + argsFragment;
+                    // A call's arguments are one JSON object, so a slot holding
+                    // two whole objects is holding two calls: the stream reused
+                    // this index instead of opening the next, which is how
+                    // vLLM's id-less parallel deltas glue `{"url":"a"}` and
+                    // `{"url":"b"}` into one unparsable string (issue #9807).
+                    // Cut on the object boundary, not on a change of function
+                    // name: the same tool called twice has no name to cut on.
+                    // A delta carrying an id addresses its own call already.
+                    const split = stablePartId
+                      ? { complete: [], tail: "" }
+                      : scanArgsText(existing.toolCallId, merged);
+                    // Whether the last segment is still being written decides
+                    // who may go on writing to it.
+                    const splitTailIsOpen = split.tail.length > 0;
+                    const segments = splitTailIsOpen
+                      ? [...split.complete, split.tail]
+                      : split.complete;
+                    const isSplit = segments.length > 1;
+                    // The slot keeps the object it opened with, under the name
+                    // and id it had; the rest are calls this delta introduced.
+                    const slotText = isSplit ? segments[0] : merged;
                     let parsedArgs: ToolCallMessagePart["args"] =
                       existing.args ?? {};
-                    if (merged) {
+                    if (slotText) {
                       try {
                         parsedArgs = JSON.parse(
-                          merged,
+                          slotText,
                         ) as ToolCallMessagePart["args"];
                       } catch {
                         parsedArgs = {
-                          _raw: merged,
+                          _raw: slotText,
                         } as ToolCallMessagePart["args"];
                       }
                     }
                     const prevExtra = (existing as PositionedToolCallPart)
                       .extra_content;
+                    // Metadata parked for the next call is not this card's.
+                    const incomingExtra = suppressName
+                      ? undefined
+                      : call.extra_content;
                     if (
-                      call.extra_content !== undefined &&
-                      JSON.stringify(call.extra_content) !==
-                        JSON.stringify(prevExtra)
+                      incomingExtra !== undefined &&
+                      JSON.stringify(incomingExtra) !== JSON.stringify(prevExtra)
                     ) {
                       // Gemini puts the thought signature on the call, and
                       // the next turn is rejected without it.
@@ -6986,26 +7280,148 @@ export function createOpenAIStreamAdapter(
                       ...(stablePartId
                         ? { toolCallId: stablePartId, _has_stable_id: true }
                         : {}),
-                      toolName: nextName,
-                      argsText: merged,
+                      toolName: isSplit ? prevName || nextName : nextName,
+                      argsText: slotText,
                       args: parsedArgs,
-                      ...(call.extra_content !== undefined
-                        ? { extra_content: call.extra_content }
+                      ...(incomingExtra !== undefined && !isSplit
+                        ? { extra_content: incomingExtra }
                         : prevExtra !== undefined
                           ? { extra_content: prevExtra }
                           : {}),
                       ...(idx !== undefined ? { _delta_index: idx } : {}),
                     };
                     toolCallParts[existingIndex] = updated;
+                    if (isSplit) {
+                      // The slot keeps one segment rather than the whole string
+                      // it accumulated, so the resumable scan no longer
+                      // describes what it was reading.
+                      boundaryScans.delete(existing.toolCallId);
+                      boundaryScans.delete(updated.toolCallId);
+                      // Appended, not inserted beside the slot, so a call the
+                      // stream opened third reads third whichever index it
+                      // reused. Where the branch below puts one, too.
+                      toolCallParts.push(
+                        ...bornSplitToolCalls(
+                          segments.slice(1),
+                          nextName,
+                          idx,
+                          incomingExtra,
+                        ),
+                      );
+                      // New calls are state, so they never wait on the gate.
+                      addedToolCall = true;
+                    }
                   } else {
-                    const callId =
+                    let callId =
                       stablePartId ||
                       `tool_call_${idx ?? toolCallParts.length}`;
+                    if (
+                      !stablePartId &&
+                      toolCallParts.some((p) => p.toolCallId === callId)
+                    ) {
+                      // The slot's own id is taken: this index already opened a
+                      // call and has closed it. Two cards under one id collect
+                      // each other's results.
+                      callId = mintSplitToolCallId(idx);
+                    }
 
                     if (!codexRoundToolCallIds.includes(callId)) {
                       codexRoundToolCallIds.push(callId);
                     }
-                    const argsText = argsFragment;
+                    // A slot can arrive already holding several calls in one
+                    // fragment: vLLM bundles them into a single delta when the
+                    // model writes them in one pass. Same boundary as above.
+                    const freshSplit = stablePartId
+                      ? { complete: [], tail: "" }
+                      : splitTopLevelJsonObjects(argsFragment);
+                    const freshTailIsOpen = freshSplit.tail.length > 0;
+                    const freshSegments = freshTailIsOpen
+                      ? [...freshSplit.complete, freshSplit.tail]
+                      : freshSplit.complete;
+                    const freshIsSplit = freshSegments.length > 1;
+                    // The name a name-only delta parked for whichever call the
+                    // arguments turned out to open, continued by whatever this
+                    // delta adds to it.
+                    const parked = pendingNameByIndex.get(idx) ?? "";
+                    const nameFragment = call.function?.name ?? "";
+                    const parkedSlot = pendingSlotByIndex.get(idx);
+                    pendingSlotByIndex.delete(idx);
+                    // A parked name that repeats or extends the closed call's
+                    // own is most likely that call's name resent, kept only
+                    // because a second no-argument call to the same tool looks
+                    // identical. So a delta that names its call outright wins:
+                    // concatenating gave "alphabeta", a name the backend never
+                    // executes. Same decision as _take_parked there.
+                    const heldName = matched?.toolName ?? "";
+                    const parkedIsResend =
+                      !!parked &&
+                      !!heldName &&
+                      (heldName.startsWith(parked) ||
+                        parked.startsWith(heldName));
+                    const parkedDisagrees =
+                      !!nameFragment &&
+                      !(
+                        nameFragment.startsWith(parked) ||
+                        parked.startsWith(nameFragment)
+                      );
+                    const pendingName =
+                      parkedIsResend && parkedDisagrees ? "" : parked;
+                    // The place goes with the announcement. A name read as the
+                    // closed call's resent announced nothing, so the call
+                    // opening here takes the position its arguments arrived at.
+                    const announcedSlot =
+                      pendingName === parked ? parkedSlot : undefined;
+                    const freshName = !nameFragment
+                      ? pendingName
+                      : nameFragment.startsWith(pendingName)
+                        ? nameFragment
+                        : pendingName + nameFragment;
+                    pendingNameByIndex.delete(idx);
+                    // The metadata that came with that parked name belongs to
+                    // this call, the one it was announcing.
+                    // The metadata parked with that name follows it: read as
+                    // the closed call's, it stays with the closed card rather
+                    // than giving this one another call's signature.
+                    const parkedExtra =
+                      pendingName === parked
+                        ? pendingExtraByIndex.get(idx)
+                        : undefined;
+                    const disownedExtra =
+                      pendingName === parked
+                        ? undefined
+                        : pendingExtraByIndex.get(idx);
+                    pendingExtraByIndex.delete(idx);
+                    if (
+                      disownedExtra !== undefined &&
+                      existingIndex !== -1 &&
+                      matched
+                    ) {
+                      const closed = toolCallParts[
+                        existingIndex
+                      ] as PositionedToolCallPart;
+                      const closedExtra = closed.extra_content;
+                      toolCallParts[existingIndex] = {
+                        ...closed,
+                        extra_content:
+                          isPlainRecord(closedExtra) &&
+                          isPlainRecord(disownedExtra)
+                            ? { ...closedExtra, ...disownedExtra }
+                            : disownedExtra,
+                      };
+                    }
+                    // Merged, not replaced: a signature parked with the name
+                    // and metadata arriving with the arguments are different
+                    // fields of one call, and dropping either gets the replayed
+                    // turn rejected. Same per-call merge the backend does.
+                    const freshExtra =
+                      isPlainRecord(parkedExtra) && isPlainRecord(call.extra_content)
+                        ? { ...parkedExtra, ...call.extra_content }
+                        : call.extra_content !== undefined
+                          ? call.extra_content
+                          : parkedExtra;
+                    const argsText = freshIsSplit
+                      ? freshSegments[0]
+                      : argsFragment;
                     let parsedArgs: ToolCallMessagePart["args"] = {};
                     if (argsText) {
                       try {
@@ -7021,19 +7437,56 @@ export function createOpenAIStreamAdapter(
                     const fresh: PositionedToolCallPart = {
                       type: "tool-call" as const,
                       toolCallId: callId,
-                      toolName: call.function?.name ?? "",
+                      toolName: freshName,
                       argsText,
                       args: parsedArgs,
-                      textCursor: cumulativeText.length,
-                      ...(call.extra_content !== undefined
-                        ? { extra_content: call.extra_content }
+                      textCursor: announcedSlot
+                        ? announcedSlot.cursor
+                        : cumulativeText.length,
+                      ...(freshExtra !== undefined && !freshIsSplit
+                        ? { extra_content: freshExtra }
                         : {}),
                       ...(stablePartId ? { _has_stable_id: true } : {}),
                       ...(idx !== undefined ? { _delta_index: idx } : {}),
                     };
-                    toolCallParts.push(fresh);
+                    const born = freshIsSplit
+                      ? bornSplitToolCalls(
+                          freshSegments.slice(1),
+                          freshName,
+                          idx,
+                          freshExtra,
+                        )
+                      : [];
+                    // A call announced by name goes where it was announced, not
+                    // where its arguments turned up, so the transcript reads in
+                    // the order the backend runs them.
+                    if (announcedSlot) {
+                      toolCallParts.splice(announcedSlot.at, 0, fresh, ...born);
+                      // Another index can be waiting on the same position,
+                      // having been announced when the list was this long. It
+                      // was announced later, so it belongs after this one, and
+                      // splicing both at the one mark reversed them.
+                      const inserted = 1 + born.length;
+                      for (const [waitingIdx, slot] of pendingSlotByIndex) {
+                        if (slot.at >= announcedSlot.at) {
+                          pendingSlotByIndex.set(waitingIdx, {
+                            ...slot,
+                            at: slot.at + inserted,
+                          });
+                        }
+                      }
+                    } else {
+                      toolCallParts.push(fresh, ...born);
+                    }
                     addedToolCall = true;
                   }
+                }
+                // After this chunk's deltas, not before them: a provider can
+                // put finish_reason on the same chunk as the turn's last
+                // name-only delta, and clearing first would let that name be
+                // parked again and cross into the next turn.
+                if (chunk.choices?.[0]?.finish_reason) {
+                  endProviderTurn();
                 }
                 if (
                   addedToolCall ||
@@ -7053,6 +7506,9 @@ export function createOpenAIStreamAdapter(
                   };
                 }
                 continue;
+              }
+              if (chunk.choices?.[0]?.finish_reason) {
+                endProviderTurn();
               }
               // extra_content can arrive with no content at all: a Gemini
               // thoughtSignature fragment, or the codex reasoning ledger on a
