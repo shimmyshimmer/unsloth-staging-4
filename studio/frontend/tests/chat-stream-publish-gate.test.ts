@@ -267,14 +267,16 @@ function withoutComments(source: string): string {
 }
 
 /** The adapter between two anchors, without its comments. */
-function regionOf(from: string, to: string, maxChars = 60_000): string {
+function regionOf(from: string, to: string, maxChars = 75_000): string {
   const start = ADAPTER.indexOf(from);
   assert.notEqual(start, -1, `"${from}" is gone; this test needs rewriting`);
   const end = ADAPTER.indexOf(to, start);
   assert.notEqual(end, -1, `"${to}" is gone; this test needs rewriting`);
   // Without this, editing the end anchor's line (even adding a space) silently
   // slides the region to the next match hundreds of lines away, and the
-  // ordering assertions below go on passing against the wrong slice.
+  // ordering assertions below go on passing against the wrong slice. A ceiling
+  // on drift, not a budget: raise it when the loop legitimately grows, after
+  // checking the anchors still land where they should.
   assert.ok(
     end - start < maxChars,
     `the region from "${from}" to "${to}" is ${end - start} chars; ` +
@@ -642,9 +644,15 @@ test("a per-call thought signature forces a publish", () => {
     window.includes("replayStateChanged = true"),
     "a changed per-call extra_content does not force a publish",
   );
+  // Read off `incomingExtra`, which is `call.extra_content` except when the
+  // delta announced the NEXT call and parked its metadata for it.
   assert.ok(
-    window.includes("call.extra_content !== undefined"),
+    window.includes("incomingExtra !== undefined"),
     "the latch fires on calls that carry no extra_content at all",
+  );
+  assert.ok(
+    window.includes("? undefined\n                      : call.extra_content"),
+    "the latch no longer reads the delta's own extra_content",
   );
 
   // And the latch has to be honoured where the tool-call publish is decided.
