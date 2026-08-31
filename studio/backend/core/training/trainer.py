@@ -982,7 +982,12 @@ class UnslothTrainer:
                         self._update_progress(error = friendly, is_training = False)
                         return False
 
-            device_map = get_device_map(gpu_ids)
+            # The planner declines a full finetune and an explicit auto_model, and its
+            # "sequential" fallback fills cuda:0 first: wrong shape for a training run.
+            device_map = get_device_map(
+                gpu_ids,
+                planner_eligible = not full_finetuning and self._audio_type not in ("csm", "whisper"),
+            )
             logger.info(
                 f"Using device_map='{device_map}' ({get_visible_gpu_count()} GPU(s) visible)"
             )
@@ -3479,9 +3484,9 @@ class UnslothTrainer:
                 # kills the feature. Env-only, deliberately NOT worker.py's
                 # _data_parallel_world_size, which also counts visible CUDA devices:
                 # that bounds a row subset where over-counting is free, this feeds a
-                # veto where both directions are wrong. Unsloth's multi-GPU load is
-                # device_map="balanced", model-parallel to transformers with _n_gpu = 1,
-                # so a balanced 4-GPU run draws one GPU's rows per step and counting
+                # veto where both directions are wrong. Unsloth's multi-GPU load is a
+                # sharding device_map, model-parallel to transformers with _n_gpu = 1,
+                # so a sharded 4-GPU run draws one GPU's rows per step and counting
                 # devices would report 4x the passes, vetoing a qualifying run.
                 world_size = world_size_from_env()
                 if world_size > 1:

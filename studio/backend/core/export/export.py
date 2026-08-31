@@ -81,14 +81,15 @@ _PYTORCH_MISSING_MESSAGE = (
 _LLAMA_CPP_SCRIPTS_WARNING_EMITTED = False
 
 
-def _multi_gpu_device_map_kwargs() -> dict:
+def _multi_gpu_device_map_kwargs(planner_eligible: bool = True) -> dict:
     """``device_map`` kwargs for sharding a checkpoint across every visible GPU.
 
     unsloth's ``from_pretrained`` defaults to ``device_map="sequential"``, which stacks
     the whole model on GPU0 and OOMs multi-GPU hosts whose other GPUs sit empty (#7053).
-    Returns ``{"device_map": "balanced"}`` only on a real multi-GPU CUDA/ROCm host
-    (mirroring the inference loader's ``get_device_map``), else empty so single-GPU, CPU
-    and MLX loads keep the loader default."""
+    Returns a sharding map only on a real multi-GPU CUDA/ROCm host (mirroring the
+    inference loader's ``get_device_map``), else empty so single-GPU, CPU and MLX loads
+    keep the loader default. ``planner_eligible = False`` for the CSM and Whisper
+    branches below, which pass a concrete ``auto_model`` the planner will not plan."""
     if _IS_MLX:
         return {}
     try:
@@ -96,13 +97,15 @@ def _multi_gpu_device_map_kwargs() -> dict:
 
         visible = get_parent_visible_gpu_ids()
         if len(visible) > 1:
-            device_map = get_device_map(visible)
+            device_map = get_device_map(visible, planner_eligible = planner_eligible)
         elif not visible:
             # UUID/MIG masks resolve to no numeric ids; get_device_map(None) falls back to the visible count.
-            device_map = get_device_map(None)
+            device_map = get_device_map(None, planner_eligible = planner_eligible)
         else:
             return {}
-        if device_map == "balanced":
+        # Both sharding answers `get_device_map` gives. A "balanced"-only whitelist
+        # dropped the map once CUDA began asking for "unsloth".
+        if device_map in ("balanced", "unsloth"):
             return {"device_map": device_map}
     except Exception as exc:
         logger.debug(f"multi-GPU device_map resolution failed; using loader default: {exc}")
@@ -138,6 +141,18 @@ def _is_cpu_spill_rejection(exc: BaseException) -> bool:
     match it explicitly. See transformers ``quantizers/quantizer_bnb_4bit.py``.
     """
     return "dispatched on the cpu or the disk" in str(exc).lower()
+
+
+def _is_device_map_infeasible(exc: BaseException) -> bool:
+    """The ``"unsloth"`` planner declining to place the model, matched by class name.
+
+    It raises rather than spilling a bitsandbytes model to CPU. That is right for a
+    load the user asked for and wrong here: it budgets from free memory read before
+    this process opens a context, so a training or chat job holding the other cards
+    can make it refuse a model the single-device loader still fits. By name, because
+    importing the class would tie the export to a version that defines it.
+    """
+    return type(exc).__name__ == "DeviceMapInfeasible"
 
 
 class _CpuSpillRetry(Exception):
@@ -477,13 +492,6 @@ class ExportBackend:
             # Skip the Hub when offline so a no-internet export uses the local cache.
             local_files_only = _hf_offline()
 
-            # Shard across every visible GPU instead of stacking on GPU0 (#7053); {} on single-GPU/CPU/MLX.
-            _device_map_kw = (
-                _multi_gpu_device_map_kwargs()
-                if _device_map_override is None
-                else _device_map_override
-            )
-
             # Run the type-detection probes in the forced-offline window (else a gated
             # base 404s); it covers is_vision_model's Hub reads + the transformers-5
             # subprocess, and local_files_only makes detect_audio_type's requests.get skip.
@@ -494,6 +502,18 @@ class ExportBackend:
                 self.is_vision = not self._audio_type and is_vision_model(
                     model_id, hf_token = token, local_files_only = local_files_only
                 )
+
+            # Shard across every visible GPU instead of stacking on GPU0 (#7053); {} on
+            # single-GPU/CPU/MLX. After detection, not before: the CSM and Whisper
+            # branches pass a concrete auto_model the planner declines, and the map they
+            # get depends on which branch this is.
+            _device_map_kw = (
+                _multi_gpu_device_map_kwargs(
+                    planner_eligible = self._audio_type not in ("csm", "whisper"),
+                )
+                if _device_map_override is None
+                else _device_map_override
+            )
 
             if self._audio_type == "csm":
                 from unsloth import FastModel
@@ -638,9 +658,14 @@ class ExportBackend:
             if (
                 _device_map_override is None
                 and (
-                    isinstance(e, _CpuSpillRetry) or _is_oom_error(e) or _is_cpu_spill_rejection(e)
+                    isinstance(e, _CpuSpillRetry)
+                    or _is_oom_error(e)
+                    or _is_cpu_spill_rejection(e)
+                    or _is_device_map_infeasible(e)
                 )
-                and _multi_gpu_device_map_kwargs()
+                and _multi_gpu_device_map_kwargs(
+                    planner_eligible = self._audio_type not in ("csm", "whisper")
+                )
             ):
                 # Retry outside this block: the live traceback pins the half-built model's
                 # frames, so an in-block retry inherits the exhausted device.
@@ -654,7 +679,7 @@ class ExportBackend:
 
         logger.warning(
             f"Multi-GPU export load unusable ({retry_reason}); retrying on "
-            f"the single-device loader default."
+            f"the sequential loader default."
         )
         self.cleanup_memory()
         return self.load_checkpoint(
@@ -663,7 +688,10 @@ class ExportBackend:
             load_in_4bit = load_in_4bit,
             trust_remote_code = trust_remote_code,
             hf_token = hf_token,
-            _device_map_override = {},
+            # Named, not omitted: an omitted map is unsloth's DEFAULT_DEVICE_MAP, which
+            # `requested_device_map` upgrades back to the planner, so the retry would
+            # re-run the placement that just failed. A typed "sequential" passes through.
+            _device_map_override = {"device_map": "sequential"},
         )
 
     def _write_export_metadata(self, save_directory: str):
