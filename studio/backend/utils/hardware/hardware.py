@@ -4936,14 +4936,37 @@ def apply_gpu_ids(gpu_ids, backend: Optional[str] = None) -> None:
         logger.info("Applied gpu_ids: CUDA_VISIBLE_DEVICES='%s'", value)
 
 
-def get_device_map(gpu_ids: Optional[list[int]] = None) -> str:
+def get_device_map(
+    gpu_ids: Optional[list[int]] = None,
+    *,
+    planner_eligible: bool = True,
+) -> str:
     """Return the Hugging Face ``device_map`` string for model loading.
 
-    Returns ``"balanced"`` (shard evenly across GPUs) when:
+    Returns ``"unsloth"`` on CUDA, or ``"balanced"`` on XPU, to shard across
+    GPUs when:
       - ``gpu_ids`` explicitly lists >1 GPU, **or**
       - ``CUDA_VISIBLE_DEVICES``/``ZE_AFFINITY_MASK`` uses non-numeric
         identifiers (UUID/MIG/wildcard) and >1 GPU is visible (fallback:
         numeric IDs unresolvable, so assume multi-GPU is intended).
+
+    CUDA asks for unsloth's head-aware planner instead of accelerate's
+    ``"balanced"``, which caps every device but the last at about
+    ``model_size / n_devices`` and charges cuda:0 alone for the largest layer.
+    On a quantized model the unquantized ``lm_head`` then does not fit, every
+    module lands on the last card, and a 4bit model wholly on a non-zero card
+    cannot be trained: ``Accelerator.prepare_model`` refuses it.
+
+    Two cases keep ``"balanced"``, both because the planner would decline and
+    its ``"sequential"`` fallback fills cuda:0 to its whole free budget before
+    touching cuda:1 -- on a 7B in bf16 across 2x16 GiB that is the entire model
+    on cuda:0, against 13/19 for ``balanced``, leaving no room for optimizer
+    state:
+
+      - XPU, where the planner has no memory budgets at all;
+      - ``planner_eligible = False``, for a full finetune or an explicit
+        ``auto_model`` class with no ``_model_mapping``
+        (``CsmForConditionalGeneration``, ``WhisperForConditionalGeneration``).
 
     Returns ``"sequential"`` (single device) otherwise, including CPU/MLX
     backends.
@@ -4978,6 +5001,8 @@ def get_device_map(gpu_ids: Optional[list[int]] = None) -> str:
                     multi_gpu = True
 
         if multi_gpu:
+            if device == DeviceType.CUDA and planner_eligible:
+                return "unsloth"
             return "balanced"
 
     return "sequential"
