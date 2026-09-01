@@ -22749,7 +22749,6 @@ async def produce_openai_chat_completions(
         # recomputing here would hide that and drop the client catalog.
         not _sf_tools_on
         and not _sf_use_tools
-        and image is None
         and not _sf_is_gptoss
         and _sf_features.get("supports_tools", False)
         and ((payload.tools and len(payload.tools) > 0) or _sf_has_tool_msgs)
@@ -22780,6 +22779,18 @@ async def produce_openai_chat_completions(
     _sf_chat_targets = (
         (_sf_mlx_target,) if _sf_hf_target is _sf_mlx_target else (_sf_mlx_target, _sf_hf_target)
     )
+    # An image turn renders through the PROCESSOR on both backends
+    # (_generate_vision_response, _generate_vlm), and its template is a different file from
+    # the tokenizer's for most VLMs: Qwen2.5-VL's processor body never mentions tools while
+    # its tokenizer body does. Authorizing healing from the tokenizer body would promote a
+    # text-form call for a schema that render never carried (#7066). The objects above are
+    # None under the orchestrator, which mirrors metadata rather than a live processor, so
+    # the body is read from that mirror.
+    _sf_image_tpl = (
+        (_sf_model_info.get("chat_template_info") or {}).get("processor_template")
+        if image is not None
+        else None
+    )
     _sf_healing_tools = (
         # Safe under EVERY template this turn could select: when the active one drops the
         # schema the render falls back to the native template, whose profile can drop a tool
@@ -22792,6 +22803,8 @@ async def produce_openai_chat_completions(
             _sf_chat_targets,
             _sf_model_info,
             active_model_name = backend.active_model_name,
+            template = _sf_image_tpl,
+            template_is_processor = _sf_image_tpl is not None,
         )
         if _sf_client_tools
         else None
