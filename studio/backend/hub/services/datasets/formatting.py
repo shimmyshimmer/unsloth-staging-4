@@ -423,7 +423,7 @@ def check_format_response(
                     )
 
             if preview_slice is None:
-                # Tier 2: full streaming (resolves all files — slow for large repos)
+                # Tier 2: full streaming (resolves all files - slow for large repos)
                 logger.info("Tier 2: falling back to full streaming load_dataset")
                 try:
                     load_kwargs = {
