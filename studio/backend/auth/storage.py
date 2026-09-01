@@ -1137,7 +1137,6 @@ def clear_desktop_secret(conn: Optional[sqlite3.Connection] = None) -> None:
         conn.close()
 
 
-
 API_KEY_PREFIX = "sk-unsloth-"
 
 # The name is the only thing distinguishing internal keys by authority: Deep Research keys must
