@@ -54,8 +54,8 @@ PASSWORD_DIALOG = FRONTEND / "features/settings/components/change-password-dialo
 GENERAL_TAB = FRONTEND / "features/settings/tabs/general-tab.tsx"
 
 CLIPBOARD_FILES = FRONTEND / "features/chat/utils/clipboard-files.ts"
-# The DataTransfer reading half moved here when long pastes became attachments
 # (#8472). Both halves are still one contract, so read them as one.
+# The DataTransfer reading half moved here when long pastes became attachments (#8472).
 CLIPBOARD_PAYLOAD = FRONTEND / "features/chat/utils/clipboard-payload.ts"
 TAURI_CAPABILITIES = REPO / "studio/src-tauri/capabilities/default.json"
 CHAT_PAGE = FRONTEND / "features/chat/chat-page.tsx"
@@ -310,17 +310,15 @@ def test_gallery_video_links_are_absolute_and_saved_natively():
     video_page = VIDEO_PAGE.read_text(encoding = "utf-8")
     rag_api = RAG_API.read_text(encoding = "utf-8")
 
-    # The backend mints this link relative so a proxy can serve it. Its consumers are
-    # <video src> and the download, none of which go through authFetch, so a relative
-    # path under Tauri resolves against the webview and yields the SPA shell.
+    # The backend mints this link relative so a proxy can serve it.
     assert "return apiUrl(body.url);" in video_api
     assert 'from "@/lib/api-base"' in video_api
     # The same fix the RAG document preview already carries.
     assert "return apiUrl(data.url);" in rag_api
 
-    # An absolute link is cross-origin, where the download attribute stops saving, so the
-    # MP4 goes native. Streaming, not downloadUrl: a clip is capped at 2048x2048 x 1024
-    # frames, too big to buffer for IPC, and the chooser must not wait on the body.
+    # An absolute link is cross-origin, where the download attribute stops saving, so the MP4 goes native.
+    # Streaming, not downloadUrl: a clip is capped at 2048x2048 x 1024 frames, too big to buffer for IPC, and the
+    # chooser must not wait on the body.
     helper = NATIVE_FILES.read_text(encoding = "utf-8")
     assert "downloadUrlStreaming(src, exportFilename(video, format))" in video_page
     assert '"save_native_file_from_url"' in helper
@@ -329,14 +327,13 @@ def test_gallery_video_links_are_absolute_and_saved_natively():
     assert "await downloadFile(blob, exportFilename(video, format), blob.type);" in video_page
     assert "URL.createObjectURL(blob)" not in video_page
 
-    # media-src, not just connect-src: the signed link is played by an element.
+    # media-src, not just connect-src:
     tauri_config = (REPO / "studio/src-tauri/tauri.conf.json").read_text(encoding = "utf-8")
     assert (
         "media-src 'self' data: blob: https: http://localhost:* http://127.0.0.1:*" in tauri_config
     )
 
-    # The save dialog now offers these to video, not just to the audio player, and the
-    # streaming command is registered and pinned to the local backend.
+    # The save dialog now offers these to video, not just to the audio player, and the streaming command is registered
     dialogs = NATIVE_DIALOGS.read_text(encoding = "utf-8")
     assert '("MPEG-4 video or audio", filter_extensions(["m4a", "mp4"]))' in dialogs
     assert '("WebM video or audio", filter_extensions(["webm"]))' in dialogs
@@ -348,9 +345,9 @@ def test_gallery_video_links_are_absolute_and_saved_natively():
     # The chooser has to come first, or the user waits on the body before being asked where.
     streaming = dialogs[dialogs.index("pub async fn save_native_file_from_url") :]
     assert streaming.index(".save_file(") < streaming.index("stream_url_to_path(&url")
-    # No proxy (the signed URL must not reach one) and no redirects (they would leave loopback
-    # after the check). read_timeout, not timeout: it bounds each chunk, so a backend that goes
-    # quiet cannot hang the save while a legitimately large clip still finishes.
+    # No proxy (the signed URL must not reach one) and no redirects (they would leave loopback after the check).
+    # read_timeout, not timeout: it bounds each chunk, so a backend that goes quiet cannot hang the save while a
+    # legitimately large clip still finishes.
     loopback = (REPO / "studio/src-tauri/src/loopback_http.rs").read_text(encoding = "utf-8")
     assert "fn streaming_client" in loopback
     assert "redirect(reqwest::redirect::Policy::none())" in loopback
@@ -445,8 +442,7 @@ def test_mac_dock_reopens_hidden_main_window():
 
 
 def test_windows_browser_guard_runs_only_in_release_builds():
-    # WebView2 is not reachable from Python, so pin the release-only call that
-    # keeps refresh controls available during development.
+    # WebView2 is not reachable from Python, so pin the release-only call that keeps refresh controls available during
     source = TAURI_MAIN.read_text(encoding = "utf-8")
 
     assert "fn setup_windows_browser_guards" in source
@@ -469,7 +465,7 @@ def test_desktop_manages_the_remote_password_through_the_account_dialog():
     refresh = section.split("const refreshStatus = useCallback(", 1)[1].split("}, []);", 1)[0]
     assert "mutationEpoch.current += 1;" in refresh
     assert "setPollRevision(" in refresh
-    # Initial mode sends no current password; the web flow it serves keeps it.
+    # Initial mode sends no current password;
     body = dialog.split("function changePasswordBody", 1)[1].split("function dialogCopy", 1)[0]
     assert '? [["new_password", nextPassword]]' in body
     assert '["current_password", currentPassword],' in body
@@ -532,7 +528,6 @@ def test_first_app_layout_survives_a_stale_setup_window_size():
     assert "enforceWindowSizeBounds(" in app_layout
     finalize_call = app_layout.split("finalizeAppWindowLayout({", 1)[1].split("});", 1)[0]
     assert "measured," in finalize_call
-    # Limit the check to this call's arguments.
     bounds_call = app_layout.split("enforceWindowSizeBounds(", 1)[1].split(");", 1)[0]
     assert "bounds," in bounds_call
     assert "requestedSize," in bounds_call
@@ -571,8 +566,8 @@ def test_desktop_titlebar_separates_navigation_from_sidebar_brand():
     sidebar = APP_SIDEBAR.read_text(encoding = "utf-8")
     header = sidebar.split("<SidebarHeader", 1)[1].split("</SidebarHeader>", 1)[0]
 
-    # The names, not the whole import list: #8025 added Minus/Square/X to the
-    # same line for the window controls and this went red on every open PR.
+    # The names, not the whole import list: #8025 added Minus/Square/X
+    # The names, not the whole import list:
     lucide = re.search(r"import \{([^}]*)\} from \"lucide-react\";", titlebar)
     assert lucide is not None, "titlebar no longer imports from lucide-react"
     icons = {name.strip() for name in lucide.group(1).split(",")}
@@ -637,9 +632,7 @@ def test_tauri_collapse_removes_the_icon_rail_but_web_keeps_it():
     assert "translate-y-[var(--studio-titlebar-navigation-offset-y,0px)]" in TITLEBAR.read_text(
         encoding = "utf-8"
     )
-    # The nudge has to move the navigation without pushing it out of the titlebar it sits
-    # in, so the button box travels with it. The container's mt-1 is deliberately not in
-    # the sum: translate-y is visual, and the margin already seats the box in the row.
+    # The nudge has to move the navigation without pushing it out of the titlebar it sits in, so the button box travels
     button = _titlebar_nav_button_px(TITLEBAR.read_text(encoding = "utf-8"))
     assert button is not None, "navigation button size no longer readable from buttonClass"
     blocks = _chrome_style_blocks(APP_PROVIDER.read_text(encoding = "utf-8"))
@@ -666,21 +659,18 @@ def test_fixed_sheets_start_below_the_custom_titlebar():
     # Portalled sheets read the height off <html>, so the mirror has to stay.
     assert 'set("--studio-custom-titlebar-height", usesCustomTitlebar ? "34px" : null)' in provider
 
-    # Only viewport-fixed sheets clear the titlebar; the absolute recipe block
-    # sheet sits in its own container and keeps a plain top edge.
+    # Only viewport-fixed sheets clear the titlebar;
     assert 'position === "fixed" ? VIEWPORT_TOP_EDGE : CONTAINED_TOP_EDGE' in sheet
     for side in ("left", "right", "top"):
         assert f"data-[side={side}]:top-[var(--studio-custom-titlebar-height,0px)]" in sheet
         assert f"data-[side={side}]:top-0" in sheet
 
-    # Anchor both edges so the inset shrinks the sheet; h-full would instead
-    # push its bottom past the viewport.
+    # Anchor both edges so the inset shrinks the sheet;
     for side in ("left", "right"):
         assert f"data-[side={side}]:bottom-0" in sheet
         assert f"data-[side={side}]:h-full" not in sheet
 
-    # The shared class is the only sheet offset; a local one would double up.
-    # Dialogs still read --studio-window-chrome-top (DesktopChromeVarsEffect).
+    # The shared class is the only sheet offset;
     for portalled in (
         RESEARCH_ACTIVITY_PANEL,
         RESPONSE_DETAILS_SHEET,
@@ -705,8 +695,7 @@ def test_mac_chat_header_controls_share_the_titlebar_row():
     assert "shouldUseNativeMacWindowTitlebar" not in source
     assert "[--studio-content-top-inset:var(--studio-mac-titlebar-height" not in source
     assert source.count("var(--studio-mac-traffic-light-inset") == 2
-    # Sharing the row is the contract: the padding must leave the control room inside the
-    # header, so a retune to a large value fails here rather than shipping a clipped row.
+    # Sharing the row is the contract:
     blocks = _chrome_style_blocks(provider)
     padded = {
         name: values
@@ -792,10 +781,8 @@ def test_image_page_structural_panes_share_the_container_breakpoint():
     assert "@[50rem]:flex-row @[50rem]:overflow-hidden" in section
     assert "@[50rem]:w-[408px]" in section
     assert "md:flex-row" not in section
-    # pb-6, not the old pb-20: the action is an in-flow footer now, so the rail no longer
-    # reserves 80px for an overlay to sit in. The crossfade into that footer is the
-    # -action mask, which is why the two are asserted together -- the small padding is
-    # only correct while the fade is there to dissolve the last control into the footer.
+    # pb-6, not the old pb-20:
+    # pb-6, not the old pb-20: the action is an in-flow footer now, so the rail no longer reserves 80px for an overlay
     assert "panel-scroll-fade-action" in section
     assert "gap-4 px-10 pt-9 pb-6 @[50rem]:overflow-y-auto" in section
     assert "p-6 px-10 @[50rem]:pt-[60px]" in section
@@ -869,15 +856,13 @@ def test_media_page_headers_out_stack_the_mac_drag_region():
     assert "pointer-events-none absolute inset-x-0 top-0 z-40 h-[48px]" in navbar
     assert "data-tauri-drag-region" in navbar
 
-    # (page, end of the header band, clickable control groups expected inside it)
     for page, band_end, min_groups in (
         (IMAGES_PAGE, "MediaPageLink", 3),
         (VIDEO_PAGE, "MediaPageLink", 2),
         (AUDIO_PAGE, "PillTabs", 2),
     ):
         source = page.read_text(encoding = "utf-8")
-        # matched on the band's size alone: Images lays its header out as a grid and Video as a
-        # flex row, so the stacking contract below is what this pins, not one layout's utilities.
+        # matched on the band's size alone:
         before, marker, band = source.partition("h-[48px] shrink-0")
         assert marker, page.name
         opening = before.rsplit('<div className="', 1)[1]
@@ -886,8 +871,6 @@ def test_media_page_headers_out_stack_the_mac_drag_region():
 
         band = band.split(band_end, 1)[0]
         # every control group in the band has to opt back in, whatever utilities lay it out:
-        # Audio and Images seat their mode pills in a grid cell, Video in a flex row, so
-        # matching on the opt-in alone is what keeps this honest across all three.
         groups = re.findall(r'"([^"]*pointer-events-auto[^"]*)"', band)
         assert len(groups) >= min_groups, (page.name, groups)
 

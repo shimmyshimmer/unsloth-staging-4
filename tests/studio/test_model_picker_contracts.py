@@ -84,11 +84,8 @@ def _read_backend(rel: str) -> str:
     return path.read_text(encoding = "utf-8")
 
 
-# The frontend greps below have no parser to hand. The backend does, and a rule read out
-# of the parse tree survives the edits that are not about it: a formatter that splits a
-# set literal one name per line, a reordering, a renamed neighbour. Each helper raises
 # rather than returning empty when it cannot find what it was pointed at, so a rule that
-# moves reddens here instead of passing vacuously.
+# The frontend greps below have no parser to hand.
 def _backend_function(rel: str, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
     """The definition of ``name`` in backend file ``rel``."""
     tree = ast.parse(_read_backend(rel), filename = rel)
@@ -213,9 +210,8 @@ def _override_lookup_candidates(*args, **kwargs) -> list[str]:
     try:
         return override_lookup_candidates(*args, **kwargs)
     except ModuleNotFoundError as missing:
-        # The standalone-.gguf branch lazily imports hub.utils.gguf, which reaches structlog. CI
-        # installs studio.txt; a bare `pytest tests/studio/...` does not. Skip on a missing
-        # third-party package only -- a missing first-party module is a real break.
+        # The standalone-.gguf branch lazily imports hub.utils.gguf, which reaches structlog.
+        # CI installs studio.txt;
         if (missing.name or "").split(".")[0] in {"hub", "loggers", "utils", "core", "models"}:
             raise
         import pytest as _pytest
@@ -317,11 +313,10 @@ def test_chat_autoload_toast_is_persistent_and_dismissible():
     assert "toast.loading(" not in auto_load
     assert "const updateAutoLoadToast =" in auto_load
     assert "if (autoLoadToastDismissed) return;" in auto_load
-    # Progress + the terminal "download stopped" notice; success/error use their
-    # own toast.success / toast.error helpers.
+    # Progress + the terminal "download stopped" notice;
+    # success/error use their own toast.success / toast.error helpers.
     assert auto_load.count("toast.message(") == 3
-    # One progress toast re-titled through every phase: the cascade updates it
-    # directly, and the download keeps it live via the same updater.
+    # One progress toast re-titled through every phase:
     assert auto_load.count("updateAutoLoadToast(") >= 2
     assert (
         "ensureDefaultModelDownloaded(\n        hfToken,\n        options?.abortSignal,\n        updateAutoLoadToast,\n      )"
@@ -337,22 +332,8 @@ def test_chat_autoload_toast_is_persistent_and_dismissible():
     # Terminal success uses a fresh finite toast after manual progress dismissal.
     assert "showAutoLoadSuccess" in auto_load
     # How a degraded load is described belongs to one helper, not to this call site.
-    #
-    # This assertion has moved three times: it was `description: undefined`, then
-    # `description: cpuFallbackReason` when the CPU-fallback branch appeared, then the
-    # mmproj branch went in front of that. Each rewrite pinned a fresh spelling of an
-    # inline conditional, and the third one shipped a real bug that no spelling-based
-    # check could have caught: `mmproj ? ... : cpu ? ...` drops the CPU message when
-    # both are set, so a session that lost GPU acceleration AND vision reported only
-    # the vision loss.
-    #
-    # So this no longer describes the conditional at all. It requires the call site to
-    # delegate, and the composition itself is tested where it lives, in
+    # It requires the call site to delegate, and the composition itself is tested where it lives, in
     # studio/frontend/tests/mmproj-fallback.test.ts, against both reasons together.
-    # Sliced to the end of the helper body, not to the first `};`. That earlier bound
-    # stopped at the `options` object literal, so anything declared after it -- the
-    # toast severity, which is the half that decides whether a degraded load looks
-    # like a plain success -- was silently outside the text being asserted on.
     success_toast = auto_load.split("const showAutoLoadSuccess", 1)[1]
     success_toast = success_toast.split("if (autoLoadToastDismissed)", 1)[0]
     assert "loadFallbackNotice(" in success_toast, (
@@ -501,8 +482,7 @@ def test_deferred_gpu_pick_keeps_its_index_namespace():
 
     apply = _read("features/model-picker/model-config/apply-per-model-config.ts")
     assert "selectedGpuIndexKind: s.selectedGpuIndexKind" in apply
-    # gpuFieldsSignature moved to config-signature.ts so the editor's instance key can
-    # read it without importing the runtime applier; the namespace rule moved with it.
+    # gpuFieldsSignature moved to config-signature.ts so the editor's instance key can read it without importing the
     signature = _read("features/model-picker/model-config/config-signature.ts")
     assert "config.selectedGpuIndexKind === undefined" in signature
     assert 'config.selectedGpuIndexKind ?? "physical"' not in signature
@@ -525,8 +505,7 @@ def test_gpu_picker_round_trips_requested_pool_not_fitted_subset():
     assert "const reportedGpuIds = requestedGpuIdsFromResponse(resp)" in store
     assert "loadedGpuIndexKind: GpuIndexKind | null;" in store
     assert "loadedGpuIndexKind: gpuIds == null ? null : (gpuIndexKind ?? null)" in store
-    # A cold discovery cache reports gpuIndexKind === undefined (deferred, not
-    # rejected); only a warm cache's definitive null should drop the pin.
+    # A cold discovery cache reports gpuIndexKind === undefined (deferred, not rejected);
     assert "reportedGpuIds != null && gpuIndexKind !== null" in store
 
     status = _read("features/chat/lib/apply-inference-status-to-store.ts")
@@ -546,8 +525,7 @@ def test_compare_load_uses_each_models_gpu_config():
     placement = " ".join(_read("features/chat/lib/gpu-placement.ts").split())
     assert 'own.gpuMemoryMode ?? (treatAsDiffusion ? "auto" : shared.gpuMemoryMode)' in placement
     assert "own.gpuLayers ?? (treatAsDiffusion ? GPU_LAYERS_AUTO : shared.gpuLayers)" in placement
-    # An unclassified GGUF is pinned like a confirmed one: /load may still find a
-    # diffusion header after the download.
+    # An unclassified GGUF is pinned like a confirmed one:
     assert "return isDiffusion === true || diffusionUnknown" in placement
     assert "ownConfig.nCpuMoe ?? compareLoadKnobs.nCpuMoe" in src
     assert "if (ownConfig.selectedGpuIds != null)" in src
@@ -665,24 +643,20 @@ def test_a_pinned_cached_row_loads_from_the_id_the_backend_pinned():
 
     picker = _read("features/model-picker/components/model-selector/pickers.tsx")
     assert "loadId={c.load_id}" in picker, "the quant list cannot pass on a pin it never gets"
-    # Every row that can start a load, and every gear beside one, reloads through
-    # the same meta and so has to carry the pin. Counted rather than matched
-    # loosely, so a new row that forgets it is a failure here rather than a load
     # that silently follows the default ref. #7736 added the third: the collapsed
     # single-quant GGUF row. #7880 added the fourth: the per-quant VRAM bar, which
-    # has to price the pinned snapshot rather than the default ref.
+    # Every row that can start a load, and every gear beside one, reloads through the same meta and so has to carry the
     assert picker.count("loadId: c.load_id") == 4, (
         "a row or gear that can start a load is missing the pin, or a new one was "
         "added and this count needs to follow it"
     )
     block = re.search(r"onConfigure\(repoId, \{.*?\n\s*\}", picker, re.S)
     assert block and "loadId," in block.group(0), "the GGUF gear drops the pin"
-    # The variant click withholds it: a quant outside the pinned snapshot lands in a different one.
+    # The variant click withholds it:
     block = re.search(r"onSelect\(repoId, \{.*?\n\s*\}", picker, re.S)
     assert block and "loadId: downloaded === true ? loadId : undefined," in block.group(0)
-    # localPath alone: preferLocalCache would answer from disk and drop the undownloaded quants.
     # #7767 added the expander's abort signal to this call, so the options are an object
-    # literal now rather than the bare localSource ternary.
+    # localPath alone: preferLocalCache would answer from disk and drop the undownloaded quants.
     call = re.search(r"listGgufVariants\(repoId, hfToken, \{.*?\n\s*\}\)", picker, re.S)
     assert call, "the expander must still list variants for the row's own repo"
     assert "...(localSource ? { localPath: localSource } : {})" in call.group(
@@ -698,7 +672,7 @@ def test_a_pinned_cached_row_loads_from_the_id_the_backend_pinned():
 
     runtime = _read("features/chat/hooks/use-chat-model-runtime.ts")
     assert "activeLoadId: loadPath === modelId ? null : loadPath," in runtime
-    # A failed swap already unloaded the pinned model: reload it from the same place, pin and all.
+    # A failed swap already unloaded the pinned model:
     assert "model_path: previousActiveLoadId || previousCheckpoint," in runtime
     assert "activeLoadId: previousActiveLoadId ?? null," in runtime
     # A model loaded outside this tab replaces the resident one, and the pin belonged to the old.
@@ -710,7 +684,7 @@ def test_a_pinned_cached_row_loads_from_the_id_the_backend_pinned():
     assert (
         '(typeof selection === "string" ? null : selection.loadId) || modelId' in runtime
     ), "loadPath must fall back to the id, so an unpinned pick is unchanged"
-    # Staged metadata, validate and load: all three read the copy that loads.
+    # Staged metadata, validate and load:
     assert runtime.count("model_path: loadPath,") == 3
     assert "model_path: modelId," not in runtime
     # A rollback reads the approval under the snapshot path, so store it under both keys.
@@ -799,8 +773,7 @@ def test_chat_autoload_scopes_variant_lookup_to_cached_repo_path():
     """Autoload must probe the exact cache row it will load, including rows
     retained from a previously selected Hugging Face cache."""
     src = _read("features/chat/api/chat-adapter.ts")
-    # Both cache-backed sources scan the exact path they will load from, not the
-    # bare repo id.
+    # Both cache-backed sources scan the exact path they will load from, not the bare repo id.
     sources = src.split("function buildAutoLoadSources", 1)[1]
     sources = sources.split("function isRememberedSource", 1)[0]
     assert sources.count("preferLocalCache: true") == 2
@@ -860,23 +833,19 @@ def test_local_mtp_warning_covers_path_and_native_gguf_sources():
     assert "isGguf &&" in local.group(0)
     assert "activeModelIsLocal" in local.group(0)
     assert "isLocalModelPath" in local.group(0)
-    # Two signals must not classify the model here, because both mislabel a
-    # remote GGUF as local: a native token, which outlives a switch to a remote
-    # model, and a bare .gguf suffix, since a one-slash org/name.gguf is a
-    # repository id. activeModelIsLocal is the backend's own answer for both.
+    # Two signals must not classify the model here, because both mislabel a remote GGUF as local: a native token, which
+    # outlives a switch to a remote model, and a bare .gguf suffix, since a one-slash org/name.gguf is a repository id.
     assert "activeNativePathToken" not in local.group(0)
     assert ".gguf" not in local.group(0)
 
-    # Switching models must drop both together: a kept flag would classify the
-    # newly selected model by the old one's provenance.
+    # Switching models must drop both together:
     store = _read("features/chat/stores/chat-runtime-store.ts")
     reset = store.split("setCheckpoint: (modelId, ggufVariant, options) =>", 1)[1].split(
         "setActiveThreadId:", 1
     )[0]
     assert "activeModelIsLocal: false" in reset
     assert "specFallbackReason: null" in reset
-    # The reason chain is a switch, so slice on the case label rather than the
-    # ternary comparison it replaced.
+    # The reason chain is a switch, so slice on the case label rather than the ternary comparison it replaced.
     assert "isLocalGguf" in src.split('case "drafter_not_found":', 1)[1]
 
 
@@ -899,12 +868,9 @@ def test_local_mtp_warning_uses_backend_source_metadata():
 
     route = _read_backend("routes/inference.py")
     assert route.count("is_local_model = config.is_local") >= 2
-    # GGUF status reports the provenance the load recorded. Re-deriving it from
-    # the filesystem would flip a local model to remote once its directory goes
-    # away underneath a running server.
+    # GGUF status reports the provenance the load recorded.
     assert "llama_backend._is_local_model = bool(native_grant_backed or config.is_local)" in route
-    # Both GGUF responses report it: the status poll and the already_loaded
-    # dedup reply. Either one re-deriving it reintroduces the flip.
+    # Both GGUF responses report it: the status poll and the already_loaded dedup reply.
     assert route.count("is_local_model = _loaded_is_local_model(") >= 2
     assert "backend.active_model_name and is_local_path(backend.active_model_name)" in route
 
@@ -978,12 +944,11 @@ def test_reset_persists_null_max_length_and_substitutes_only_for_load():
     Reset) so isDefaultConfig can clear a remembered override; the concrete
     fallback is substituted only into the load request, not the saved record."""
     src = _read("features/model-picker/components/model-config-page.tsx")
-    # Load-only substitution of the resolved value (recomputed from any committed
     # same-click Max Seq Length draft, so it is never dropped).
+    # Load-only substitution of the resolved value (recomputed from any committed same-click Max Seq Length draft, so
     assert "maxSeqLength: effectiveMaxSeqLengthValue" in src
     assert "const effectiveLoadConfig" in src
-    # The persisted record is saved from effectiveRuntimeConfig; the load request
-    # carries effectiveLoadConfig (with any committed context input).
+    # The persisted record is saved from effectiveRuntimeConfig;
     assert "onRun(effectiveLoadConfig, classifiedIsDiffusion)" in src
     assert "savePerModelConfig(" in src
 
@@ -1001,12 +966,10 @@ def test_initial_load_uses_staged_config_payload():
     numeric = _read("features/model-picker/components/numeric-value-input.tsx")
     assert "export type NumericValueInputHandle" in numeric
     assert "commit:" in numeric
-    # P1: commit returns null unless the user actually edited the field,
-    # so Load/Save with untouched Auto does not pin native context.
+    # P1: commit returns null unless the user actually edited the field, so Load/Save with untouched Auto does not pin
     assert "dirtyRef.current" in numeric
     assert "return null;" in numeric
     # P2: blur clears dirtyRef after commit so Reset/slider cannot be
-    # overwritten by a stale draft on a later Load.
     assert "dirtyRef.current = false;" in numeric
     assert "draftRef.current = String(final);" in numeric
     # Same-click Load after blur still sees the committed draft.
@@ -1029,8 +992,7 @@ def test_same_click_commit_covers_all_numeric_inputs():
     """The same-click blur bridge must flush every NumericValueInput-backed setting, not
     just Context Length."""
     page = _read("features/model-picker/components/model-config-page.tsx")
-    # Each numeric input owns an imperative handle that handleRun commits, and the
-    # handle is forwarded down to the actual NumericValueInput.
+    # Each numeric input owns an imperative handle that handleRun commits, and the handle is forwarded down to the
     for ref in ("maxSeqLengthInputRef", "gpuLayersInputRef", "moeLayersInputRef"):
         assert f"const {ref} = useRef<NumericValueInputHandle>(null);" in page
         assert f"{ref}.current?.commit()" in page
@@ -1038,8 +1000,7 @@ def test_same_click_commit_covers_all_numeric_inputs():
     # The leaf sub-components accept and forward the handle as a ref.
     assert page.count("inputRef?: Ref<NumericValueInputHandle>;") >= 2
     assert "ref={inputRef}" in page
-    # Committed drafts are folded into the staged config, gated on non-null so an
-    # untouched field never fabricates an override.
+    # Committed drafts are folded into the staged config, gated on non-null so an untouched field never fabricates an
     assert "committedMaxSeqLength != null" in page
     assert "committedGpuLayers != null" in page
     assert "committedMoeLayers != null" in page
@@ -1064,12 +1025,10 @@ def test_reset_enabled_for_explicit_context_pin_at_native():
     override, so contextAtDefault must require customContextLength == null."""
     src = " ".join(_read("features/model-picker/components/model-config-page.tsx").split())
     assert "const contextAtDefault = !target.isGguf || config.customContextLength == null;" in src
-    # The old form that ignored an explicit pin equal to native must not return.
     assert (
         "(nativeContextLength == null ? config.customContextLength == null : "
         "contextValue === nativeContextLength)" not in src
     )
-    # The app-default constant is the single source of truth (imported, not local).
     assert "DEFAULT_MAX_SEQ_LENGTH," in src
     assert "const DEFAULT_MAX_SEQ_LENGTH = 4096" not in src
 
@@ -1083,6 +1042,7 @@ def test_compare_pane_non_gguf_falls_back_to_app_default():
     barrel = _read("features/model-picker/index.ts")
     assert "DEFAULT_MAX_SEQ_LENGTH," in barrel
     src = " ".join(_read("features/chat/shared-composer.tsx").split())
+    # The app-default constant is the single source of truth (imported, not local).
     assert "DEFAULT_MAX_SEQ_LENGTH," in src
     assert (
         "const effectiveMaxSeqLength = ownConfig.customContextLength ?? "
@@ -1183,6 +1143,7 @@ def test_chat_load_prepares_hf_token_before_gguf_metadata_preflight():
     assert prepare < metadata
     # The raw store token must not be handed to the preflight.
     assert "hf_token: preparedToken.token" in runtime
+    # The old form that ignored an explicit pin equal to native must not return.
     assert (
         "hf_token: useChatRuntimeStore.getState().hfToken" not in runtime
     ), "GGUF metadata preflight must not send the unprepared stored token"
@@ -1252,13 +1213,11 @@ def test_legacy_migration_is_idempotent_and_non_destructive():
     a newer per-model config."""
     raw = _read("features/model-picker/model-config/per-model-config.ts")
     src = " ".join(raw.split())
-    # Migration runs from readMap (every store read), so it must be safe to repeat.
     assert (
         "function readMap(): StoredMap { migrateLegacyLoadSettingsOnce(); "
         "return readMapRaw(); }" in src
     )
-    # Layer 1: in-memory once-per-session guard so repeated readMap() calls
-    # migrate at most once.
+    # Layer 1: in-memory once-per-session guard so repeated readMap() calls migrate at most once.
     assert "let legacyMigrationChecked = false;" in src
     assert "if (legacyMigrationChecked || !canUseStorage()) {" in src
     assert "legacyMigrationChecked = true;" in src
@@ -1266,8 +1225,8 @@ def test_legacy_migration_is_idempotent_and_non_destructive():
     assert 'const LEGACY_MIGRATION_FLAG = "unsloth_model_configs_migrated";' in src
     assert "if (localStorage.getItem(LEGACY_MIGRATION_FLAG)) {" in src
     assert src.count('localStorage.setItem(LEGACY_MIGRATION_FLAG, "1");') >= 3
-    # Layer 3: non-overwriting merge skips an existing (or default) key, so even a
     # forced re-run cannot duplicate or clobber a user's config.
+    # Layer 3: non-overwriting merge skips an existing (or default) key, so even a forced re-run cannot duplicate or
     assert "if (isDefaultConfig(migrated) || Object.hasOwn(map, key)) {" in src
 
 
@@ -1279,7 +1238,7 @@ def test_variant_expander_forwards_the_gguf_filename():
     handler = re.search(r"const handleVariantClick = useCallback\(.*?\n  \);", src, re.S)
     assert handler, "handleVariantClick not found"
     assert "ggufFilename: filename," in handler.group(0)
-    # The call site must pass it through in the handler's argument order. Matched structurally, since prettier wraps the call once it grows.
+    # The call site must pass it through in the handler's argument order.
     call = re.search(r"handleVariantClick\(([^)]*)\)", src)
     assert call, "handleVariantClick call site not found"
     args = [a.strip() for a in call.group(1).split(",") if a.strip()]
@@ -1312,6 +1271,7 @@ def test_a_routed_curated_pick_uses_the_same_load_spec_as_a_direct_one():
     repo that has no model_index.json. The catalog spec the page's own picker consults has to win."""
     helper = _read("lib/diffusion-route-pick.ts")
     assert re.search(r"spec\?:\s*\{\s*kind:", helper), "the helper takes no catalog spec"
+    # Migration runs from readMap (every store read), so it must be safe to repeat.
     assert (
         "if (spec) return { repoId: model, opts: { kind: spec.kind, filename: spec.filename } };"
         in helper
@@ -1322,13 +1282,11 @@ def test_a_routed_curated_pick_uses_the_same_load_spec_as_a_direct_one():
     ):
         src = _read(rel)
         # The middle argument, the routed filename, has been respelled more than once;
-        # only the third is load-bearing, so do not pin the second.
         call = re.search(r"diffusionRoutePick\(\s*wanted,\s*(.*?),?\s*\);", src, re.S)
         assert call, f"{rel}: the routed pick does not go through diffusionRoutePick"
-        # By position, not by presence: `diffusionRoutePick(wanted, routedFilename ??
-        # loadSpecFor(wanted, IMAGE_CATALOG)?.filename)` type-checks, passes the spec's
-        # filename as the quant, drops the spec, and would pass a substring check while
-        # curated single-file artifacts load as GGUF.
+        # By position, not by presence: `diffusionRoutePick(wanted, routedFilename ?? loadSpecFor(wanted,
+        # IMAGE_CATALOG)?.filename)` type-checks, passes the spec's filename as the quant, drops the spec, and would
+        # pass a substring check while curated single-file artifacts load as GGUF.
         args = _split_args(call.group(1))
         assert len(args) >= 2, f"{rel}: the routed pick passes no spec argument"
         assert (
@@ -1382,10 +1340,7 @@ def test_diffusion_pages_stage_downloads_through_the_manager():
         stage_fn = re.search(r"const loadOrStage = useCallback\(.*?\n  \);", src, re.S)
         assert stage_fn, f"{rel}: loadOrStage not found"
         body = stage_fn.group(0)
-        # A cached GGUF can still be missing a separate text encoder or VAE, and only the plan
-        # sees that, so every Hub pick is planned and only local picks bypass it. Safe on both
-        # pages because both planners filter against the cache: a fully cached pick returns no
-        # entries. Flipping this on a planner that does not filter would re-stage a whole model.
+        # A cached GGUF can still be missing a separate text encoder or VAE, and only the plan sees that, so every Hub
         assert 'source !== "hub"' in body, f"{rel}: local picks would be planned"
         assert (
             "isDownloaded !== false" not in body
@@ -1405,8 +1360,7 @@ def test_every_diffusion_planner_filters_the_cache_before_staging():
         src = (root / name).read_text(encoding = "utf-8")
         plan = re.search(r"def download_plan\(.*?\n    (?=@|def )", src, re.S)
         assert plan, f"{name}: download_plan not found"
-        # Either probe: `_hub_file_is_loadable` is the stricter one, adding the stale-live-copy
-        # check on top, and a planner may reasonably use it instead.
+        # Either probe: `_hub_file_is_loadable` is the stricter one, adding the stale-live-copy check on top, and a
         assert "_hub_file_is_cached" in plan.group(0) or "_hub_file_is_loadable" in plan.group(
             0
         ), f"{name}: download_plan stages files without checking the cache"
@@ -1433,11 +1387,7 @@ def test_a_hidden_diffusion_page_does_not_load_when_its_download_lands():
         assert "if (!active)" in ready.group(0), f"{rel}: a hidden page still takes the GPU"
         # Deferred, not dropped: something has to fire the held pick when the page returns.
         assert "stagedLoadDeferred" in ready.group(0), f"{rel}: the pick is discarded"
-        # The deps array grew when the load body moved into runStagedLoad, so match the
-        # effect by its guard and check the deps separately. Keying the boundary on
-        # `[active` instead lets a reordered array run the match on into the next hook,
-        # where loadOrStage's own handleLoadRef call satisfies the loader assertion below
-        # for a flush that loads nothing.
+        # The deps array grew when the load body moved into runStagedLoad, so match the effect by its guard and check
         flush = re.search(
             r"if \(!active \|\| !stagedLoadDeferred\.current\) return;(.*?)\n  \}, \[([^\]]*)\]\);",
             src,
@@ -1500,7 +1450,6 @@ def test_a_dying_staged_download_only_rolls_back_its_own_pick():
             r"if \(\s*quantRevert\.current &&\s*quantRevert\.current === stagedQuantRevert\.current\s*\)",
             region,
         ), f"{rel}: a dead job can roll back a newer pick's quant label"
-        # Cleared either way, or a later job inherits this one's owner and reverts on its behalf.
         assert (
             "stagedQuantRevert.current = null" in region
         ), f"{rel}: the staged owner is never released"
@@ -1576,11 +1525,9 @@ def test_a_pick_that_never_loads_restores_its_generation_recipe():
         )
         assert revert, f"{rel}: no shared rollback helper"
         body = revert.group(1)
-        # The recipe may be restored conditionally (a preset chosen after the pick owns those
-        # fields), but the rollback still has to read it off the token.
+        # The recipe may be restored conditionally (a preset chosen after the pick owns those fields), but the rollback
         for setter in ("setQuant(r.prev)", "setSteps(", "r.steps", "setGuidance(", "r.guidance"):
             assert setter in body, f"{rel}: rollback does not restore {setter}"
-        # No rollback path may still put back the label alone.
         assert (
             "setQuant(quantRevert.current.prev)" not in src
         ), f"{rel}: a rollback path restores the label without its recipe"
@@ -1597,9 +1544,7 @@ def test_every_pick_replaces_the_rollback_it_leaves_behind():
         select = re.search(r"const handleModelSelect = useCallback\(\n(.*?)\n  \);", src, re.S)
         assert select, f"{rel}: handleModelSelect not found"
         body = select.group(1)
-        # One installed entry per branch that moves the label. Counting is what catches the
-        # branches nobody thinks about: the curated non-GGUF one and the generic pipeline
-        # fall-through both shipped without an entry at different points.
+        # One installed entry per branch that moves the label.
         moves = body.count("setQuant(")
         installs = body.count("quantRevert.current = revert;")
         assert moves == installs, (
@@ -1636,6 +1581,7 @@ def test_every_pick_route_invalidates_the_staged_intent():
             for tok in ("const spec = loadSpecFor(", "if (meta.ggufVariant")
             if tok in pick
         )
+        # Cleared either way, or a later job inherits this one's owner and reverts on its behalf.
         assert (
             pick.index("beginPick();") < first_branch
         ), f"{rel}: the invalidation runs after a branch that can already have returned"
@@ -1691,6 +1637,7 @@ def test_a_new_pick_drops_the_previous_staged_intent():
         assert (
             "stagedLoadDeferred.current = false;" in head
         ), f"{rel}: a deferred staged load can still fire for the abandoned pick"
+        # No rollback path may still put back the label alone.
         assert (
             "stagedQuantRevert.current = null;" in head
         ), f"{rel}: the dead intent keeps ownership of the rollback"
@@ -1766,10 +1713,9 @@ def test_staged_plans_label_the_checkpoint_without_guessing_from_the_extension()
         assert "e.files.includes(opts.filename)" in entries.group(
             0
         ), f"{page} does not mark the picked repo's entry as the checkpoint"
-        # The plan's own answer wins over both local guesses. A gated pipeline is staged from an
-        # ungated MIRROR, so its entry no longer carries the id we picked and the repo-id test
-        # reads the whole selected model as "Required assets". Only the planner knows about the
-        # swap. `??`, not `||`: a planner that answers false must not fall through to a guess.
+        # The plan's own answer wins over both local guesses.
+        # A gated pipeline is staged from an ungated MIRROR, so its entry no longer carries the id we picked and the
+        # repo-id test reads the whole selected model as "Required assets".
         assert "e.checkpoint ??" in entries.group(
             0
         ), f"{page} ignores the checkpoint flag the plan carried"
@@ -1833,7 +1779,7 @@ def test_staged_download_callbacks_only_answer_their_own_variant():
     the staged queue and started a load whose scoped files were still downloading, and its
     failure wiped a queue that was still running."""
     src = _read("features/hub/download-manager/use-staged-download.ts")
-    # The comparison lives in the shared isOurs() guard the three callbacks run (which also binds them to the started file set).
+    # The comparison lives in the shared isOurs() guard the three callbacks run (which also binds them to the started
     assert "(variant ?? null) === activeVariant &&" in src
     for callback in ("onComplete", "onError", "onCancelled"):
         handler = re.search(rf"{callback}: \(variant\) => \{{\n(.*?)\n    \}},", src, re.S)
@@ -1850,7 +1796,7 @@ def test_video_gallery_fetches_clips_as_their_cards_come_into_view():
     assert "new IntersectionObserver(" in src
     assert "ref={stripRef}" in src and "data-clip-id={video.id}" in src
     assert 'root.querySelectorAll("[data-clip-id]")' in src
-    # rootMargin applies to the root box only, so the strip (the clipping scroller) must BE the root or the prefetch margin never reaches a clipped card.
+    # rootMargin applies to the root box only, so the strip (the clipping scroller) must BE the root or the prefetch
     assert '{ root, rootMargin: "0px 600px" }' in src
     # The only surviving whole-page fetches are the no-IntersectionObserver fallbacks.
     eager = list(re.finditer(r"page\.videos\.forEach\(\(video\) => void ensureSrc\(video\)\)", src))
@@ -1879,7 +1825,7 @@ def test_on_device_rows_carry_the_task_the_pickers_filter_on():
     assert "task: row.task ?? null," in vm and "task: model.task ?? null," in vm
     conv = _read("features/model-picker/inventory/use-chat-picker-inventory.ts")
     assert conv.count("task: row.task ?? null,") == 3, "a picker converter drops the task"
-    # A generation-task row is not a chat row, so the chat-only guard must not hide it from the pickers that can load it.
+    # A generation-task row is not a chat row, so the chat-only guard must not hide it from the pickers that can load
     assert re.search(
         r"row\.capabilities\.canChat \|\|\s*studioPageForTask\(row\.task\) !== undefined", conv
     )
@@ -1939,18 +1885,13 @@ def test_a_lost_generate_post_must_prove_it_reached_the_backend():
     fn = fn[: fn.index("\n}\n")]
     assert "sawActive" in fn
     assert "did not reach the server" in fn
-    # The proof used to be an inline knownIds set; it is now a baseline handed
-    # to hasUnknownRecord in lib/gallery-flags.ts. Same proof, named helper, so
-    # the assertion follows it rather than pinning the old spelling.
+    # The proof used to be an inline knownIds set;
+    # it is now a baseline handed to hasUnknownRecord in lib/gallery-flags.ts.
     assert "hasUnknownRecord(" in fn
     assert "hasUnknownRecord(\n        baseline," in fn
-    # The caller still snapshots the ids BEFORE the POST and passes THAT SET in.
-    # Pin the argument, not the mere presence of the snapshot expression: with a
-    # fresh `new Set()` in the knownIds slot the snapshot still exists, is still
-    # taken before the POST and `probeBaseline` still reaches the probe, yet every
     # record already on the page reads as unknown and a POST that never landed is
-    # reported as a finished image. Whitespace is normalised first, so reformatting
     # the call cannot break the pin.
+    # The caller still snapshots the ids BEFORE the POST and passes THAT SET in.
     snapshot_pattern = (
         r"const (\w+) = new Set\(galleryCache\.images\.map\(\(image\) => image\.id\)\);"
     )
@@ -1972,8 +1913,8 @@ def test_a_lost_generate_post_must_prove_it_reached_the_backend():
     assert "export async function hasUnknownRecord" in flags
     # An unknown row is the proof, and only an unpinned one counts.
     assert "return !baseline.knownIds.has(record.id);" in flags
-    # Inconclusive listings must refuse to claim proof, else a submission that
     # never landed reads as a finished image, which is the bug this guards.
+    # Inconclusive listings must refuse to claim proof, else a submission that never landed reads as a finished image
     assert "if (!baseline.canJudgeUnpinned) return false;" in flags
 
 
@@ -1983,8 +1924,7 @@ def test_parallel_slots_setting_wired_end_to_end():
     and the cross-model reset; a lost hop silently reverts the model to the server-wide
     slot default."""
     config = _read("features/model-picker/model-config/per-model-config.ts")
-    # Persisted per model, clamped on every read/write, and null (= server
-    # default) counts as default so blank configs are not stored.
+    # Persisted per model, clamped on every read/write, and null (= server default) counts as default so blank configs
     assert '"nParallel",' in config
     assert "N_PARALLEL_MAX, Math.round(partial.nParallel)" in config
     assert "config.nParallel == null &&" in config
@@ -1996,10 +1936,9 @@ def test_parallel_slots_setting_wired_end_to_end():
     api_types = _read("features/chat/types/api.ts")
     assert "n_parallel?: number | null;" in api_types
     runtime = _read("features/chat/hooks/use-chat-model-runtime.ts")
-    # Click-time snapshot, /load body, validate preflight, cross-model reset and
-    # failed-switch rollback all carry the value.
+    # Click-time snapshot, /load body, validate preflight, cross-model reset and failed-switch rollback all carry the
     assert "pendingLoadConfig?.nParallel" in runtime
-    # GGUF-gated, like the compare pane: a transformers load has no slots.
+    # GGUF-gated, like the compare pane:
     assert "n_parallel: isGguf ? loadNParallel : null," in runtime
     assert "n_parallel: validateNParallel," in runtime
     assert "loadNParallel = pendingLoadConfig?.nParallel ?? null;" in runtime
@@ -2007,19 +1946,15 @@ def test_parallel_slots_setting_wired_end_to_end():
     chat_api = _read("features/chat/api/chat-api.ts")
     assert "n_parallel: payload.n_parallel," in chat_api
     composer = _read("features/chat/shared-composer.tsx")
-    # The compare pane is a second /load builder; its preflight sizes like its load.
+    # The compare pane is a second /load builder;
     assert composer.count("n_parallel: ownConfig.nParallel ?? null,") == 2
     adapter = _read("features/chat/api/chat-adapter.ts")
     # The startup auto-load is a third builder reading the remembered config.
     assert adapter.count("n_parallel: config.nParallel ?? null,") == 2
-    # ... and records it as loaded through the diffusion-gated local below.
     assert "loadedNParallel: committedSlots," in adapter
     status = _read("features/chat/lib/apply-inference-status-to-store.ts")
-    # Hydration seeds the rollback BASELINE only; adopting the resolved echo into
-    # the control would pin a blank "server default" to a number.
     assert "loadedNParallel: status.requested_parallel_slots," in status
     assert "nParallel: status.requested_parallel_slots," not in status
-    # The sidebar form remounts when an external change lands.
     signature = _read("features/model-picker/model-config/config-signature.ts")
     assert 'config.nParallel ?? "",' in signature
     sidebar = " ".join(_read("features/model-picker/components/sidebar-model-config.tsx").split())
@@ -2035,7 +1970,6 @@ def test_parallel_slots_reach_an_api_load_through_the_server_mirror():
         "if (config.nParallel && config.nParallel > 0) { payload.n_parallel = config.nParallel; }"
         in api
     )
-    # The monitor lists what a remote load applies, so slots-only must not read as "App defaults".
     monitor = " ".join(_read("features/api-monitor/components/saved-model-settings.tsx").split())
     assert "if (override.n_parallel) {" in monitor
 
@@ -2044,7 +1978,6 @@ def test_parallel_slots_reach_an_api_load_through_the_server_mirror():
     assert "n_parallel = payload.n_parallel," in route
     store = _read_backend("utils/openai_auto_switch_settings.py")
     assert 'entry["n_parallel"] = n_parallel' in store
-    # GGUF-only, like the picker: a safetensors load has no llama-server slots.
     gguf_block = store.split("    if is_gguf:", 1)[1]
     assert 'kwargs["n_parallel"] = override["n_parallel"]' in gguf_block
 
@@ -2053,14 +1986,13 @@ def test_parallel_slots_control_cleared_when_the_load_never_sent_them():
     """`nParallel` is the editable control ("blank = follow the server default") and
     `loadedNParallel` the rollback baseline."""
     status = " ".join(_read("features/chat/lib/apply-inference-status-to-store.ts").split())
-    # A swap under this tab must reset the control, or model A's count follows onto model B.
     assert "...(seedLoadParams && slotsModelChanged && { nParallel: null })," in status
     # ... while still never adopting the RESOLVED echo into the control.
     assert "nParallel: status.requested_parallel_slots," not in status
 
     adapter = _read("features/chat/api/chat-adapter.ts")
-    # Slice the two success branches apart, bounding the second at the shared tail
     # so it cannot swallow the fresh-default path below and stay green.
+    # Slice the two success branches apart, bounding the second at the shared tail so it cannot swallow the
     candidate = adapter.split("async function loadAutoLoadCandidate", 1)[1]
     gguf_branch, non_gguf_rest = candidate.split('if (candidate.kind === "gguf") {', 1)[1].split(
         "} else {", 1
@@ -2069,15 +2001,13 @@ def test_parallel_slots_control_cleared_when_the_load_never_sent_them():
     # The cached-GGUF branch keeps the remembered override via the gated local...
     assert "nParallel: committedSlots," in gguf_branch
     assert "nParallel: null," not in gguf_branch
-    # ...
     assert "nParallel: null," in non_gguf_branch
     assert "loadedNParallel: null," in non_gguf_branch
 
     fresh_default = adapter.split("// Nothing on the device:", 1)[1].split(
         "showAutoLoadSuccess(\n          `Loaded ${DEFAULT_CHAT_MODEL_LABEL}", 1
     )[0]
-    # The fresh-default download omits the slots, so its success state clears both,
-    # or the control reads as an unapplied edit against the seeded baseline.
+    # The fresh-default download omits the slots, so its success state clears both, or the control reads as an
     assert "n_parallel" not in fresh_default.split("saveSpeculativeType", 1)[0]
     assert "nParallel: null," in fresh_default
     assert "loadedNParallel: null," in fresh_default
@@ -2120,22 +2050,20 @@ def test_adopting_a_resident_model_reseeds_the_slot_and_batch_controls():
     assert "const slotsModelChanged = hydratingExistingModel;" in status
     # Nothing may reintroduce a same-model exemption without this test being rewritten.
     assert "readoptingSameModel" not in status
+    # A swap under this tab must reset the control, or model A's count follows onto model B.
     assert "...(seedLoadParams && slotsModelChanged && { nParallel: null })," in status
     # Never a slot-count proxy for "same model".
     assert "prevState.loadedNParallel === (status.requested_parallel_slots" not in status
-    # The baseline seed stays ungated, or a rollback after a tab reload restores
-    # the model at the server default slots.
+    # Hydration seeds the rollback BASELINE only;
+    # The baseline seed stays ungated, or a rollback after a tab reload restores the model at the server default slots.
     assert "loadedNParallel: status.requested_parallel_slots," in status
     # The batch pair is told the same thing, from the same local, so the two cannot drift.
     assert "modelChanged: slotsModelChanged," in status
-    # And the reseed re-reads this model's remembered config rather than blanking.
     assert (
         "status.is_gguf && (slotsUnseeded || batchesUnseeded || slotsModelChanged) "
         "? resolveResidentInitialConfig(checkpointId, status.gguf_variant ?? null)" in status
     ), "the model-change reseed must feed the remembered lookup, or it discards the saved config"
 
-    # And the rollback that makes the reseed necessary is still ordered before the
-    # hydration it protects, in the adopt path.
     runtime = _read("features/chat/hooks/use-chat-model-runtime.ts")
     adopt = runtime[runtime.index("const confirmedStatus = await getInferenceStatus()") :]
     adopt = adopt[: adopt.index("void refreshContextUsage(")]
@@ -2191,8 +2119,7 @@ def test_hydration_restores_a_remembered_slot_override():
         "rememberedNParallel != null && rememberedNParallel === "
         "status.requested_parallel_slots && { nParallel: rememberedNParallel, }" in status
     )
-    # Both cases trip the model-change clear, so the seed only survives by
-    # being spread after it.
+    # Both cases trip the model-change clear, so the seed only survives by being spread after it.
     assert src.index("slotsModelChanged && { nParallel: null }") < src.index(
         "nParallel: rememberedNParallel,"
     )
@@ -2206,23 +2133,21 @@ def test_remembered_slots_are_read_through_the_cached_repo_alias():
     blanks on the model change and the next Save writes the blank over the saved
     ``n_parallel``, locally and through the server mirror."""
     config = " ".join(_read("features/model-picker/model-config/per-model-config.ts").split())
-    # The raw identifier still wins, so a path-keyed record is never shadowed.
     assert (
         "const direct = resolveInitialConfig(modelId, ggufVariant); "
         "if (direct.remembered) {" in config
     )
     assert "const alias = publicModelId(modelId);" in config
-    # Only a namespaced collapse, the rule residentModelIdMatches applies: every other
-    # path collapses onto a file stem two models can share.
+    # Only a namespaced collapse, the rule residentModelIdMatches applies:
     assert 'if (alias === modelId || !alias.includes("/")) { return direct; }' in config
 
     status = " ".join(_read("features/chat/lib/apply-inference-status-to-store.ts").split())
     assert "resolveResidentInitialConfig(checkpointId, status.gguf_variant ?? null)" in status
     assert "resolveInitialConfig(checkpointId" not in status
 
-    # The backend applies the same model's override by the same alias, which is why the
-    # echo the adoption gate compares against carries the saved count at all. Driven through the
-    # real ladder rather than grepped, for the reason in
+    # The backend applies the same model's override by the same alias, which is why the echo the adoption gate compares
+    # against carries the saved count at all.
+    # Driven through the real ladder rather than grepped, for the reason in
     # test_a_standalone_gguf_has_one_settings_identity_everywhere.
     candidates = _override_lookup_candidates("/models/m.gguf", "org/repo", "Q8_0")
     assert candidates[:2] == [
@@ -2244,15 +2169,12 @@ def test_failed_switch_rollback_restores_the_slot_intent_not_the_resolved_count(
         "selection.previousConfig ? (selection.previousConfig.nParallel ?? null) "
         ": useChatRuntimeStore.getState().nParallel;" in runtime
     )
-    # Matched on the call prefix, not the whole call: the staged apply also
-    # carries the resolved diffusion flag. Only the ordering is the contract.
+    # Matched on the call prefix, not the whole call:
     assert runtime.index("const previousNParallel") < runtime.index(
         "applyPerModelConfigToRuntime(pendingLoadConfig,"
     ), "a config staged on the selection must not replace it either"
-    # Ordering, not adjacency: the concatenated form required the two statements to be neighbours,
     # so #8702 broke it by inserting a line between them without changing the contract.
-    # Scoped to selectWithConfig, because the hub auto-load path takes the same snapshot above the
-    # only applyModelLoadConfigToRuntime call and would satisfy a whole-file comparison on its own.
+    # Ordering, not adjacency: the concatenated form required the two statements to be neighbours, so #8702 broke it by
     picker = " ".join(_read("features/chat/chat-page.tsx").split())
     handoff = _brace_matched_body(picker, "const selectWithConfig = async (")
     assert (
@@ -2264,8 +2186,7 @@ def test_failed_switch_rollback_restores_the_slot_intent_not_the_resolved_count(
     ), "the snapshot must be taken before the target's config is applied"
     rollback = runtime.split("const rollbackSpeculativeType", 1)[1]
     assert "nParallel: previousNParallel," in rollback
-    # Baseline and reload payload keep the resolved count, or the rollback
-    # recreates the previous model at a different slot count.
+    # Baseline and reload payload keep the resolved count, or the rollback recreates the previous model at a different
     assert "loadedNParallel: stateBeforeUnload.loadedNParallel ?? null," in rollback
     assert "n_parallel: stateBeforeUnload.loadedNParallel," in runtime
 
@@ -2296,6 +2217,7 @@ def test_batch_sizes_setting_wired_end_to_end():
     assert "...(validateNBatch != null ? { n_batch: validateNBatch } : {})," in runtime
     assert "...(validateNUbatch != null ? { n_ubatch: validateNUbatch } : {})," in runtime
     assert "n_batch: isGguf ? loadNBatch : null," not in runtime
+    # And the rollback that makes the reseed necessary is still ordered before the hydration it protects, in the adopt
     runtime = _read("features/chat/hooks/use-chat-model-runtime.ts")
     assert "loadNBatch = pendingLoadConfig?.nBatch ?? null;" in runtime
     assert "loadNUbatch = pendingLoadConfig?.nUbatch ?? null;" in runtime
@@ -2320,15 +2242,16 @@ def test_batch_sizes_setting_wired_end_to_end():
     assert "loadedNBatch: committedNBatch," in adapter
     assert "loadedNUbatch: committedNUbatch," in adapter
     status = " ".join(_read("features/chat/lib/apply-inference-status-to-store.ts").split())
-    # both pairs hydrate through the one shared rule
     assert "incoming: status.requested_n_batch," in status
     assert "incoming: status.requested_n_ubatch," in status
     assert '...("loaded" in nBatchSeed && { loadedNBatch: nBatchSeed.loaded ?? null }),' in status
     assert '...("value" in nBatchSeed && { nBatch: nBatchSeed.value ?? null }),' in status
+    # And the reseed re-reads this model's remembered config rather than blanking.
     assert (
         '...("loaded" in nUbatchSeed && { loadedNUbatch: nUbatchSeed.loaded ?? null, }),' in status
     )
     assert '...("value" in nUbatchSeed && { nUbatch: nUbatchSeed.value ?? null }),' in status
+    # The sidebar form remounts when an external change lands.
     signature = _read("features/model-picker/model-config/config-signature.ts")
     assert 'config.nBatch ?? "",' in signature
     assert 'config.nUbatch ?? "",' in signature
@@ -2342,6 +2265,7 @@ def test_batch_sizes_reach_an_api_load_through_the_server_mirror():
     assert "n_ubatch?: number;" in api
     assert "if (config.nBatch && config.nBatch > 0) { payload.n_batch = config.nBatch; }" in api
     assert "if (config.nUbatch && config.nUbatch > 0) { payload.n_ubatch = config.nUbatch; }" in api
+    # The monitor lists what a remote load applies, so slots-only must not read as "App defaults".
     monitor = " ".join(_read("features/api-monitor/components/saved-model-settings.tsx").split())
     assert "if (override.n_batch) {" in monitor
     assert "if (override.n_ubatch) {" in monitor
@@ -2352,6 +2276,7 @@ def test_batch_sizes_reach_an_api_load_through_the_server_mirror():
     assert "n_ubatch = payload.n_ubatch," in route
     store = _read_backend("utils/openai_auto_switch_settings.py")
     assert '("n_batch", "n_ubatch")' in store
+    # GGUF-only, like the picker:
     gguf_block = store.split("    if is_gguf:", 1)[1]
     assert 'kwargs["n_batch"] = override["n_batch"]' in gguf_block
     assert 'kwargs["n_ubatch"] = override["n_ubatch"]' in gguf_block
@@ -2366,10 +2291,8 @@ def test_hydration_clears_the_batch_baselines_for_a_batchless_model():
     clean-control-follow and pending-edit rules live in resolveBatchSizeSeed and are
     behavior-tested in resolve-batch-size-seed.test.ts; here only the wiring is pinned."""
     seed = " ".join(_read("features/chat/lib/resolve-batch-size-seed.ts").split())
-    # a non-gguf clears; an absent field on a gguf is an older backend saying nothing,
-    # though a swap still has to drop the pair staged against the model that left.
-    # The baseline goes with the control, or a later failed swap rolls back with a
     # batch the backend that reported nothing never ran.
+    # a non-gguf clears; an absent field on a gguf is an older backend saying nothing, though a swap still has to drop
     assert "const effective = isGguf ? incoming : null;" in seed
     assert "if (effective === undefined) {" in seed
     assert "return modelChanged ? { value: null, loaded: null } : {};" in seed
@@ -2381,18 +2304,10 @@ def test_hydration_clears_the_batch_baselines_for_a_batchless_model():
     src = _read("features/chat/lib/apply-inference-status-to-store.ts")
     status = " ".join(src.split())
     assert "isGguf: status.is_gguf ?? true," in status
-    # A swap under this tab resets the controls too, but through the seed, not a blanket
-    # null after it: the batch echo is the REQUESTED size, so clearing it here would also
-    # discard the value just adopted from the new model and revert it on the next Reload.
-    # EVERY seed is told the same thing from the same local, so none of them can drift
-    # apart. Checked per call site rather than as a count: the llama-server tuning knobs
-    # deliberately reuse this seed, so a hardcoded number fails the next time the group
-    # grows while saying nothing about drift, and a whole-file count of `modelChanged`
-    # would both break on an unrelated one elsewhere and let an unrelated one stand in
-    # for a seed that omitted the property.
-    # Comments stripped first: this file discusses `resolveBatchSizeSeed (modelChanged)`
-    # in prose, and a scan that counted that sentence as a call site would fail on a
-    # wording change.
+    # A swap under this tab resets the controls too, but through the seed, not a blanket null after it: the batch echo
+    # is the REQUESTED size, so clearing it here would also discard the value just adopted from the new model and revert
+    # it on the next Reload.
+    # EVERY seed is told the same thing from the same local, so none of them can drift apart.
     seed_args = _call_arguments(_code_only(src), "resolveBatchSizeSeed")
     assert len(seed_args) >= 2, "the batch pair alone should be two seeds"
     for args in seed_args:
@@ -2400,7 +2315,6 @@ def test_hydration_clears_the_batch_baselines_for_a_batchless_model():
             "modelChanged: slotsModelChanged," in args
         ), f"a resolveBatchSizeSeed call is not told modelChanged from slotsModelChanged: {args}"
     assert "{ nBatch: null, nUbatch: null }" not in status
-    # The remembered override is re-adopted only when the echo proves it.
     assert (
         "rememberedNBatch != null && rememberedNBatch === "
         "status.requested_n_batch && { nBatch: rememberedNBatch, }" in status
@@ -2416,36 +2330,25 @@ def test_vulkan_inference_devices_are_the_pickable_set():
     inference inventory (ggml ordinals, the space `--device Vulkan<i>` pins) rather than
     the torch view, which can miss cards llama-server drives."""
     src = " ".join(_read("hooks/use-gpu-info.ts").split())
-    # The Vulkan inventory is authoritative even while its probe is temporarily
-    # empty. Falling through would expose physical CUDA/ROCm IDs in an ordinal
-    # picker and make DiffusionGemma offer a selection the route rejects.
-    # Scoped to the GGUF picker: an image or video load runs on torch, not llama-server, so it
-    # reads the torch inventory even here. A Vulkan chat build says nothing about the CUDA / ROCm
-    # devices a diffusion load can be pinned to.
+    # The Vulkan inventory is authoritative even while its probe is temporarily empty.
     vulkan_gate = (
         "const inference = data?.inference_gpu; "
         'if (!forDiffusion && inference?.backend === "vulkan") {'
     )
     assert vulkan_gate in src
-    # A confirmed-Vulkan backend with no enumerated devices yet must return no
-    # devices, not fall through to the torch/CUDA inventory below.
+    # A confirmed-Vulkan backend with no enumerated devices yet must return no devices, not fall through to the
     assert "if (!(inference.devices ?? []).length) return [];" in src
     # Pinnable on the ggml ordinal space, gated on the backend's own support flag.
     assert "const picksAccepted = inference.gguf_gpu_ids_supported !== false;" in src
     assert 'pinnable: picksAccepted && d.index_kind === "vulkan",' in src
-    # A Vulkan ordinal is not a CUDA ID, so the torch-side diffusion runner
-    # cannot take the pick even when llama-server can.
+    # A Vulkan ordinal is not a CUDA ID, so the torch-side diffusion runner cannot take the pick even when llama-server
     assert "diffusionPinnable: false," in src
-    # The torch fallback keeps the XPU ban for torch ordinals only: a Vulkan
-    # ordinal stays pickable even when this list arrives from an XPU host.
     assert (
         "pinnable: pinnableBackend && "
         '(d.index_kind === "vulkan" || '
         '(data?.device_backend !== "xpu" && d.index_kind === "physical")),' in src
     )
-    # Only a physical index is ever handed to the diffusion runner, and ROCm
-    # counts: it reuses torch.cuda.* and the same physical-ID path, so excluding
-    # it would hide the picker on every multi-GPU ROCm host.
+    # The raw identifier still wins, so a path-keyed record is never shadowed.
     assert (
         "const diffusionBackend = "
         'data?.device_backend === "cuda" || data?.device_backend === "rocm";' in src
@@ -2466,7 +2369,7 @@ def test_chat_autoload_records_every_validation_failure():
     assert recorder.index("noteLoadFailure(label, error)") < recorder.index(
         "unslothUserCancelled === true"
     ), "recording must not sit behind a marker test"
-    # A declined dialog halts the sweep (retrying reopens it); nothing else does.
+    # A declined dialog halts the sweep (retrying reopens it);
     assert "unslothUserCancelled === true" in recorder
     assert recorder.count("autoLoadCancelled = true;") == 1
     assert recorder.index("unslothUserCancelled === true") < recorder.index(
@@ -2534,7 +2437,6 @@ def test_only_gguf_configs_are_mirrored_to_the_server():
         "if ( !saveFailed && (target.apiLoadable ?? target.isGguf) && !nativePathToken ) "
         "{ syncModelOverride(" in src
     )
-    # The local save is not behind the same gate.
     assert "if (remember) { saveFailed = !savePerModelConfig(" in src
 
 
@@ -2548,7 +2450,6 @@ def test_a_native_leased_gguf_is_not_mirrored_to_the_server():
         "const nativePathToken = target.meta.nativePathToken ?? "
         "(isActiveModel ? activeNativePathToken : null);" in page
     ), "the token this gate reads"
-    # The one-time backfill has no token to read, so it goes by the identity shape.
     backfill = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
     assert "!isNativeFileLabel(entry.modelId) &&" in backfill
     identity = " ".join(_read("features/hub/lib/model-identity.ts").split())
@@ -2557,7 +2458,6 @@ def test_a_native_leased_gguf_is_not_mirrored_to_the_server():
     assert "const NATIVE_FILE_LABEL_RE = /^[^/\\\\]+\\.gguf$/i;" in identity
 
     inference = _read_backend("routes/inference.py")
-    # /api/inference/status and the checkpoint helper share _llama_status_model_ids.
     assert (
         "return display_model_id, (None if native_grant_backed else model_id)" in inference
     ), "why the checkpoint is only a display name"
@@ -2575,7 +2475,7 @@ def test_evicted_local_configs_drop_their_server_overrides():
     )
     api = " ".join(_read("features/model-picker/api/model-overrides.ts").split())
     assert "keepLaunchFlags?: boolean;" in api
-    # remove=false with no fields: the route re-supplies stored flags and drops an empty row.
+    # remove=false with no fields:
     assert "remove: config === null && !options?.keepLaunchFlags," in api
     assert (
         "...(config === null && !options?.keepLaunchFlags ? { llama_extra_args: [] } : {}),"
@@ -2584,7 +2484,6 @@ def test_evicted_local_configs_drop_their_server_overrides():
     route = _read_backend("routes/settings.py")
     assert 'requested_extra_args = stored.get("llama_extra_args")' in route, "the rule this mirrors"
 
-    # Eviction reports what it dropped as model id + variant, not the normalized storage key.
     store = " ".join(_read("features/model-picker/model-config/per-model-config.ts").split())
     assert "evicted?: { modelId: string; ggufVariant: string | null }[]" in store
     assert "modelIdFromStorageKey(" in store and "ggufVariantFromStorageKey(" in store
@@ -2606,7 +2505,7 @@ def test_backfill_compares_server_keys_by_normalized_identity():
 
 def test_monitor_stats_exclude_model_lifecycle_rows():
     """A load, unload or download is recorded as a monitor entry but is not an HTTP call."""
-    # computeStats lives in stats.ts so it runs under `node --test`; the hook re-exports it.
+    # computeStats lives in stats.ts so it runs under `node --test`;
     src = " ".join(_read("features/api-monitor/stats.ts").split())
     assert 'if (entry.kind === "lifecycle") { continue; }' in src
     # "Requests" is a request count too, so it cannot stay entries.length.
@@ -2642,7 +2541,6 @@ def test_monitor_overlay_does_not_pull_in_the_lazy_page():
     overlay = _read("features/api-monitor/api-monitor-overlay.tsx")
     assert 'from "./lifecycle"' in overlay
     assert "api-monitor-page" not in overlay, "the overlay must not reach the page"
-    # The helpers live in their own module, not re-exported through the page.
     shared = _read("features/api-monitor/lifecycle.ts")
     assert "export function isLifecycleEntry(" in shared
     assert "export function lifecycleLabel(" in shared
@@ -2654,7 +2552,7 @@ def test_override_writes_are_ordered_per_model():
     the entry the newer one meant to replace."""
     src = " ".join(_read("features/model-picker/api/model-overrides.ts").split())
     assert "const writesByKey = new Map<string, Promise<void>>();" in src
-    # Keyed by the same override key the server stores under.
+    # The remembered override is re-adopted only when the echo proves it.
     assert (
         "const key = modelOverrideKey( normalizeModelIdentity(modelId), normalizeGgufVariantIdentity(ggufVariant), );"
         in src
@@ -2677,7 +2575,7 @@ def test_detail_settings_need_a_resolved_quant():
     """The on-device card passes a null variant while its own lookup is pending or after it
     failed."""
     src = " ".join(_read("features/hub/hub-page.tsx").split())
-    # `variant`, not the argument: a resident quant may have replaced it, so judge what is saved.
+    # `variant`, not the argument:
     guard = "if (!variant && selectedModel.isGguf && selectedModel.requiresVariant) {"
     assert guard in src
     assert src.count("Couldn't determine which quant to configure.") == 2
@@ -2702,6 +2600,8 @@ def test_ollama_models_are_not_advertised_as_api_loadable():
     assert "row.source !== LOCAL_MODEL_SOURCE.OLLAMA" in hub
     assert "apiLoadable:" in hub
     backend = _read_backend("core/inference/local_model_resolver.py")
+    # Only a physical index is ever handed to the diffusion runner, and ROCm counts: it reuses torch.cuda.* and the same
+    # physical-ID path, so excluding it would hide the picker on every multi-GPU ROCm host.
     assert (
         "Ollama's\n    scanner is skipped" in backend or "scanner is skipped" in backend
     ), "the rule this mirrors"
@@ -2743,11 +2643,10 @@ def test_backfill_splits_a_quant_suffix_the_way_the_backend_does():
     to one key, and whichever was already on the server made the other look migrated."""
     identity = " ".join(_read("features/model-picker/model-config/model-identity.ts").split())
     assert "export function splitQuantSuffix(" in identity
-    # Two rules keep a path out: no separator in the tail, and a non-.gguf head carries no label.
+    # Two rules keep a path out:
     assert 'if (tail.includes("/") || tail.includes("\\\\"))' in identity
     assert 'if (!head.toLowerCase().endsWith(".gguf")) { return null; }' in identity
-    # A .gguf head is not enough: the suffix must be the label the scanner derives, or a name
-    # containing ".gguf:" folds two real POSIX files onto one key.
+    # A .gguf head is not enough:
     assert "tail.toLowerCase() === ggufQuantLabel(filename).toLowerCase()" in identity
 
     migrate = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
@@ -2758,7 +2657,7 @@ def test_backfill_splits_a_quant_suffix_the_way_the_backend_does():
     assert "def split_quant_suffix(" in backend, "the rule this mirrors"
     assert "_BPW_SUFFIX" in backend and "bpw" in identity
     assert "extract_quant_label(filename).casefold()" in backend, "the label rule"
-    # Both sides accept the same quant vocabulary; the regex lives with the loader.
+    # Both sides accept the same quant vocabulary;
     quants = _read_backend("core/inference/llama_cpp.py")
     for token in ("MXFP", "IQ", "TQ", "BF16", "F16", "F32"):
         assert token in quants and token in identity, token
@@ -2768,7 +2667,6 @@ def test_backfill_splits_a_quant_suffix_the_way_the_backend_does():
     assert "function ggufQuantLabel(" in identity and "function ggufStem(" in identity
     assert "_GGUF_SPLIT_SUFFIX_RE" in gguf and "GGUF_SPLIT_SUFFIX" in identity
     assert "_FLOAT_PRECISION_QUANTS" in gguf and "FLOAT_PRECISION_QUANTS" in identity
-    # The executable half of this contract, case by case against split_quant_suffix.
     assert (WORKDIR / "studio" / "frontend" / "tests" / "model-identity.test.ts").is_file()
 
 
@@ -2793,6 +2691,7 @@ def test_the_settings_page_judges_the_config_storage_actually_keeps():
     assert "remember ? normalizedRuntimeConfig : null," in src
     assert "isDefaultConfig(effectiveRuntimeConfig)" not in src
 
+    # Eviction reports what it dropped as model id + variant, not the normalized storage key.
     store = " ".join(_read("features/model-picker/model-config/per-model-config.ts").split())
     assert "export function normalizePerModelConfig(" in store
     assert "const normalized = normalize(config);" in store
@@ -2806,7 +2705,7 @@ def test_the_chat_picker_marks_ollama_targets_unloadable_by_the_api():
     assert "apiLoadable: isGguf && !isOllamaLinkPath(id)," in picker
     sidebar = " ".join(_read("features/model-picker/components/sidebar-model-config.tsx").split())
     assert "apiLoadable: isGguf && !isOllamaLinkPath(modelId)," in sidebar
-    # The same classification gates the backfill, or an older config still reaches the server.
+    # The one-time backfill has no token to read, so it goes by the identity shape.
     backfill = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
     assert "!isOllamaLinkPath(entry.modelId) &&" in backfill
 
@@ -2820,10 +2719,12 @@ def test_the_backfill_fills_in_fields_rather_than_skipping_known_keys():
     """The backfill reads the override map once and then writes each model in turn, so a
     save by another tab during that pass was overwritten by this browser's older
     localStorage copy."""
+    # The same classification gates the backfill, or an older config still reaches the server.
     backfill = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
     assert "{ fillAbsentFields: true }," in backfill
-    # Key presence alone is not "done": what the server lacks decides.
+    # Key presence alone is not "done":
     assert "const stored = known.get(key);" in backfill
+    # /api/inference/status and the checkpoint helper share _llama_status_model_ids.
     assert (
         "if (stored && absentFields(stored, current.config).length === 0) { continue; }" in backfill
     )
@@ -2838,9 +2739,7 @@ def test_the_backfill_fills_in_fields_rather_than_skipping_known_keys():
     # Ordinary saves must stay unconditional, or a settings edit would never land.
     assert "syncModelOverride" in api and "fill_absent_fields: true" in api
 
-    # Read out of the route's parse tree, not its text. The rule is which names the route
-    # declares, forwards and excludes; a set literal reflowed one name per line by the
-    # formatter, or a name added beside them, is not a change to it.
+    # Read out of the route's parse tree, not its text.
     route = "routes/settings.py"
     handler = "update_openai_auto_switch_override"
     assert _annotated_field(route, "ModelOverridePayload", "fill_absent_fields") == (
@@ -2851,7 +2750,7 @@ def test_the_backfill_fills_in_fields_rather_than_skipping_known_keys():
     # A write mode must not leak into saved fields, or model_id-only removal stops working.
     assert {"remove", "fill_absent_fields"} <= _model_dump_exclusions(route, handler)
 
-    # The merge is the server's, in the write's transaction: a client-side one reopens the race.
+    # The merge is the server's, in the write's transaction:
     db = _read_backend("storage/studio_db.py")
     assert "merged = {**entry_value, **stored}" in db
     assert "BEGIN IMMEDIATE" in db
@@ -2869,9 +2768,6 @@ def test_the_hub_settings_page_matches_a_resident_path_loaded_model():
     )
     assert "loadedConfig={settingsTargetIsResident ? activeModelConfig : null}" in hub
     assert "settingsTargetIsResident ? activeGgufContextLength : null" in hub
-    # The loadable identifier, as every other status reader records it -- except for a
-    # speech model, which chat cannot adopt at all. speechOnly rides beside the null so
-    # the helper can tell it from the empty slot the idle-unload rule is about.
     assert (
         "checkpointId: isSpeechOnlyStatus(status) ? null "
         ": resolveInferenceCheckpointId(status), "
@@ -2880,7 +2776,6 @@ def test_the_hub_settings_page_matches_a_resident_path_loaded_model():
     assert "setCheckpoint(status.active_model" not in hub
     chat = " ".join(_read("features/chat/lib/apply-inference-status-to-store.ts").split())
     assert "return status.model_identifier ?? status.active_model;" in chat, "the rule this mirrors"
-    # The alias is the backend's own public id rule, not a private heuristic.
     identity = _read("features/hub/lib/model-identity.ts")
     assert "export function publicModelId(" in identity
     assert "models--" in identity and "snapshots" in identity
@@ -2918,12 +2813,11 @@ def test_the_hub_settings_editor_reseeds_when_the_live_config_lands():
     mounted instance."""
     view = " ".join(_read("features/hub/catalog/hub-model-settings-view.tsx").split())
     assert "key={modelConfigInstanceKey( target.id, target.ggufVariant, loadedConfig, )}" in view
-    # Same key the sidebar entry uses; that parity is the point.
     sidebar = " ".join(_read("features/model-picker/components/sidebar-model-config.tsx").split())
     assert "key={modelConfigInstanceKey(modelId, settingsGgufVariant, loadedConfig)}" in sidebar
 
     signature = " ".join(_read("features/model-picker/model-config/config-signature.ts").split())
-    # "No live config yet" needs its own value: that transition is the one that must remount.
+    # "No live config yet" needs its own value:
     assert 'if (!config) { return "none"; }' in signature
     for field in (
         "config.customContextLength",
@@ -2953,10 +2847,8 @@ def test_a_standalone_gguf_has_one_settings_key():
 
     common = _read_backend("hub/services/models/common.py")
     # The rule this mirrors: a variant is derived only for a single scanned file.
-    # gguf_variant_key, not the hub's extract_quant_label: for a standalone file there is no
-    # directory to qualify, so the key IS the quant token -- and it keeps the bpw modifier, which
-    # is what makes it agree with the loader's own _extract_quant_label (the equality the sibling
-    # test below depends on). The hub label drops that modifier.
+    # gguf_variant_key, not the hub's extract_quant_label: for a standalone file there is no directory to qualify, so
+    # the key IS the quant token
     assert "gguf_variant_key(gguf_files[0].name)" in common
     assert "if scan_path.is_file() and len(gguf_files) == 1" in common
 
@@ -2969,6 +2861,7 @@ def test_a_standalone_gguf_is_resident_despite_its_derived_quant():
     hub = " ".join(_read("features/hub/hub-page.tsx").split())
     assert "const settingsTargetIsStandaloneFile =" in hub
     assert 'settingsTarget.id.toLowerCase().endsWith(".gguf")' in hub
+    # Keyed by the same override key the server stores under.
     assert (
         "(settingsTargetIsStandaloneFile || ggufVariantsMatch(activeGgufVariant, settingsTarget.ggufVariant))"
         in hub
@@ -2983,28 +2876,28 @@ def test_a_standalone_gguf_has_one_settings_identity_everywhere():
     """A loose .gguf has no quant to choose between, but llama_cpp falls back to
     _extract_quant_label(gguf_path) when a load names no variant, and /status echoes
     that as gguf_variant."""
+    # Same key the sidebar entry uses;
     sidebar = " ".join(_read("features/model-picker/components/sidebar-model-config.tsx").split())
-    # Nulled for the settings identity, and used for every field that keys it.
     assert (
         "const settingsGgufVariant = isStandaloneGgufPath(modelId) ? null : ggufVariant;" in sidebar
     )
     assert "ggufVariant: settingsGgufVariant," in sidebar
     assert "ggufVariant: settingsGgufVariant ?? undefined," in sidebar
-    # The label still shows the quant; only the identity drops it.
+    # The label still shows the quant;
     assert "displayName: ggufVariant ? `${leaf} · ${ggufVariant}` : leaf," in sidebar
 
-    # One rule, one definition: the Hub row applies the same test.
+    # The alias is the backend's own public id rule, not a private heuristic.
+    # One rule, one definition:
     identity = _read("features/hub/lib/model-identity.ts")
     assert "export function isStandaloneGgufPath(" in identity
-    # The suffix, and something that names a file on this machine: see
-    # test_a_repo_id_ending_in_gguf_keeps_its_quant for why the suffix is not enough.
+    # The suffix, and something that names a file on this machine: see test_a_repo_id_ending_in_gguf_keeps_its_quant for
+    # why the suffix is not enough.
     assert "GGUF_SUFFIX_RE.test(modelId)" in identity
     row_identity = _read("features/hub/inventory/settings-identity.ts")
     assert 'row.path.toLowerCase().endsWith(".gguf")' in row_identity
 
-    # The precedence that makes the bare path win, asserted on the real function rather than on
     # inference.py's text: #8702 moved this ladder to utils/openai_auto_switch_settings.py
-    # unchanged, and the grep that used to live here went red for a pure refactor.
+    # The precedence that makes the bare path win, asserted on the real function rather than on inference.py's text:
     candidates = _override_lookup_candidates("/models/m-Q4_K_M.gguf", "org/repo", None)
     assert candidates == [
         "/models/m-Q4_K_M.gguf",
@@ -3041,8 +2934,6 @@ def test_settings_open_reads_status_before_resolving_the_quant():
         "await refreshResidentModelStatus(); if (settingsOpenSeq.current !== openSeq) return;"
         in page
     )
-    # Three: both handlers read on entry, and openModelSettings reads again after the
-    # variant lookup, whose network round trip is its own window for a switch to land.
     assert page.count("await refreshResidentModelStatus();") == 3
 
 
@@ -3055,7 +2946,6 @@ def test_a_local_quant_folder_resolves_its_variants_by_path():
         'const repoId = row.kind === "cache" ? row.repoId : (row.repoId ?? row.path ?? null);'
         in hub
     )
-    # The on-device card already lists by path, so both surfaces choose from one set of quants.
     card = " ".join(_read("features/hub/catalog/local-on-device-card.tsx").split())
     assert "repoId: modelId, hfToken, preferLocalCache: true, localPath: localGgufPath," in card
     # The backend scans a path in the repo_id position before the validation that would 400.
@@ -3070,8 +2960,8 @@ def test_no_settings_target_is_built_on_an_unread_store():
     reloads with what it seeded, so a target built before the status read lands can
     persist and launch the settings of the model an API switch displaced."""
     page = " ".join(_read("features/hub/hub-page.tsx").split())
-    # Both handlers read first and drop the open if a newer one started meanwhile, and
-    # the variant lookup's await gets the same treatment. Every read carries the guard.
+    # Three: both handlers read on entry, and openModelSettings reads again after the variant lookup, whose network
+    # Both handlers read first and drop the open if a newer one started meanwhile, and the variant lookup's await gets
     assert page.count("await refreshResidentModelStatus();") == 3
     assert (
         page.count(
@@ -3089,22 +2979,18 @@ def test_an_empty_status_is_read_against_the_idle_unload_setting():
     checkpoint only while the loop is armed."""
     hub = " ".join(_read("features/hub/hub-page.tsx").split())
     adopt = " ".join(_read("features/hub/lib/adopt-inference-status.ts").split())
-    # Awaited, not raced: the first status read is the one most likely to land on an evicted
-    # model, and an unresolved default of false would clear a checkpoint that is coming back.
     assert (
         "Promise.all([getInferenceStatus(), readIdleUnloadArmed()]) "
         ".then(([status, idleUnloadArmed]) => {" in hub
     )
     assert "idleUnloadArmed," in hub
-    # Read with every status read, not cached for the life of the page: the idle timeout
-    # is editable from Settings while this page stays mounted.
+    # Read with every status read, not cached for the life of the page:
     assert "idleUnloadRead.current ??=" not in hub
     assert "idleUnloadArmed.current = settings.idleUnloadActive;" in hub
-    # A failed read keeps the last answer. The default is disarmed, which is the side
-    # that clears the checkpoint, so falling back to it would drop a live selection.
+    # A failed read keeps the last answer.
     assert ".catch(() => idleUnloadArmed.current)" in hub
-    # An Audio load taking the single slot is not an idle eviction: nothing stashes the
     # chat model, so the exemption must not swallow that case.
+    # An Audio load taking the single slot is not an idle eviction:
     assert "if (state.idleUnloadArmed && !status.speechOnly) { return false; }" in adopt
     assert "actions.clearCheckpoint?.();" in adopt
 
@@ -3132,6 +3018,7 @@ def test_detail_settings_defers_a_derived_quant_to_a_fresh_status_read():
     nothing re-reads status while the window keeps focus, so an API-driven switch leaves
     that quant naming the model it displaced."""
     page = " ".join(_read("features/hub/hub-page.tsx").split())
+    # The on-device card already lists by path, so both surfaces choose from one set of quants.
     card = " ".join(_read("features/hub/catalog/local-on-device-card.tsx").split())
     assert "if (!quantIsUserPicked) { const settled = useChatRuntimeStore.getState();" in page
     assert "variant = settled.activeGgufVariant;" in page
@@ -3152,9 +3039,7 @@ def test_a_cached_repo_keeps_the_settings_saved_under_its_old_key():
     repo id; the server backfill only mirrors what is stored, so nothing else moves it."""
     config = " ".join(_read("features/model-picker/model-config/per-model-config.ts").split())
     assert "export function adoptLegacyConfigKey(" in config
-    # The key is renamed in one write. Saving the second copy first puts a full map one entry
-    # over budget, and savePerModelConfig then evicts the oldest unrelated model silently, with
-    # no eviction list handed back here, so that model's server override outlives its settings.
+    # The key is renamed in one write.
     assert "savePerModelConfig(modelId, ggufVariant, legacy)" not in config
     assert (
         "const alreadySaved = findConfigKeyForModelVariant(map, modelId, ggufVariant) "
@@ -3163,6 +3048,7 @@ def test_a_cached_repo_keeps_the_settings_saved_under_its_old_key():
     # A newer save under the current key wins, and the stale record still goes.
     assert "if (!(alreadySaved || isDefaultConfig(legacy)))" in config
     assert "map[key] = toStoredConfig(legacy);" in config
+    # The loadable identifier, as every other status reader records it -- except for a speech model, which chat cannot
     assert (
         "delete map[legacyKey]; deleteConfigEntriesForModelVariant(map, legacyModelId, "
         "ggufVariant);" in config
@@ -3179,29 +3065,19 @@ def test_clearing_the_log_keeps_a_request_that_is_still_running():
     assert 'if entry.shared or entry.subject != subject or entry.status == "running"' in monitor
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Test hooks the Playwright driver depends on.
-#
-# tests/studio/playwright_model_config.py drives the picker through these exact
-# attributes and accessible names. Renaming one is a source-only edit that type
-# checks, lints and passes every unit test, and then fails a 25-minute browser job
-# with "selector not found" -- which is how the collapsed-row regression (#7736)
-# sat on main. Pin them here so that break costs two seconds instead.
-# ─────────────────────────────────────────────────────────────────────────────
 
 
+# ───────────────────────────────────────────────────────────────────────────── Test hooks the Playwright driver depends
+# on.
+# tests/studio/playwright_model_config.py drives the picker through these exact attributes and accessible names.
 def test_picker_rows_keep_their_automation_attributes():
     pickers = _read("features/model-picker/components/model-selector/pickers.tsx")
-    # On the row button itself, not a wrapper: the driver scopes row text to it.
+    # On the row button itself, not a wrapper:
     assert '"data-model-picker-option": true;' in pickers
     assert '"data-model-picker-option": true,' in pickers
     assert "data-model-picker-search-input" in pickers
     assert "data-model-picker-list" in pickers
-    # And that ModelRow still spreads them onto the button. Without this the two
-    # above only prove the props are declared and returned: ModelRow reads
-    # optionProps?.onKeyDown separately, so the prop stays used and type checks
-    # while data-model-picker-option leaves the DOM and every row lookup in the
-    # driver fails.
+    # And that ModelRow still spreads them onto the button.
     row_button = re.search(r"const content = \(\s*<button\b(.*?)>", pickers, re.S)
     assert row_button, "ModelRow no longer renders its content as a <button>"
     assert "{...optionProps}" in row_button.group(
@@ -3224,10 +3100,7 @@ def test_run_settings_gear_label_names_its_model():
     render sites and an uncle at the rest -- so it matches on this label, and the model
     name in it is what keeps it off another row's gear."""
     pickers = _read("features/model-picker/components/model-selector/pickers.tsx")
-    # The expander's own label, not any of them: pickers.tsx interpolates this
-    # string at five sites, so a file-wide match stays green while the one the
-    # driver depends on drops its repo or its quant. That is the only label with
-    # both, and naming the quant is how the driver tells one variant from another.
+    # speech model, which chat cannot adopt at all. speechOnly rides beside the null so
     assert (
         "ariaLabel={`Inference settings for ${repoId} ${v.quant}`}" in pickers
     ), "the variant gear label no longer names both the repo and the quant"
@@ -3239,18 +3112,17 @@ def test_a_multi_quant_parent_row_still_has_no_gear():
     """The driver reads the absence of a gear as "this row expands rather than loads".
     Give the parent row a gear and that inference silently inverts."""
     pickers = _read("features/model-picker/components/model-selector/pickers.tsx")
-    # Inside the parent row, not anywhere in the file. Adding a gear to the parent
-    # while leaving the spacer in place satisfies a file-wide search, and that is
-    # exactly the change that would invert the driver's inference.
+    # Inside the parent row, not anywhere in the file.
     start = pickers.index("const renderDownloadedGgufRow")
     parent = pickers[start : pickers.index("const renderDownloadedModelRow", start)]
     parent_row = parent[: parent.index("{expanderOpen && (")]
-    # The gutter by reference, not by width. Pinning "w-[42px]" pinned two things
-    # the driver does not care about: the exact pixel width, and the fact that it
-    # was spelled inline. main has since moved to w-[38px] behind ROW_ACTIONS_CLASS,
-    # which is the same spacer doing the same job, and this assertion would have
-    # failed the moment the two met -- reporting a lost spacer that is still there.
+    # The gutter by reference, not by width.
+    # Pinning "w-[42px]" pinned two things the driver does not care about: the exact pixel width, and the fact that it
+    # was spelled inline.
+    # main has since moved to w-[38px] behind ROW_ACTIONS_CLASS, which is the same spacer doing the same job, and this
+    # assertion would have failed the moment the two met
     gutter = "ROW_ACTIONS_CLASS" in parent_row or re.search(r"w-\[\d+px\]", parent_row)
+    # Nulled for the settings identity, and used for every field that keys it.
     assert (
         'aria-hidden="true"' in parent_row and gutter
     ), "the multi-quant parent row lost the spacer that stands in for a gear"
@@ -3266,12 +3138,9 @@ def test_run_settings_page_keeps_its_identifying_controls():
     assert 'aria-label="Back to model list"' in page
     assert 'ariaLabel="Context Length"' in page
     assert 'aria-label="Context Length"' in page
-    # The button, not the word: "Reset" also appears in this file's own comments, so a
-    # raw source search passes with the control deleted and the Playwright reset gate
-    # only finds out 25 minutes later.
-    # Whole elements, like test_the_primary_action_keeps_its_four_labels. The old single-line regex
-    # pinned the handler body exactly, so #8702 broke it by reflowing that call across lines while
-    # the button itself stayed untouched.
+    # The button, not the word: "Reset" also appears in this file's own comments, so a raw source search passes with the
+    # control deleted and the Playwright reset gate only finds out 25 minutes later.
+    # Whole elements, like test_the_primary_action_keeps_its_four_labels.
     reset = any(
         "DEFAULT_PER_MODEL_CONFIG" in el.group(0)
         and ">\n          Reset\n        <" in el.group(0)
@@ -3286,13 +3155,9 @@ def test_the_primary_action_keeps_its_four_labels():
     page = _read("features/model-picker/components/model-config-page.tsx")
     for label in ('"Save settings"', '"Forget settings"', '"Reload model"', '"Load model"'):
         assert label in page, label
-    # And that the label is rendered by a button the driver can press. The four
-    # literals above live in the primaryActionLabel calculation, so they survive
-    # the button being deleted or turned into a non-button, and get_by_role finds
-    # nothing while this stays green.
-    # Whole elements, then the one that is both: other props on the opening tag
-    # contain braces of their own, so a pattern that tries to reach onClick
-    # through a negated class stops at the first `disabled={...}`.
+    # And that the label is rendered by a button the driver can press.
+    # The four literals above live in the primaryActionLabel calculation, so they survive the button being deleted or
+    # turned into a non-button, and get_by_role finds nothing while this stays green.
     primary = any(
         "onClick={handleRun}" in el.group(0) and "{primaryActionLabel}" in el.group(0)
         for el in re.finditer(r"<Button\b.*?</Button>", page, re.S)
@@ -3313,7 +3178,6 @@ def test_the_micro_batch_advisory_compares_against_the_emitted_batch():
     assert "config.nUbatch > effectiveBatch" in page
     # the rendered number too, or the text still names a batch nothing runs at
     assert 'llama.cpp will run at{" "} {effectiveBatch}.' in page
-    # and the floor must be declared before the comparison that uses it
     assert page.index("const batchFloor =") < page.index("const effectiveBatch =")
 
 
@@ -3325,7 +3189,7 @@ def test_a_blank_batch_still_caps_the_micro_batch_at_the_llama_default():
     names the same number."""
     src = _read("features/model-picker/components/model-config-page.tsx")
     page = " ".join(src.split())
-    assert "N_BATCH_LLAMA_DEFAULT," in page  # imported, not inlined
+    assert "N_BATCH_LLAMA_DEFAULT," in page
     assert ": N_BATCH_LLAMA_DEFAULT;" in page
     # effectiveBatch is now never null, so the predicate must not re-check it for null
     assert "config.nUbatch != null && config.nUbatch > effectiveBatch" in page
@@ -3357,17 +3221,12 @@ def test_autoload_local_rows_follow_the_picker_policy():
     policy = src.split("function isAutoLoadableLocalRow", 1)[1]
     policy = policy.split("\n}", 1)[0]
     assert "AUTO_LOAD_LOCAL_SOURCES.has(row.source)" in policy
-    # Not `=== true`: normalizeCapabilities falls back to the format capability
-    # when the backend sends no can_chat, so the picker shows such a row while
-    # `=== true` skipped it and fell through to downloading the default.
+    # Not `=== true`:
+    # Not `=== true`: normalizeCapabilities falls back to the format capability when the backend sends no can_chat, so
     assert "row.capabilities?.can_chat !== false" in policy
     assert "row.partial !== true" in policy
     # An adapter resolves its base model, a Hub fetch when that base is uncached;
-    # a scan-folder checkpoint is a pickle with no Hub security scan. Stated as
-    # an allowlist, which subsumes both: excluding them by name was only as good
-    # as the classification, and the backend sends "unknown" when it cannot tell.
-    # test_a_local_row_the_picker_would_hide_is_never_auto_loaded covers the
-    # behaviour.
+    # test_a_local_row_the_picker_would_hide_is_never_auto_loaded covers the behaviour.
     assert '(isGgufLocalRow(row) || row.model_format === "safetensors")' in policy
     assert "isHiddenModelId(row.model_id, row.id, row.path)" in policy
 
@@ -3375,7 +3234,7 @@ def test_autoload_local_rows_follow_the_picker_policy():
     assert '"models_dir"' in sources
     assert '"lmstudio"' in sources
     assert '"custom"' in sources
-    # hf_cache rows are the cached lists' job; ollama links are not loadable.
+    # hf_cache rows are the cached lists' job;
     assert '"hf_cache"' not in sources
     assert '"ollama"' not in sources
 
@@ -3393,7 +3252,6 @@ def test_default_model_download_is_visible_and_cancellable():
     assert "cancelDownload," in helper
     # Live byte progress, so the user is not staring at a static message.
     assert "useDownloadManagerStore.subscribe(" in helper
-    # Already on disk from an earlier run: no download at all.
     assert 'if (variant?.downloaded && variant.partial !== true) return "ready";' in helper
     # The load only happens once the bytes are actually here.
     assert "loadModel(" not in helper
@@ -3444,7 +3302,7 @@ def test_indexed_local_loads_are_remembered_without_bypassing_leases():
     assert "(indexedLocalPick || !isLocalModelPath(modelId))" in block
 
     store = _read("features/chat/utils/last-local-model-load.ts")
-    # A cached Hub GGUF repo without a quant names no file; a local .gguf does.
+    # A cached Hub GGUF repo without a quant names no file;
     assert 'input.kind === "gguf" && !ggufVariant && !isPathLikeId(id)' in store
     # Identity only: no tokens, leases, or approvals are persisted.
     assert "token" not in store.lower().replace("isPathLikeId", "")
@@ -3523,7 +3381,6 @@ def test_local_safetensors_chat_capability_is_classified_not_assumed():
     call = call.split("elif not rows:", 1)[0]
     assert "_local_transformers_can_chat(scan_path)" in call
     assert 'model_format in {"safetensors", "checkpoint"}' in call
-    # Fails open: an unfamiliar architecture must not be hidden.
     classifier = src.split("def _local_transformers_can_chat(", 1)[1]
     classifier = classifier.split("\ndef ", 1)[0]
     assert classifier.rstrip().endswith("return None")
@@ -3539,7 +3396,7 @@ def test_sources_dedupe_on_the_load_target_alone():
     key = src.split("function autoLoadSourceKey", 1)[1].split("\n}", 1)[0]
     assert "return normalizeTarget(source.loadId);" in key
     assert "source.kind" not in key
-    # Ordering keeps every row; the sort alone decides which twin is reached first.
+    # Ordering keeps every row;
     order = src.split("function orderAutoLoadSources", 1)[1].split("\n}\n", 1)[0]
     assert "[...sources].sort(" in order
     assert "filter(" not in order
@@ -3598,12 +3455,13 @@ def test_the_default_variant_lookup_takes_the_run_signal():
     src = _read("features/chat/api/chat-adapter.ts")
     helper = src.split("async function ensureDefaultModelDownloaded", 1)[1]
     helper = helper.split("async function autoLoadSmallestModel", 1)[0]
+    # The expander's own label, not any of them: pickers.tsx interpolates this string at five sites, so a file-wide
+    # match stays green while the one the driver depends on drops its repo or its quant.
     assert (
         "listGgufVariants(DEFAULT_CHAT_MODEL_REPO, undefined, {\n      signal: abortSignal,\n    })"
         in helper
     )
-    # The catch below swallows the abort rejection, so the guard after it is
-    # what actually stops the download from starting.
+    # The catch below swallows the abort rejection, so the guard after it is what actually stops the download from
     assert helper.index("} catch {") < helper.index("abortSignal?.throwIfAborted();")
 
 
@@ -3628,8 +3486,7 @@ def test_the_default_download_prepares_the_token_first():
     helper = helper.split("async function autoLoadSmallestModel", 1)[0]
     assert "prepareHfTokenForUse(hfToken)" in helper
     assert 'if (!prepared.proceed) return "cancelled";' in helper
-    # After the on-disk check, so nothing prompts when there is no download,
-    # and before the managed start.
+    # After the on-disk check, so nothing prompts when there is no download, and before the managed start.
     assert helper.index('return "ready"') < helper.index("prepareHfTokenForUse(hfToken)")
     assert helper.index("prepareHfTokenForUse(hfToken)") < helper.index(
         "downloadManager.requestStart(request)"
@@ -3658,6 +3515,7 @@ def test_cached_classification_reads_the_snapshot_the_row_loads():
 def test_non_chat_conditional_generation_is_excluded_before_the_suffix_check():
     """Whisper ends in ForConditionalGeneration; the order decides the answer."""
     src = _read_backend("hub/services/models/common.py")
+    # Fails open: an unfamiliar architecture must not be hidden.
     classifier = src.split("def _local_transformers_can_chat(", 1)[1]
     classifier = classifier.split("\ndef ", 1)[0]
     assert classifier.index("_NON_CHAT_GENERATIVE_MODEL_TYPES") < classifier.index(
@@ -3720,7 +3578,6 @@ def test_the_gguf_footprint_is_resolved_per_dependency_group_not_per_repo():
     representative and pasting its companionBytes onto every row therefore
     advertised a GB-wrong "Full required size" on the rows it did not sample."""
     src = _read("features/model-picker/components/model-selector/pickers.tsx")
-    # The old shape: one scalar for the whole listing.
     assert "const [companionBytes, setCompanionBytes] = useState" not in src
     assert (
         "const [companionBytesByKey, setCompanionBytesByKey] = useState<\n    Map<string, number>\n  >"
@@ -3731,20 +3588,9 @@ def test_the_gguf_footprint_is_resolved_per_dependency_group_not_per_repo():
     group = group.split("}, [displayVariants, recommendedQuantForVariant]);", 1)[0]
     assert "new Map<string, GgufVariantDetail>()" in group
     assert 'const key = variant.dependency_key ?? "";' in group
-    # The recommended quant still wins, and only inside its own group. Main
-    # tracked the source through effectiveRecommended becoming a SET and
-    # asserted membership in it; but that set is flattened across groups, so it
-    # blesses the other group's pick when two families in one repo share quant
-    # names.
-    #
-    # Group-scoping it is right, but this block buckets by the BACKEND's
-    # dependency_key ("flux.2-klein:<digest>") while the recommendation map is
-    # keyed by PRESENTATION group ("quantizations", "text-frames",
-    # "reference-media"). Joining those two key spaces makes every lookup
-    # undefined and the recommended-quant branch dead, leaving whichever row
-    # tier ordering put first to speak for the group. So ask through the
-    # variant, and pin that neither the flattened set nor the crossed-key
-    # lookup is what stands here.
+    # The recommended quant still wins, and only inside its own group.
+    # Group-scoping it is right, but this block buckets by the BACKEND's dependency_key ("flux.2-klein:<digest>") while
+    # the recommendation map is keyed by PRESENTATION group ("quantizations", "text-frames", "reference-media").
     assert "const recommended = recommendedQuantForVariant.get(variant);" in group
     assert "variant.quant === recommended" in group
     assert "current.quant !== recommended" in group
@@ -3752,8 +3598,7 @@ def test_the_gguf_footprint_is_resolved_per_dependency_group_not_per_repo():
     assert "effectiveRecommended.has(" not in group
     assert "effectiveRecommendedByGroup.get(key)" not in group
 
-    # And the map it asks is built from the presentation groups, keyed by the
-    # variant objects those groups hold.
+    # And the map it asks is built from the presentation groups, keyed by the variant objects those groups hold.
     builder = src.split("const recommendedQuantForVariant = useMemo(", 1)[1]
     builder = builder.split("}, [variantGroups, effectiveRecommendedByGroup]);", 1)[0]
     assert "new Map<GgufVariantDetail, string>()" in builder
@@ -3770,8 +3615,7 @@ def test_every_footprint_group_gets_its_own_resolve_call():
     effect = effect.split("const variantOptionKeys = useMemo(", 1)[0]
     assert "for (const footprintVariant of footprintVariants) {" in effect
     assert "resolveDownloadFootprint(repoId, {" in effect
-    # Each resolution writes only its own key, into a fresh Map: mutating the state
-    # Map in place would leave React on the old identity and drop earlier groups.
+    # Each resolution writes only its own key, into a fresh Map:
     assert "next.set(dependencyKey, companion);" in effect
     assert "const next = new Map(previous);" in effect
     # Cleared per listing, so a reopened repo never shows the previous repo's totals.
@@ -3814,17 +3658,16 @@ def test_a_refused_load_after_staging_rolls_the_pick_back():
     for page in ("features/images/images-page.tsx", "features/video/video-page.tsx"):
         src = _read(page)
         helper = src.split("const runStagedLoad = useCallback(", 1)[1].split("[revertPick],", 1)[0]
-        # Fire-and-forget is precisely the defect: the boolean has to be observed.
+        # Fire-and-forget is precisely the defect:
         assert ".then((started) => {" in helper, page
         assert "if (started) return;" in helper, page
-        # Same identity guard onCancelled uses: a newer pick owns the label from the moment it
         # is made, so a stale completion must not revert it.
+        # Same identity guard onCancelled uses:
         assert "const owned = stagedQuantRevert.current;" in helper, page
         assert "quantRevert.current === owned" in helper, page
         assert "revertPick(quantRevert.current);" in helper, page
         # One implementation, reached from both deferred paths, so neither can drift.
         assert src.count("if (pending) runStagedLoad(pending);") == 2, page
-        # Exactly one direct call left, the one inside the helper itself.
         assert len(re.findall(r"void handleLoadRef\s*\.current\(\s*pending\.", src)) == 1, page
 
 
@@ -3903,7 +3746,7 @@ def test_the_media_gpu_pick_survives_a_reload():
     ):
         src = " ".join(_read(page).split())
         assert f'usePersistedChoice( "{key}", "auto", )' in src, page
-        # A stored id is only a hint: a card that has gone falls back to automatic.
+        # A stored id is only a hint:
         assert "gpuChoices.some((d) => String(d.index) === selectedGpu)" in src or (
             "controls.gpuChoices.some((d) => String(d.index) === controls.selectedGpu)" in src
         ), page

@@ -64,7 +64,6 @@ def enforce_spacing(text: str) -> tuple[str, bool]:
 
         line_changed = False
 
-        # Insert a space before '=' when missing and not preceded by whitespace.
         if col > 0 and line[col - 1] not in {" ", "\t"}:
             line = f"{line[:col]} {line[col:]}"
             offsets[line_index] += 1
@@ -72,7 +71,6 @@ def enforce_spacing(text: str) -> tuple[str, bool]:
             line_changed = True
             changed = True
 
-        # Insert a space after '=' when missing and not followed by whitespace or newline.
         next_index = col + 1
         if next_index < len(line) and line[next_index] not in {" ", "\t", "\n", "\r"}:
             line = f"{line[:next_index]} {line[next_index:]}"
@@ -137,7 +135,6 @@ def remove_redundant_passes(text: str) -> tuple[str, bool]:
             lines[start] = segment if segment.strip() else ""
             continue
 
-        # Fall-back for unexpected multi-line 'pass'.
         prefix = lines[start][: node.col_offset]
         lines[start] = prefix if prefix.strip() else ""
         for idx in range(start + 1, end):
@@ -145,7 +142,6 @@ def remove_redundant_passes(text: str) -> tuple[str, bool]:
         suffix = lines[end][(node.end_col_offset or 0) :]
         lines[end] = suffix
 
-    # Normalise to ensure lines end with newlines except at EOF.
     result_lines: list[str] = []
     for index, line in enumerate(lines):
         if not line:
@@ -173,11 +169,11 @@ def remove_blank_after_short_import(text: str) -> tuple[str, bool]:
 
     lines = text.splitlines(keepends=True)
     import_types = (ast.Import, ast.ImportFrom)
-    drop: set[int] = set()  # 1-based physical line numbers to delete
+    drop: set[int] = set()
 
     def suites_of(node: ast.AST) -> list[list[ast.stmt]]:
         if isinstance(node, ast.Module):
-            return []  # module-level import spacing is left alone
+            return []
         out: list[list[ast.stmt]] = []
         for attr in ("body", "orelse", "finalbody"):
             val = getattr(node, attr, None)
@@ -187,7 +183,7 @@ def remove_blank_after_short_import(text: str) -> tuple[str, bool]:
 
     for node in ast.walk(tree):
         for suite in suites_of(node):
-            if len(suite) > 3:  # only small blocks
+            if len(suite) > 3:
                 continue
             i = 0
             while i < len(suite):
@@ -197,7 +193,7 @@ def remove_blank_after_short_import(text: str) -> tuple[str, bool]:
                 j = i
                 while j + 1 < len(suite) and isinstance(suite[j + 1], import_types):
                     j += 1
-                if j + 1 < len(suite):  # an import block followed by another statement
+                if j + 1 < len(suite):
                     last_imp, nxt = suite[j], suite[j + 1]
                     gap = range((last_imp.end_lineno or last_imp.lineno) + 1, nxt.lineno)
                     nums = [n for n in gap if 1 <= n <= len(lines)]
@@ -214,7 +210,7 @@ def remove_blank_after_short_import(text: str) -> tuple[str, bool]:
 _STRING_TRIVIA = (tokenize.NL, tokenize.NEWLINE, tokenize.COMMENT, tokenize.INDENT, tokenize.DEDENT)
 
 
-_DEF_MIN_PARAMS_FOR_MULTILINE = 3  # signatures with < this many params stay one line
+_DEF_MIN_PARAMS_FOR_MULTILINE = 3
 
 
 def _def_specs_by_line(tree: ast.AST) -> dict[int, tuple[int, bool]]:
@@ -256,7 +252,7 @@ def normalize_def_trailing_comma(text: str) -> tuple[str, bool]:
 
     specs = _def_specs_by_line(tree)
     n = len(toks)
-    edits: list[tuple[int, int, str]] = []  # (row, col, "del" | "ins")
+    edits: list[tuple[int, int, str]] = []
     i = 0
     while i < n:
         t = toks[i]
@@ -283,7 +279,7 @@ def normalize_def_trailing_comma(text: str) -> tuple[str, bool]:
                                 m -= 1
                             last = toks[m]
                             has_comma = last.type == tokenize.OP and last.string == ","
-                            empty = m == j  # nothing between ( and )
+                            empty = m == j
                             if force_multiline and not has_comma and not empty:
                                 edits.append((last.end[0], last.end[1], "ins"))
                             elif not force_multiline and has_comma:
@@ -303,7 +299,7 @@ def normalize_def_trailing_comma(text: str) -> tuple[str, bool]:
         if kind == "del":
             if col < len(ln) and ln[col] == ",":
                 lines[row - 1] = ln[:col] + ln[col + 1 :]
-        else:  # ins
+        else:
             lines[row - 1] = ln[:col] + "," + ln[col:]
     out = "".join(lines)
     try:
@@ -332,8 +328,8 @@ def _split_string_token(s: str) -> tuple[str, str, str] | None:
     return None
 
 
-# A "piece" is one string literal in source: a plain STRING token, or a whole
-# f-string spanning FSTRING_START..FSTRING_END. (kind, (row, col0), (row, col1), raw)
+# A "piece" is one string literal in source: a plain STRING token, or a whole f-string spanning
+# FSTRING_START..FSTRING_END.
 def _string_pieces(
     toks: list[tokenize.TokenInfo], lines: list[str]
 ) -> list[tuple[str, tuple[int, int], tuple[int, int], str | None]]:
@@ -354,7 +350,7 @@ def _string_pieces(
         elif t.type == tokenize.FSTRING_START:
             depth = 0
             j = i
-            while j < n:  # walk to the matching FSTRING_END (f-strings can nest)
+            while j < n:
                 if toks[j].type == tokenize.FSTRING_START:
                     depth += 1
                 elif toks[j].type == tokenize.FSTRING_END:
@@ -388,21 +384,20 @@ def _merge_string_run(pieces: list[tuple[str, str]]) -> str | None:
             return None
         prefix, quote, body = pqb
         if "b" in prefix.lower():
-            return None  # bytes: leave side-by-side
+            return None
         parsed.append((kind, prefix, quote, body))
     if len({p[2] for p in parsed}) != 1:
-        return None  # mixed quote style: not a safe textual merge
+        return None
     quote = parsed[0][2]
     if not any(p[0] == "f" for p in parsed):
         # No f-string: merge plain/raw/unicode sharing one prefix by concatenation.
         if len({p[1].lower() for p in parsed}) != 1:
-            return None
+            return None  # bytes: leave side-by-side
         return f"{parsed[0][1]}{quote}{''.join(p[3] for p in parsed)}{quote}"
-    # f-string fold only when a plain string is glued onto an f-string; a run of
-    # only f-strings is left side-by-side (folding long ones would force ruff to
-    # re-wrap the surrounding statement).
+    # A run of only f-strings is left side-by-side:
+    # f-string fold only when a plain string is glued onto an f-string;
     if all(p[0] == "f" for p in parsed):
-        return None
+        return None  # mixed quote style: not a safe textual merge
     # raw mixed with f is too subtle (backslash + brace escaping) -> skip.
     if any("r" in p[1].lower() for p in parsed):
         return None
@@ -451,8 +446,8 @@ def _fold_collapses(
             ln = ln[:c0] + merged + ln[c1:]
         seg.append(ln)
     indent = len(seg[0]) - len(seg[0].lstrip())
-    # Conservative over-estimate: join continuation lines with a single space
-    # (ruff joins bracketed wraps with none), so borderline cases skip the fold.
+    # Conservative over-estimate: ruff joins bracketed wraps with no space, so borderline cases skip the fold.
+    # Conservative over-estimate:
     joined = " ".join(s.strip() for s in seg)
     return indent + len(joined) <= _LINE_LENGTH
 
@@ -499,8 +494,7 @@ def merge_adjacent_string_literals(text: str) -> tuple[str, bool]:
         if merged is None:
             continue
         row, c0, c1 = run[0][1][0], run[0][1][1], run[-1][2][1]
-        # An f-string fold must not push its statement onto extra lines; a plain
-        # concatenation always collapses cleanly so it skips this check.
+        # An f-string fold must not push its statement onto extra lines;
         if any(kind == "f" for kind, _s, _e, _r in run) and not _fold_collapses(
             tree, lines, row, c0, c1, merged
         ):
@@ -547,21 +541,19 @@ def collapse_short_asserts(text: str) -> tuple[str, bool]:
 
     comment_rows = {t.start[0] for t in toks if t.type == tokenize.COMMENT}
 
-    targets = []  # (lo, hi) spans whose one-line form fits and have no comment
+    targets = []
     for lo, hi in multiline:
         if any(lo <= r <= hi for r in comment_rows):
             continue  # a comment would keep ruff multi-line -> never collapses
         seg = [lines[k].rstrip("\n") for k in range(lo - 1, hi)]
         indent = len(seg[0]) - len(seg[0].lstrip())
-        # Over-estimate (join with a space; keep the comma) so a "fits" verdict
-        # is always at least as long as ruff's real one-line output -> no fight.
+        # Over-estimate (join with a space;
         if indent + len(" ".join(s.strip() for s in seg)) <= _LINE_LENGTH:
             targets.append((lo, hi))
     if not targets:
         return text, False
 
-    # Trailing commas (a ',' whose next significant token is a closer), grouped
-    # by the target assert they belong to.
+    # Trailing commas (a ',' whose next significant token is a closer), grouped by the target assert they belong to.
     sig = [t for t in toks if t.type not in _STRING_TRIVIA]
     by_target: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
     for i, t in enumerate(sig):
@@ -578,7 +570,7 @@ def collapse_short_asserts(text: str) -> tuple[str, bool]:
     base_dump = ast.dump(tree)
     working = lines[:]
     changed = False
-    for positions in by_target.values():  # apply per assert; skip any that break AST
+    for positions in by_target.values():
         trial = working[:]
         for row, col in sorted(positions, reverse=True):
             ln = trial[row - 1]
@@ -603,9 +595,6 @@ def process_file(path: Path, pre: bool = False) -> bool:
 
     if pre:
         # Pre-ruff: normalize def-signature magic commas (>=3 params + a default
-        # add so ruff forces one-per-line; everything else strips so ruff
-        # collapses), and strip the magic trailing comma from a short multi-line
-        # assert so ruff joins it onto one line. Everything else runs post-ruff.
         updated, normalized = normalize_def_trailing_comma(original)
         updated, collapsed = collapse_short_asserts(updated)
         if normalized or collapsed:
