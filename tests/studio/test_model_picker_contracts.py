@@ -3065,8 +3065,6 @@ def test_clearing_the_log_keeps_a_request_that_is_still_running():
     assert 'if entry.shared or entry.subject != subject or entry.status == "running"' in monitor
 
 
-
-
 # ───────────────────────────────────────────────────────────────────────────── Test hooks the Playwright driver depends
 # on.
 # tests/studio/playwright_model_config.py drives the picker through these exact attributes and accessible names.
