@@ -551,7 +551,7 @@ class AnthropicStreamEmitter:
         elif etype == "metadata":
             self._usage = event.get("usage", {})
             return []
-        # status events — no Anthropic equivalent
+        # status events - no Anthropic equivalent
         return []
 
     def finish(
@@ -1068,7 +1068,7 @@ class AnthropicPassthroughEmitter:
                 # argument deltas, which never allocate a state either).
                 continue
             if tc_idx not in self._tool_call_states:
-                # New tool call — close prior block, open tool_use block
+                # New tool call - close prior block, open tool_use block
                 if self._current_block_type is not None:
                     events.append(self._close_current_block())
                 tc_id = anthropic_tool_use_id(tc.get("id", ""))

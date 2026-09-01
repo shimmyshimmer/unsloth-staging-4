@@ -506,6 +506,7 @@ def test_gpu_picker_round_trips_requested_pool_not_fitted_subset():
     assert "loadedGpuIndexKind: GpuIndexKind | null;" in store
     assert "loadedGpuIndexKind: gpuIds == null ? null : (gpuIndexKind ?? null)" in store
     # A cold discovery cache reports gpuIndexKind === undefined (deferred, not rejected);
+    # A cold discovery cache reports gpuIndexKind === undefined (deferred, not
     assert "reportedGpuIds != null && gpuIndexKind !== null" in store
 
     status = _read("features/chat/lib/apply-inference-status-to-store.ts")
@@ -3068,6 +3069,7 @@ def test_clearing_the_log_keeps_a_request_that_is_still_running():
 # ───────────────────────────────────────────────────────────────────────────── Test hooks the Playwright driver depends
 # on.
 # tests/studio/playwright_model_config.py drives the picker through these exact attributes and accessible names.
+# ─────────────────────────────────────────────────────────────────────────────
 def test_picker_rows_keep_their_automation_attributes():
     pickers = _read("features/model-picker/components/model-selector/pickers.tsx")
     # On the row button itself, not a wrapper:
@@ -3221,6 +3223,8 @@ def test_autoload_local_rows_follow_the_picker_policy():
     assert "AUTO_LOAD_LOCAL_SOURCES.has(row.source)" in policy
     # Not `=== true`:
     # Not `=== true`: normalizeCapabilities falls back to the format capability when the backend sends no can_chat, so
+    # Not `=== true`: normalizeCapabilities falls back to the format capability
+    # `=== true` skipped it and fell through to downloading the default.
     assert "row.capabilities?.can_chat !== false" in policy
     assert "row.partial !== true" in policy
     # An adapter resolves its base model, a Hub fetch when that base is uncached;
