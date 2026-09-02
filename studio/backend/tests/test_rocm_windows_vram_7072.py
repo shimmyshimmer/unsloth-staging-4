@@ -91,7 +91,26 @@ def _adapter_output(adapters):
     return "".join(f"{name}|{int(used)}\n" for name, used in adapters)
 
 
-def _subprocess_run(*, adapter_output = "__NONE__\n", util_output = "12.0\n"):
+def _engine_output(samples):
+    """``GPU Engine`` rows in the shape Get-Counter is asked to emit."""
+    if not samples:
+        return "__NONE__\n"
+    return "".join(f"{name}|{value}\n" for name, value in samples)
+
+
+# One engine on the solo host's own adapter, so 12.0 narrowed or not.
+_DEFAULT_ENGINES = [("pid_1_luid_0x00000000_0x00015369_phys_0_eng_0_engtype_3D", 12.0)]
+
+
+def _subprocess_run(
+    *,
+    adapter_output = "__NONE__\n",
+    util_output = None,
+    engine_samples = None,
+):
+    if util_output is None:
+        util_output = _engine_output(_DEFAULT_ENGINES if engine_samples is None else engine_samples)
+
     def fake_run(cmd, *a, **k):
         joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
         if "GPU Adapter Memory" in joined and "InstanceName" in joined:
@@ -1019,8 +1038,7 @@ def test_hip_luid_join_declines_and_falls_back(win_rocm, monkeypatch):
     assigned, aggregate, whole_adapter = join(SOLO_ADAPTERS, dev_meta)
     assert assigned[0] == pytest.approx(3 * GB)
     assert aggregate == pytest.approx(3 * GB)
-    # One ordinal owning every node its LUID names, so the engine counters for
-    # that LUID are this device's and nothing else's.
+    # One ordinal owning every node its LUID names, so the LUID is this device's.
     assert whole_adapter == [0x15369]
 
 
@@ -1044,7 +1062,7 @@ def test_hip_luid_join_bounds_the_counter_by_the_carve_out(win_rocm, monkeypatch
 
     # Inside the carve-out still resolves, so the decline above is the bound.
     under = [("luid_0x00000000_0x00015369_phys_0", 0.25 * GB)]
-    assigned, aggregate = hw._match_adapter_used_by_hip_luid(under, apu)
+    assigned, aggregate, _whole = hw._match_adapter_used_by_hip_luid(under, apu)
     assert assigned[0] == pytest.approx(0.25 * GB)
     assert aggregate == pytest.approx(0.25 * GB)
 
@@ -2180,17 +2198,23 @@ def test_a_discrete_card_on_the_same_runtime_keeps_the_dedicated_counter(win_roc
     assert aggregate == pytest.approx(7.90, abs = 0.01)
 
 
-# ----------------------------------------------------------------------------- #
-# GPU Engine utilization
-#
-# The engine counters are instanced per adapter, exactly like the memory ones,
-# so the unfiltered 3D sum is every adapter's work: the display iGPU's and the
-# Basic Render Driver's alongside the card being monitored.
-# ----------------------------------------------------------------------------- #
-def _engine_query(monkeypatch, adapters):
-    """Run the Train page's poll and hand back the GPU Engine counter path."""
+# This card at 17%, other adapters at 61%, so a wrong selection still reads 78.
+FOREIGN_ENGINES = [
+    ("pid_100_luid_0x00000000_0x00015369_phys_0_eng_0_engtype_3D", 12.0),
+    ("pid_101_luid_0x00000000_0x00015369_phys_0_eng_1_engtype_3D", 5.0),
+    ("pid_200_luid_0x00000000_0x000183fe_phys_0_eng_0_engtype_3D", 44.0),
+    ("pid_300_luid_0x00000000_0x0001842f_phys_0_eng_0_engtype_3D", 17.0),
+]
+
+
+def _engine_query(
+    monkeypatch,
+    adapters,
+    engine_samples = None,
+):
+    """Run the poll; hand back the devices and the counter path."""
     seen = []
-    inner = _subprocess_run(adapter_output = _adapter_output(adapters))
+    inner = _subprocess_run(adapter_output = _adapter_output(adapters), engine_samples = engine_samples)
 
     def fake_run(cmd, *a, **k):
         seen.append(" ".join(cmd) if isinstance(cmd, list) else str(cmd))
@@ -2202,39 +2226,184 @@ def _engine_query(monkeypatch, adapters):
     return devices, query
 
 
-def test_gpu_utilization_counts_only_this_adapters_engines(win_rocm, monkeypatch):
+def _solo_host(monkeypatch, identity = None):
     monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
     monkeypatch.setitem(sys.modules, "torch", _fake_torch(SOLO_DEVICE, free_equals_total = True))
-    monkeypatch.setattr(hw, "_rocm_windows_hip_adapter_ids", _hip_ids((0x15369, 0)))
+    if identity is not None:
+        monkeypatch.setattr(hw, "_rocm_windows_hip_adapter_ids", _hip_ids(identity))
 
-    (device,), engine_query = _engine_query(monkeypatch, SOLO_ADAPTERS)
-    assert device["gpu_utilization_pct"] == 12.0
-    assert "luid_0x00000000_0x00015369_" in engine_query
+
+def test_gpu_utilization_counts_only_this_adapters_engines(win_rocm, monkeypatch):
+    _solo_host(monkeypatch, (0x15369, 0))
+
+    (device,), _ = _engine_query(monkeypatch, SOLO_ADAPTERS, FOREIGN_ENGINES)
+    assert device["gpu_utilization_pct"] == 17.0  # this card's two engines, not 78
 
 
 def test_gpu_utilization_falls_back_to_every_engine(win_rocm, monkeypatch):
-    """Without HIP identity there is no LUID to narrow to, and the whole-host
-    sum is still better than no reading."""
-    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
-    monkeypatch.setitem(sys.modules, "torch", _fake_torch(SOLO_DEVICE, free_equals_total = True))
+    """No HIP identity means no LUID to narrow to, and the host sum beats no reading."""
+    _solo_host(monkeypatch)
 
-    (device,), engine_query = _engine_query(monkeypatch, SOLO_ADAPTERS)
-    assert device["gpu_utilization_pct"] == 12.0
-    assert "luid_" not in engine_query
+    (device,), _ = _engine_query(monkeypatch, SOLO_ADAPTERS, FOREIGN_ENGINES)
+    assert device["gpu_utilization_pct"] == 78.0
 
 
 def test_a_linked_adapters_hidden_nodes_are_not_this_devices_engines(win_rocm, monkeypatch):
-    """A LUID covering a node this ordinal does not own would sum that node's
-    work in. The VRAM join is what establishes the device IS the whole adapter,
-    and here it does not: one ordinal holding one node of two."""
-    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
-    monkeypatch.setitem(sys.modules, "torch", _fake_torch(SOLO_DEVICE, free_equals_total = True))
-    monkeypatch.setattr(hw, "_rocm_windows_hip_adapter_ids", _hip_ids((0x15369, 0b01)))
+    """Narrowing needs the VRAM join to prove the device is the whole adapter."""
+    _solo_host(monkeypatch, (0x15369, 0b01))
     linked = [
         ("luid_0x00000000_0x00015369_phys_0", 3 * GB),
         ("luid_0x00000000_0x00015369_phys_1", 5 * GB),
     ]
 
-    (device,), engine_query = _engine_query(monkeypatch, linked)
-    assert device["vram_used_gb"] is None  # the VRAM join declined too
-    assert "luid_" not in engine_query
+    (device,), _ = _engine_query(monkeypatch, linked, FOREIGN_ENGINES)
+    assert device["vram_used_gb"] is None
+    assert device["gpu_utilization_pct"] == 78.0  # the join declined, so the host's sum
+
+
+def test_the_selection_is_ours_and_not_the_counter_paths(win_rocm, monkeypatch):
+    """A LUID in the path hands selection to PDH, which no test here can run."""
+    _solo_host(monkeypatch, (0x15369, 0))
+
+    _, query = _engine_query(monkeypatch, SOLO_ADAPTERS, FOREIGN_ENGINES)
+    assert "\\GPU Engine(*)\\Utilization Percentage" in query
+    assert "luid_" not in query
+    assert "InstanceName" in query
+
+
+def test_a_longer_luid_that_starts_the_same_is_not_this_adapter(win_rocm, monkeypatch):
+    """0x153690 begins with 0x15369. Matching on a prefix would count it."""
+    _solo_host(monkeypatch, (0x15369, 0))
+
+    (device,), _ = _engine_query(
+        monkeypatch,
+        SOLO_ADAPTERS,
+        [
+            ("pid_100_luid_0x00000000_0x00015369_phys_0_eng_0_engtype_3D", 12.0),
+            ("pid_200_luid_0x00000000_0x00153690_phys_0_eng_0_engtype_3D", 44.0),
+        ],
+    )
+    assert device["gpu_utilization_pct"] == 12.0
+
+
+def test_engtype_spelled_in_lower_case_is_still_a_3d_engine(win_rocm, monkeypatch):
+    """Hosts emit engtype_3D and engtype_3d both; PDH folded the case for us before."""
+    _solo_host(monkeypatch, (0x15369, 0))
+
+    (device,), _ = _engine_query(
+        monkeypatch,
+        SOLO_ADAPTERS,
+        [
+            ("pid_100_luid_0x00000000_0x00015369_phys_0_eng_0_engtype_3d", 12.0),
+            ("pid_101_LUID_0X00000000_0X00015369_phys_0_eng_1_ENGTYPE_3D", 5.0),
+        ],
+    )
+    assert device["gpu_utilization_pct"] == 17.0
+
+
+def test_only_3d_engines_count(win_rocm, monkeypatch):
+    """A compute engine is not the 3D reading, and no 3D instance is unknown, not zero."""
+    _solo_host(monkeypatch, (0x15369, 0))
+
+    (device,), _ = _engine_query(
+        monkeypatch,
+        SOLO_ADAPTERS,
+        [
+            ("pid_100_luid_0x00000000_0x00015369_phys_0_eng_0_engtype_Compute", 88.0),
+            ("pid_101_luid_0x00000000_0x00015369_phys_0_eng_1_engtype_Copy", 3.0),
+        ],
+    )
+    assert device["gpu_utilization_pct"] is None
+
+
+def test_an_idle_engine_reads_zero_rather_than_unknown(win_rocm, monkeypatch):
+    _solo_host(monkeypatch, (0x15369, 0))
+
+    (device,), _ = _engine_query(
+        monkeypatch,
+        SOLO_ADAPTERS,
+        [
+            ("pid_100_luid_0x00000000_0x00015369_phys_0_eng_0_engtype_3D", 0.0),
+        ],
+    )
+    assert device["gpu_utilization_pct"] == 0.0
+
+
+def test_unusable_samples_are_dropped_and_the_sum_is_bounded(win_rocm, monkeypatch):
+    """The clamp used to live in the PowerShell expression, so it has to live here now."""
+    _solo_host(monkeypatch, (0x15369, 0))
+
+    (device,), _ = _engine_query(
+        monkeypatch,
+        SOLO_ADAPTERS,
+        [
+            ("pid_1_luid_0x00000000_0x00015369_phys_0_eng_0_engtype_3D", "NaN"),
+            ("pid_2_luid_0x00000000_0x00015369_phys_0_eng_1_engtype_3D", "Infinity"),
+            ("pid_3_luid_0x00000000_0x00015369_phys_0_eng_2_engtype_3D", -5.0),
+            ("pid_4_luid_0x00000000_0x00015369_phys_0_eng_3_engtype_3D", "not-a-number"),
+            ("pid_5_luid_0x00000000_0x00015369_phys_0_eng_4_engtype_3D", 70.0),
+            ("pid_6_luid_0x00000000_0x00015369_phys_0_eng_5_engtype_3D", 70.0),
+        ],
+    )
+    assert device["gpu_utilization_pct"] == 100.0
+
+
+def test_an_instance_name_carrying_no_luid_is_not_this_adapters(win_rocm, monkeypatch):
+    _solo_host(monkeypatch, (0x15369, 0))
+
+    (device,), _ = _engine_query(
+        monkeypatch,
+        SOLO_ADAPTERS,
+        [
+            ("pid_100_luid_0x00000000_0x00015369_phys_0_eng_0_engtype_3D", 12.0),
+            ("engtype_3D", 44.0),
+            ("pid_200_luid_zz_0x1_phys_0_eng_0_engtype_3D", 44.0),
+        ],
+    )
+    assert device["gpu_utilization_pct"] == 12.0
+
+
+def test_no_engine_instances_at_all_reads_unknown(win_rocm, monkeypatch):
+    _solo_host(monkeypatch, (0x15369, 0))
+
+    (device,), _ = _engine_query(monkeypatch, SOLO_ADAPTERS, [])
+    assert device["gpu_utilization_pct"] is None
+
+
+def test_a_high_luid_half_selects_its_own_adapter(win_rocm, monkeypatch):
+    """The high half is only ever zero on ordinary hardware, so nothing else covers it."""
+    high = (0xA << 32) | 0x15369
+    _solo_host(monkeypatch, (high, 0))
+
+    (device,), _ = _engine_query(
+        monkeypatch,
+        [("luid_0x0000000a_0x00015369_phys_0", 3 * GB)],
+        [
+            ("pid_1_luid_0x0000000a_0x00015369_phys_0_eng_0_engtype_3D", 12.0),
+            ("pid_2_luid_0x00000000_0x00015369_phys_0_eng_0_engtype_3D", 44.0),
+        ],
+    )
+    assert device["gpu_utilization_pct"] == 12.0
+
+
+def test_the_luid_is_internal_and_never_reaches_a_payload(win_rocm, monkeypatch):
+    """Keeping the internal LUID out of both payloads is a convention, not a mechanism."""
+    _solo_host(monkeypatch, (0x15369, 0))
+    monkeypatch.setattr(
+        hw.subprocess, "run", _subprocess_run(adapter_output = _adapter_output(SOLO_ADAPTERS))
+    )
+
+    def carries_luid(value):
+        if isinstance(value, dict):
+            return "luid" in value or any(carries_luid(v) for v in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(carries_luid(v) for v in value)
+        return False
+
+    internal, _ = hw._rocm_windows_per_device_vram([0])
+    assert internal[0]["luid"] == 0x15369  # the join resolved, so absence below means something
+    assert carries_luid(internal[0])  # the control: what a leak would look like
+
+    for payload in (hw.get_gpu_utilization(), hw.get_visible_gpu_utilization()):
+        assert not carries_luid(payload)
+        assert 0x15369 not in [v for v in payload.values() if isinstance(v, int)]
