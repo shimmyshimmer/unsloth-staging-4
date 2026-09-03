@@ -515,30 +515,47 @@ class TestKnown211SetParity:
             ), f"{label} floor gate must not use the unanchored ^rocm(\\d+)\\.(\\d+) prefix"
 
     def test_install_ps1_bounds_unknown_leaf_pinned_torch(self):
-        """install.ps1's pinned-torch install must bound BOTH companions on EVERY
-        index, cu<digits> families included: torchaudio 2.11 dropped its exact torch
-        pin from the wheel metadata, so a bare companion beside torch<2.11 can
-        resolve a mismatched 2.11.0 build (Codex P2, then unconditional per the
-        torchaudio 2.11 unpinning)."""
+        """install.ps1's pinned-torch install must bound the whole trio on EVERY
+        index with the default torch 2.11 line (<2.12 trio, matching install.sh's
+        ceiling-composed default and _CUDA_TORCH_PKG_SPEC): torchaudio 2.11
+        dropped its exact torch pin from the wheel metadata, so a bare companion
+        beside a capped torch can resolve a mismatched build."""
         text = INSTALL_PS1.read_text(encoding = "utf-8")
         assert (
-            '$_pinVisionSpec = "torchvision>=0.19,<0.26.0"' in text
-        ), "install.ps1 custom-pin install must bound torchvision (>=0.19,<0.26.0)"
+            '$_pinTorchSpec = "torch>=2.4,<2.12.0"' in text
+        ), "install.ps1 default install must use the torch 2.11 line (<2.12.0)"
         assert (
-            '$_pinAudioSpec = "torchaudio>=2.4,<2.11.0"' in text
-        ), "install.ps1 custom-pin install must bound torchaudio (>=2.4,<2.11.0)"
-        # No cu-family exemption: the bounds apply unconditionally.
+            '$_pinVisionSpec = "torchvision>=0.19,<0.27.0"' in text
+        ), "install.ps1 must pair torchvision <0.27.0 with torch <2.12"
+        assert (
+            '$_pinAudioSpec = "torchaudio>=2.4,<2.12.0"' in text
+        ), "install.ps1 must pair torchaudio <2.12.0 with torch <2.12"
         assert (
             "$_pinCuLeaf" not in text
         ), "install.ps1 must bound companions on every index (no cu-family exemption)"
-        # The bounded companions must actually be passed to the install command.
+        # No stale 2.10-line DEFAULT remains. Checked against the default trio's own
+        # assignments rather than as a blanket "<2.11.0 appears nowhere": Get-XpuTorchSpecs
+        # deliberately keeps a curated sub-2.11 cap for the whl/xpu index (mirroring
+        # install.sh's xpu case arm), and that is not the default. The XPU CPU fallback is
+        # NOT part of that carve-out -- it installs from the plain whl/cpu index, the same
+        # one the ROCm-to-CPU fallback uses, so it moved to the 2.11 line with the rest.
+        for _stale in (
+            '$_pinTorchSpec = "torch>=2.4,<2.11.0"',
+            '$_pinVisionSpec = "torchvision>=0.19,<0.26.0"',
+            '$_pinAudioSpec = "torchaudio>=2.4,<2.11.0"',
+            '$_torchSpecs = @("torch>=2.4,<2.11.0"',
+        ):
+            assert (
+                _stale not in text
+            ), f"install.ps1 must not retain the <2.11.0 default torch line: {_stale}"
+        # The bounded trio must actually be built and passed to the install command.
         # Specs are splatted, so check both halves: the list is built, and it is passed.
         assert (
-            '$_torchSpecs = @("torch>=2.4,<2.11.0", $_pinVisionSpec, $_pinAudioSpec)' in text
-        ), "install.ps1 custom-pin install must build the bounded spec list"
+            "$_torchSpecs = @($_pinTorchSpec, $_pinVisionSpec, $_pinAudioSpec)" in text
+        ), "install.ps1 pinned install must build the bounded trio spec list"
         assert (
             "@_torchSpecs --default-index $TorchIndexUrl" in text
-        ), "install.ps1 custom-pin install must pass the bounded companion specs to uv"
+        ), "install.ps1 pinned install must pass the bounded trio specs to uv"
 
     def test_gfx_allowlist_matches_across_installers(self):
         # The gfx 2.11 allowlist {gfx120x-all, gfx1151, gfx1150} must appear in each.
@@ -827,9 +844,9 @@ class TestPinnedIndexClearsUvEnvParity:
         # The custom-leaf branch bounds torch AND both companions (parity with the
         # other installers' custom-pin trio bounds), gated on a non-cu-family leaf.
         for spec in (
-            '$cudaTorchSpec = "torch>=2.4,<2.11.0"',
-            '$cudaVisionSpec = "torchvision>=0.19,<0.26.0"',
-            '$cudaAudioSpec = "torchaudio>=2.4,<2.11.0"',
+            '$cudaTorchSpec = "torch>=2.4,<2.12.0"',
+            '$cudaVisionSpec = "torchvision>=0.19,<0.27.0"',
+            '$cudaAudioSpec = "torchaudio>=2.4,<2.12.0"',
         ):
             assert spec in text, f"setup.ps1 must bound the custom-leaf trio: {spec}"
         assert (
