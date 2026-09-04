@@ -34,8 +34,7 @@ PORT = int(os.environ.get("SMOKE_PORT", "5407"))
 ENGINES = [e for e in os.environ.get("SMOKE_ENGINES", "chromium").split(",") if e]
 URL = f"http://127.0.0.1:{PORT}/smoke-shortcuts.html"
 
-# navigator.platform, and a user agent to match. WebKit reports a Mac agent even
-# on Linux, so nothing here may be left to the engine's own default.
+# navigator.platform, and a user agent to match.
 PLATFORMS = {
     "macOS": ("MacIntel", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) SmokeUA"),
     "Windows": ("Win32", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SmokeUA"),
@@ -205,12 +204,11 @@ def check_text_fields(page, engine: str, platform: str) -> None:
         str(actions(page)),
     )
 
-    # Escape types nothing in the composer, so declining keeps working there,
-    # and Enter, which sends, does not.
     reset(page)
     page.focus("#smoke-composer")
     page.keyboard.press("Escape")
     declined = actions(page)
+    # Escape types nothing in the composer, so declining keeps working there, and Enter, which sends, does not.
     reset(page)
     page.focus("#smoke-composer")
     page.keyboard.press("Enter")
@@ -246,8 +244,7 @@ def check_bare_keys(page, engine: str, platform: str) -> None:
         str(actions(page)),
     )
 
-    # The whole reason the stand-aside exists: preventDefault runs before the
-    # handler, so without it Enter on Deny would cancel the click and approve.
+    # The whole reason the stand-aside exists:
     reset(page)
     page.focus("#smoke-button")
     page.keyboard.press("Enter")
@@ -306,8 +303,7 @@ def check_repeat(page, engine: str, platform: str) -> None:
 
 
 def check_altgr(page, engine: str, platform: str) -> None:
-    # AltGr reports itself as Ctrl+Alt. Off macOS an Alt chord must stand aside
-    # so the character is typed; on macOS Option reports AltGraph and is a plain Alt.
+    # AltGr reports itself as Ctrl+Alt.
     reset(page)
     prevented = page.evaluate(
         """([mac]) => {
@@ -341,9 +337,8 @@ def check_altgr(page, engine: str, platform: str) -> None:
 
 
 def check_foreign_binding(page, engine: str, platform: str) -> None:
-    # A binding stored on a Mac must not fire on the bare key elsewhere. Before
-    # the registry grew, matchesBinding ignored the ctrl flag off macOS instead
-    # of rejecting it, and a Mac Ctrl chord fired on the unmodified key.
+    # A binding stored on a Mac must not fire on the bare key elsewhere. Before the registry grew, matchesBinding
+    # ignored the ctrl flag off macOS instead of rejecting it, and a Mac Ctrl chord fired on the unmodified key.
     reload_with(page, json.dumps({"copySessionId": {"primary": "Ctrl+KeyG"}}))
     reset(page)
     page.evaluate(
@@ -520,7 +515,6 @@ def check_selection_latch(page, engine: str, platform: str) -> None:
         str(actions(page)),
     )
 
-    # With no selection the latch is never stamped, so nothing is swallowed.
     reset(page)
     page.keyboard.press(archive)
     page.keyboard.press(archive)
@@ -532,6 +526,7 @@ def check_selection_latch(page, engine: str, platform: str) -> None:
         str(actions(page)),
     )
 
+    # With no selection the latch is never stamped, so nothing is swallowed.
     # Deleting needs no latch: it has no open-chat branch to fall through to.
     reset(page)
     page.evaluate(
