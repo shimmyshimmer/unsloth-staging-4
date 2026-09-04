@@ -148,8 +148,8 @@ def _build_trainer(
     )
     env.setdefault("UNSLOTH_FORCE_FLOAT32", "0")
     if mark_forced_float32:
-        # What from_pretrained stamps on the model. `forced_float32` sets it apart
-        # from the env, which is what an earlier load leaves behind.
+        # What from_pretrained stamps on the model.
+        # `forced_float32` sets it apart from the env, which is what an earlier load leaves behind.
         model._unsloth_forced_float32 = (
             (env["UNSLOTH_FORCE_FLOAT32"] == "1") if forced_float32 is None else forced_float32
         )
@@ -683,7 +683,6 @@ def test_an_outer_autocast_is_inherited_rather_than_overridden():
     outside = _unsloth_grpo_autocast_kwargs(trainer)
     assert outside == {"enabled": True, "dtype": torch.float16}, outside
 
-    # Inside: no dtype at all, and it must actually build an autocast.
     with torch.amp.autocast(device_type = "cuda", dtype = torch.bfloat16):
         inside = _unsloth_grpo_autocast_kwargs(trainer)
         assert "dtype" not in inside, inside
@@ -693,6 +692,7 @@ def test_an_outer_autocast_is_inherited_rather_than_overridden():
 
     # Forcing float32 keeps naming float16 even inside an outer autocast.
     trainer._autocast_force_float32 = True
+    # Inside: no dtype at all, and it must actually build an autocast.
     with torch.amp.autocast(device_type = "cuda", dtype = torch.bfloat16):
         forced = _unsloth_grpo_autocast_kwargs(trainer)
     assert forced == {"enabled": True, "dtype": torch.float16}, forced

@@ -125,8 +125,8 @@ def test_ownership_guard_distinguishes_denied_from_unowned():
         in guard
     )
     assert '$markerState -eq "Denied"' in guard
-    # The old wording blamed ownership, which is unknowable while the tree is
-    # unreadable; it must stay for the genuinely-unowned case only.
+    # The old wording blamed ownership, which is unknowable while the tree is unreadable; it must stay for the
+    # genuinely-unowned case only.
     assert "is not marked as an Unsloth-owned $Label" in guard
     # Both stops stay gated, so default-home installs behave exactly as before.
     assert guard.count("$StudioHomeIsCustom -and") >= 3
@@ -141,7 +141,6 @@ def test_no_bare_test_path_probes_inside_the_llama_install_tree():
         r"|\$LlamaServerBin|\$CmakeCacheFile|\$QuantizeBin|\$altBin"
         r"|Join-Path \$BuildDir)"
     )
-    # A comment naming a probe is not a probe.
     offenders = [
         f"{index}: {line.strip()}"
         for index, line in enumerate(SETUP_PS1.splitlines(), start = 1)
@@ -153,6 +152,7 @@ def test_no_bare_test_path_probes_inside_the_llama_install_tree():
 def test_metadata_reads_are_literal_like_the_probes_that_gate_them():
     """A literal probe followed by a globbing read still fails on a path holding
     [ or ], so the probe passes and the read throws into the catch."""
+    # A comment naming a probe is not a probe.
     offenders = [
         f"{index}: {line.strip()}"
         for index, line in enumerate(SETUP_PS1.splitlines(), start = 1)
@@ -362,8 +362,7 @@ def test_the_whisper_phase_survives_an_unreadable_whisper_tree():
         r'if \(\$NonFatal\) \{ return "Denied" \}\n\s*Exit-PathAccessDenied -Path \$Path', guard
     )
     assert len(paired) == guard.count("Exit-PathAccessDenied -Path $Path"), guard
-    # No unpaired return: one above the custom-home gate would call a fresh
-    # install unreadable.
+    # No unpaired return: one above the custom-home gate would call a fresh install unreadable.
     assert len(paired) == guard.count('if ($NonFatal) { return "Denied" }'), guard
     assert len(paired) >= 3, guard
     # Only the denial is handed back; an unowned tree must still stop.
@@ -381,8 +380,7 @@ def test_the_whisper_phase_survives_an_unreadable_whisper_tree():
     # The whole point is that this stays non-fatal.
     assert "Exit-SetupFailure" not in denial, denial
     assert not re.search(r"\bexit \d", denial), denial
-    # The skip must precede the branch whose guard would exit. Anchored on that
-    # branch's body, which survives a hardening of its own probe.
+    # The skip must precede the branch whose guard would exit.
     body = "$whisperArgs = @("
     assert body in whisper, whisper
     assert whisper.index("-NonFatal") < whisper.index(body)

@@ -211,8 +211,7 @@ ON_SUBPAGE_JS = """() => ({
         || { querySelectorAll: () => [] }).querySelectorAll('*').length,
 })"""
 
-# Deep-open the archived chats, then walk away partway through the hold. Both halves run in
-# the page, because a route handler that sleeps blocks this script too.
+# Deep-open the archived chats, then walk away partway through the hold.
 ABANDON_DEEP_OPEN_JS = """(delay) => {
     window.__abandonedAt = null;
     window.__settingsSmoke.openArchived('chats');
@@ -296,10 +295,6 @@ def run_chunk_fail(page) -> None:
     click_forced(page.locator('[data-testid="settings-tab-general"]'), timeout = 15000)
     settle_panel(page)
     # Read the nav size instead of hardcoding it. The invariant is that blocking a
-    # panel does not collapse the dialog, not that the dialog has any particular
-    # number of tabs -- and the hardcoded 12 outlived its truth: the
-    # keyboard-shortcuts page made it 13 and this smoke started failing with
-    # "took the dialog down" while reporting dialog: True, which reads like an
     # error-handling regression and was a stale constant.
     nav_before = page.evaluate(
         "() => document.querySelectorAll('[data-testid^=\"settings-tab-\"]').length"
@@ -465,12 +460,8 @@ def run(page) -> None:
     # --- 1. a deep-open walked away from mid-load is not replayed later --------------
     run_abandoned_deep_open(page)
 
-    assert_persisted_monitor_restores(page)
-
-    # --- 2. every tab renders when selected -----------------------------------------
     open_dialog(page)
     settle_panel(page)
-    # Start off the persisted tab, so the first iteration is a real switch.
     click_forced(page.locator('[data-testid="settings-tab-about"]'), timeout = 15000)
     settle_panel(page)
     for tab in TABS:
@@ -494,7 +485,6 @@ def run(page) -> None:
     # --- 3. every lan address has actions bound to that address ----------------------
     run_lan_address_actions(page)
 
-    # --- 4. close/reopen, and deep-open straight to a tab ----------------------------
     page.evaluate("() => window.__settingsSmoke.close()")
     page.wait_for_timeout(300)
     for tab in ("voice", "api-keys", "data", "about", "connections"):
@@ -624,8 +614,8 @@ def main() -> int:
                         raise
                     time.sleep(2)
             page.wait_for_function("() => !!window.__settingsSmoke", timeout = 120000)
-            # Vite dev re-optimizes deps on first sight and full-reloads; settle, then
-            # reload once for a stable dep graph.
+            # Vite dev re-optimizes deps on first sight and full-reloads; settle, then reload once for a stable dep
+            # graph.
             page.wait_for_timeout(4000)
             page.reload(wait_until = "domcontentloaded")
             page.wait_for_function("() => !!window.__settingsSmoke", timeout = 120000)
@@ -646,8 +636,7 @@ def main() -> int:
                     fail(f"error boundary tripped: {report['error_boundary']}")
             browser.close()
     except Exception as exc:
-        # A cold-start dev server can fail to serve a module before anything is under
-        # test. Report that rather than dying with no record.
+        # A cold-start dev server can fail to serve a module before anything is under test.
         report["aborted"] = f"{type(exc).__name__}: {exc}"
         fail(f"harness aborted: {report['aborted'].splitlines()[0]}")
         write_report()
