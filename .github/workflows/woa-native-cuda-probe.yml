@@ -39,17 +39,15 @@ jobs:
       # The only win_arm64 pyarrow wheel that exists anywhere today: crossbow's cp314 build.
       # The release's browser URL 404s anonymously; the API asset URL with an octet-stream
       # Accept header serves it without a token.
-      - name: Stage a local wheelhouse with the crossbow pyarrow wheel
+      # The wheelhouse is a URL here, as in production: a staging release holding the
+      # win_arm64 pyarrow wheels built on this runner (cp311-cp313, from apache/arrow#48539's
+      # script) plus crossbow's cp314, with the index.txt the installer reads.
+      - name: Point the installer at the staging wheelhouse
         shell: pwsh
         run: |
-          $wh = Join-Path $env:RUNNER_TEMP 'woa-wheelhouse'
-          New-Item -ItemType Directory -Force -Path $wh | Out-Null
-          $dest = Join-Path $wh 'pyarrow-23.0.0.dev202-cp314-cp314-win_arm64.whl'
-          Invoke-WebRequest -Uri 'https://api.github.com/repos/ursacomputing/crossbow/releases/assets/342781972' `
-            -Headers @{ Accept = 'application/octet-stream' } -OutFile $dest -UseBasicParsing -TimeoutSec 600
-          Get-ChildItem -LiteralPath $wh | Format-Table Name, Length | Out-String | Write-Host
-          if ((Get-Item -LiteralPath $dest).Length -lt 10MB) { Write-Host '::error::pyarrow wheel download is too small'; exit 1 }
-          "UNSLOTH_WOA_WHEELHOUSE=$wh" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $base = 'https://github.com/danielhanchen/unsloth-staging-2/releases/download/woa-wheelhouse-v0'
+          (Invoke-WebRequest -Uri "$base/index.txt" -UseBasicParsing).Content
+          "UNSLOTH_WOA_WHEELHOUSE=$base" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # A real nvidia-smi.exe, built by Windows PowerShell 5.1 (pwsh cannot emit console
       # exes). It answers -L with a "GPU 0:" row, the bare banner with a CUDA Version, and
@@ -125,15 +123,8 @@ jobs:
           Write-Host '--- memory'; & "$dir\nvidia-smi.exe" --query-gpu=index,name,memory.total --format=csv,noheader,nounits
           "$dir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
-      # cp314 is the only minor the staged pyarrow serves, so that is the interpreter the
-      # installer must find first. A native ARM64 build: the win_arm64 wheels are unimportable
-      # from an emulated x64 one, and install.ps1 would swap it out.
-      - name: Put a native ARM64 Python 3.14 first on PATH
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.14'
-          architecture: arm64
-
+      # The installer's default minor, found as a user's machine would have it: the image
+      # ships a native ARM64 3.13 on PATH, so no setup-python and no UNSLOTH_PYTHON.
       - name: Confirm the spoof and the interpreter are what install.ps1 will see
         shell: pwsh
         run: |
@@ -147,7 +138,6 @@ jobs:
           # The checked-out ref supplies setup.ps1 / install_python_stack.py, not the
           # released wheel (see clean-machine-install-ci.yml's header).
           UNSLOTH_CI_SOURCE_OVERLAY: ${{ github.workspace }}
-          UNSLOTH_PYTHON: '3.14'
         run: |
           $ErrorActionPreference = 'Continue'
           New-Item -ItemType Directory -Force -Path logs | Out-Null
