@@ -1510,6 +1510,8 @@ def fake_studio(tmp_path, monkeypatch):
             return {"is_gguf": True, "model_identifier": state["models"][0]["id"]}
         if url.endswith("/api/auth/api-keys"):
             return {"key": "sk-unsloth-feedfacefeedface"}
+        if url.endswith("/api/settings/embedding-model"):
+            return {"embedding_model": "unsloth/bge-small-en-v1.5"}
         if url.endswith("/api/inference/load"):
             already_loaded = state["models"][0]["id"] == payload["model_path"]
             state["models"] = [{"id": payload["model_path"], "context_length": 4096}]
@@ -4711,6 +4713,12 @@ def test_connect_openclaw_no_launch(fake_studio, tmp_path, monkeypatch):
     assert config["agents"]["defaults"]["model"]["primary"] == f"unsloth/{MODEL['id']}"
     assert config["agents"]["defaults"]["skipBootstrap"] is True
     assert config["agents"]["defaults"]["workspace"] == "${OPENCLAW_WORKSPACE_DIR}"
+    assert config["memory"]["search"] == {
+        "provider": "openai-compatible",
+        "model": "unsloth/bge-small-en-v1.5",
+        "fallback": "none",
+        "remote": {"baseUrl": f"{BASE}/v1", "apiKey": "sk-unsloth-feedfacefeedface"},
+    }
     _assert_env_cwd(result.output, "OPENCLAW_WORKSPACE_DIR")
     assert _launch_command(result.output) == ["openclaw", "tui", "--local"]
     # OpenAI /v1/chat/completions works on either backend — no GGUF gate.
@@ -8731,3 +8739,94 @@ def test_a_status_body_without_is_gguf_still_launches(fake_studio, monkeypatch, 
     result = CliRunner().invoke(start.start_app, [agent, "--no-launch"])
     assert result.exit_code == 0, result.output
     assert "needs a GGUF model" not in result.output
+
+
+def _openclaw_without_the_settings_route(monkeypatch, exc = RuntimeError("404")):
+    real = start._http_json
+
+    def older_server(method, url, *args, **kwargs):
+        if url.endswith("/api/settings/embedding-model"):
+            raise exc
+        return real(method, url, *args, **kwargs)
+
+    monkeypatch.setattr(start, "_http_json", older_server)
+
+
+def test_openclaw_memory_search_asks_for_keyword_only_without_the_settings_route(
+    fake_studio, tmp_path, monkeypatch
+):
+    # A server that cannot name its embedding model cannot serve embeddings for it
+    # either. Pointing memory search at it anyway, with fallback pinned to "none",
+    # is the one shape OpenClaw cannot degrade out of. Ask for its own keyword-only
+    # mode instead: no network call, no OpenAI, and searches still return hits.
+    _openclaw_without_the_settings_route(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(start.start_app, ["openclaw", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "openclaw" / "openclaw.json").read_text())
+    search = config["memory"]["search"]
+    assert search == {"provider": "none", "fallback": "none"}
+
+
+def test_openclaw_memory_search_drops_a_stale_remote_when_the_route_is_gone(
+    fake_studio, tmp_path, monkeypatch
+):
+    # Downgrading Studio after a --persist run must not leave the previous run's
+    # endpoint and key behind for a provider that is no longer pointed at it.
+    _openclaw_without_the_settings_route(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    config_path = tmp_path / "agents" / "openclaw" / "openclaw.json"
+    config_path.parent.mkdir(parents = True)
+    config_path.write_text(json.dumps({"memory": {"search": {
+        "provider": "openai-compatible",
+        "model": "unsloth/bge-small-en-v1.5",
+        "fallback": "none",
+        "remote": {"baseUrl": "http://127.0.0.1:8888/v1", "apiKey": "sk-unsloth-old"},
+    }}}))
+    result = CliRunner().invoke(start.start_app, ["openclaw", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    search = json.loads(config_path.read_text())["memory"]["search"]
+    assert search == {"provider": "none", "fallback": "none"}
+
+
+def test_openclaw_memory_search_model_is_stripped(fake_studio, tmp_path, monkeypatch):
+    # OpenClaw sends memory.search.model to /v1/embeddings verbatim, so padding that
+    # Studio's Settings field happens to hold would travel all the way to the request.
+    real = start._http_json
+
+    def padded(method, url, *args, **kwargs):
+        if url.endswith("/api/settings/embedding-model"):
+            return {"embedding_model": "  unsloth/bge-small-en-v1.5\n"}
+        return real(method, url, *args, **kwargs)
+
+    monkeypatch.setattr(start, "_http_json", padded)
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(start.start_app, ["openclaw", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "openclaw" / "openclaw.json").read_text())
+    assert config["memory"]["search"]["model"] == "unsloth/bge-small-en-v1.5"
+
+
+def test_openclaw_memory_search_does_not_swallow_a_cli_abort(
+    fake_studio, tmp_path, monkeypatch
+):
+    # typer.Exit is a RuntimeError subclass, so a bare `except Exception` around the
+    # probe would turn a deliberate abort into a silently degraded config.
+    _openclaw_without_the_settings_route(monkeypatch, exc = typer.Exit(2))
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(start.start_app, ["openclaw", "--no-launch"])
+    assert result.exit_code == 2, result.output
+
+
+def test_openclaw_memory_search_clears_a_stale_external_fallback(
+    fake_studio, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    config_path = tmp_path / "agents" / "openclaw" / "openclaw.json"
+    config_path.parent.mkdir(parents = True)
+    config_path.write_text(json.dumps({"memory": {"search": {"fallback": "openai"}}}))
+    result = CliRunner().invoke(start.start_app, ["openclaw", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    config = json.loads(config_path.read_text())
+    assert config["memory"]["search"]["fallback"] == "none"
+    assert config["memory"]["search"]["provider"] == "openai-compatible"
