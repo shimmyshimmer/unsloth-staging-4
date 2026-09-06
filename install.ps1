@@ -4009,14 +4009,14 @@ exit 0
         # Try the Python Launcher first (most reliable on Windows)
         # py.exe resolves to the standard CPython install, not conda.
         # Prefer the requested $PythonVersion, then newest-first fallback.
-        $minors = @($PythonVersion) + (@("3.13", "3.12", "3.11") | Where-Object { $_ -ne $PythonVersion })
+        $minors = @($PythonVersion) + (@("3.14", "3.13", "3.12", "3.11") | Where-Object { $_ -ne $PythonVersion })
         # -All: Windows PowerShell 5.1 returns only the first launcher without it.
         foreach ($pyLauncher in @(Get-Command py -All -CommandType Application -ErrorAction SilentlyContinue)) {
             if ($pyLauncher.Source -match $script:CondaSkipPattern) { continue }
             foreach ($minor in $minors) {
                 try {
                     $out = & $pyLauncher.Source "-$minor" --version 2>&1 | Out-String
-                    if ($out -match "Python ((3\.1[1-3])\.\d+)") {
+                    if ($out -match "Python ((3\.1[1-4])\.\d+)") {
                         # Both captures first: Test-IsCondaPython below runs -match
                         # and overwrites $Matches. Screening the patch here costs no
                         # extra subprocess (the text is already in hand) and lets the
@@ -4042,7 +4042,7 @@ exit 0
                 if (Test-IsCondaPython $cmd.Source) { continue }
                 try {
                     $out = & $cmd.Source --version 2>&1 | Out-String
-                    if ($out -match "Python ((3\.1[1-3])\.\d+)") {
+                    if ($out -match "Python ((3\.1[1-4])\.\d+)") {
                         $full = $Matches[1]
                         $ver = $Matches[2]
                         if ($PythonSkip -contains $full) { continue }
@@ -4076,7 +4076,7 @@ exit 0
                     if (Test-IsCondaPython $exe) { continue }
                     try {
                         $out = & $exe --version 2>&1 | Out-String
-                        if ($out -match "Python ((3\.1[1-3])\.\d+)") {
+                        if ($out -match "Python ((3\.1[1-4])\.\d+)") {
                             $full = $Matches[1]
                             $ver = $Matches[2]
                             if ($PythonSkip -contains $full) { continue }

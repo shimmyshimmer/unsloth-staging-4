@@ -3270,7 +3270,7 @@ $PyLaunchers = if ($PythonOk) { @() } else { @(Get-Command py -All -CommandType 
 
 foreach ($PyLauncher in $PyLaunchers) {
     if ($PyLauncher.Source -match $CondaSkipPattern) { continue }
-    foreach ($minor in @("3.13", "3.12", "3.11")) {
+    foreach ($minor in @("3.14", "3.13", "3.12", "3.11")) {
         try {
             $out = & $PyLauncher.Source "-$minor" --version 2>&1 | Out-String
             if ($out -match 'Python (3\.\d+\.\d+)') {
@@ -3609,7 +3609,7 @@ if ($ReusedSetupPython) {
 $PyLaunchersResolve = if ($PythonCmd) { @() } else { @(Get-Command py -All -CommandType Application -ErrorAction SilentlyContinue) }
 foreach ($pyLauncher in $PyLaunchersResolve) {
     if ($pyLauncher.Source -match $CondaSkipPattern) { continue }
-    foreach ($minor in @("3.13", "3.12", "3.11")) {
+    foreach ($minor in @("3.14", "3.13", "3.12", "3.11")) {
         try {
             $out = & $pyLauncher.Source "-$minor" --version 2>&1 | Out-String
             if ($out -match 'Python 3\.(\d+)') {
