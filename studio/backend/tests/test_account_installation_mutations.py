@@ -91,3 +91,20 @@ def test_a_managed_account_cannot_stop_the_shared_server():
     assert policy.require_owner in solved
     # And the subject is bound first, or require_owner would judge an unbound context.
     assert solved.index(get_current_subject) < solved.index(policy.require_owner)
+
+
+def test_a_managed_account_cannot_replace_the_transformers_sidecar(monkeypatch):
+    """The installer swaps the installation's .venv_t5_latest and unloads the shared model."""
+    from routes import inference
+
+    def _inference_app(app):
+        app.include_router(inference.studio_router, prefix = "/api/inference")
+
+    swaps = []
+    monkeypatch.setattr(
+        inference, "try_begin_sidecar_swap", lambda *a, **k: swaps.append(1), raising = False
+    )
+    with _client(ALICE, _inference_app) as client:
+        response = client.post("/api/inference/install-latest-transformers", json = {})
+    assert response.status_code == 403
+    assert swaps == []

@@ -1808,6 +1808,22 @@ async def liveness_check():
     return alive
 
 
+async def _desktop_shell_subject(request: Request) -> Optional[str]:
+    """Owner subject for a request carrying the desktop secret, None without one.
+
+    On a multi-account install desktop-login mints no session, so the shell's ownership
+    probe and quit path prove they own the backend with the secret itself.
+    """
+    secret = request.headers.get("x-desktop-secret")
+    if secret is None:
+        return None
+    from starlette.concurrency import run_in_threadpool
+
+    if await run_in_threadpool(storage.validate_desktop_secret, secret) is None:
+        raise HTTPException(status_code = 401, detail = "Desktop authentication failed")
+    return storage.DEFAULT_ADMIN_USERNAME
+
+
 @app.get("/api/health")
 async def health_check(request: Request):
     """Liveness plus launcher capability bits; host fingerprint gated on a bearer.
@@ -1862,22 +1878,24 @@ async def health_check(request: Request):
         if os.environ.get(DISABLE_ENV_VAR) == "1" and not mlx_repairing:
             # Nothing is detecting until a hardware-dependent operation runs; say so instead of making clients poll.
             base["hardware_detection_deferred"] = True
+    subject = await _desktop_shell_subject(request)
     auth = request.headers.get("authorization", "")
     bearer = auth.split(" ", 1)[1] if auth.lower().startswith("bearer ") else None
-    try:
-        from auth.authentication import credentials_for_token
-        from auth.authentication import get_current_subject as _gcs
+    if subject is None:
+        try:
+            from auth.authentication import credentials_for_token
+            from auth.authentication import get_current_subject as _gcs
 
-        # resolved rather than built, so a scope covering this route answers it in full
-        creds = await credentials_for_token(request, bearer)
-        if creds is None:
+            # resolved rather than built, so a scope covering this route answers it in full
+            creds = await credentials_for_token(request, bearer)
+            if creds is None:
+                return base
+            # Must await: a bare coroutine is truthy and would skip the auth check
+            subject = await _gcs(creds)
+        except HTTPException:
             return base
-        # Must await: a bare coroutine is truthy and would skip the auth check
-        subject = await _gcs(creds)
-    except HTTPException:
-        return base
-    except Exception:
-        return base
+        except Exception:
+            return base
     if not subject:
         return base
 
@@ -1982,6 +2000,19 @@ async def shutdown_server(request: Request, current_subject: str = Depends(get_c
     without the CLI or killing the process manually.
     """
 
+    return _schedule_shutdown(request)
+
+
+@app.post("/api/desktop/shutdown")
+async def desktop_shutdown_server(request: Request):
+    """The desktop shell's quit path, authenticated by its secret: on a multi-account
+    install it holds no session, and stopping the backend it owns is not account work."""
+    if await _desktop_shell_subject(request) is None:
+        raise HTTPException(status_code = 401, detail = "Desktop authentication failed")
+    return _schedule_shutdown(request)
+
+
+def _schedule_shutdown(request: Request) -> dict:
     async def _delayed_shutdown():
         await asyncio.sleep(0.2)  # Let the HTTP response return first
         trigger = getattr(request.app.state, "trigger_shutdown", None)

@@ -6,6 +6,7 @@
 import asyncio
 import io
 import secrets
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -362,3 +363,62 @@ def test_terminal_gate_ignores_managed_setup_and_changes_only_owner(monkeypatch)
     assert "Password updated for 'unsloth'." in output.getvalue()
     assert "alice" not in output.getvalue()
     assert storage.get_user_and_secret("alice") == before
+
+
+def _request(path, headers):
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": path,
+        "query_string": b"",
+        "headers": [(k.encode(), v.encode()) for k, v in headers.items()],
+        "app": SimpleNamespace(state = SimpleNamespace()),
+    }
+    return Request(scope)
+
+
+def test_desktop_secret_authenticates_the_shell_health_probe(monkeypatch):
+    """The shell's ownership probe needs version from /api/health; on a multi-account
+    install desktop-login mints nothing, so the secret itself is the credential."""
+    import main
+
+    raw = storage.create_desktop_secret()
+    add_managed()
+
+    async def no_wait(budget):
+        return None
+
+    monkeypatch.setattr(main, "_await_hardware_detection", no_wait)
+    health = main.health_check
+
+    body = asyncio.run(health(_request("/api/health", {"x-desktop-secret": raw})))
+    assert body.get("version")
+    body = asyncio.run(health(_request("/api/health", {})))
+    assert "version" not in body
+    with pytest.raises(HTTPException) as refused:
+        asyncio.run(health(_request("/api/health", {"x-desktop-secret": raw + "x"})))
+    assert refused.value.status_code == 401
+
+
+def test_desktop_secret_stops_the_backend_it_owns(monkeypatch):
+    import main
+
+    raw = storage.create_desktop_secret()
+    add_managed()
+    app = FastAPI()
+    fired = []
+    app.state.trigger_shutdown = lambda: fired.append(True)
+    app.add_api_route("/api/desktop/shutdown", main.desktop_shutdown_server, methods = ["POST"])
+    with TestClient(app) as http:
+        assert http.post("/api/desktop/shutdown").status_code == 401
+        assert (
+            http.post("/api/desktop/shutdown", headers = {"X-Desktop-Secret": raw + "x"}).status_code
+            == 401
+        )
+        response = http.post("/api/desktop/shutdown", headers = {"X-Desktop-Secret": raw})
+        assert response.status_code == 200
+        assert response.json() == {"status": "shutting_down"}
+        deadline = time.monotonic() + 5
+        while not fired and time.monotonic() < deadline:
+            time.sleep(0.05)
+    assert fired

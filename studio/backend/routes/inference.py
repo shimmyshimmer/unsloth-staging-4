@@ -3109,7 +3109,7 @@ from core.inference.anthropic_compat import (
     AnthropicStreamEmitter,
     AnthropicPassthroughEmitter,
 )
-from auth import storage as auth_storage
+from auth import policy as auth_policy, storage as auth_storage
 from auth.authentication import API_KEY_PREFIX, get_current_subject
 from state import active_generations
 
@@ -16024,9 +16024,12 @@ async def check_transformers_upgrade_route(
     )
 
 
-# studio_router only: admin action, kept off the OpenAI-compatible /v1 mount.
+# studio_router only: admin action, kept off the OpenAI-compatible /v1 mount. It swaps
+# the installation's .venv_t5_latest and unloads the shared model, so owner-only.
 @studio_router.post(
-    "/install-latest-transformers", response_model = InstallLatestTransformersResponse
+    "/install-latest-transformers",
+    response_model = InstallLatestTransformersResponse,
+    dependencies = [Depends(get_current_subject), Depends(auth_policy.require_owner)],
 )
 async def install_latest_transformers_route(
     request: InstallLatestTransformersRequest, current_subject: str = Depends(get_current_subject)
