@@ -123,11 +123,38 @@ def media_generation(modality: str):
                 _generation_accounts.pop(modality, None)
 
 
+# Holders of the backend's serialized generation slot; other entries are queued.
+_generation_holders: dict[str, list[str]] = {}
+
+
+@contextmanager
+def media_generation_slot(modality: str):
+    """Entered once the backend slot is held, so a queued request is not the running one."""
+    if not policy.installation_is_multi_user():
+        yield
+        return
+    account_id = current_account_id()
+    with _generation_lock:
+        _generation_holders.setdefault(modality, []).append(account_id)
+    try:
+        yield
+    finally:
+        with _generation_lock:
+            holders = _generation_holders.get(modality) or []
+            if account_id in holders:
+                holders.remove(account_id)
+            if not holders:
+                _generation_holders.pop(modality, None)
+
+
 def generation_is_mine(modality: str) -> bool:
     if not policy.installation_is_multi_user():
         return False
     account_id = current_account_id()
     with _generation_lock:
+        holders = _generation_holders.get(modality)
+        if holders:
+            return account_id in holders
         return bool(_generation_accounts.get(modality, {}).get(account_id))
 
 
@@ -136,6 +163,9 @@ def generation_is_foreign(modality: str) -> bool:
         return False
     account_id = current_account_id()
     with _generation_lock:
+        holders = _generation_holders.get(modality)
+        if holders:
+            return any(holder != account_id for holder in holders)
         return any(
             account != account_id and count
             for account, count in _generation_accounts.get(modality, {}).items()

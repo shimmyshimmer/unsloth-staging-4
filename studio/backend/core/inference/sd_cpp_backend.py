@@ -2188,7 +2188,10 @@ class SdCppDiffusionBackend:
             )
 
         cancel = threading.Event()
-        with self._generate_lock:
+        from hub.services.models.account_access import media_generation_slot
+
+        # Same holder record as the diffusers engine, so queued requests stay queued.
+        with self._generate_lock, media_generation_slot("diffusion"):
             with self._lock:
                 state = self._state
                 if state is None:

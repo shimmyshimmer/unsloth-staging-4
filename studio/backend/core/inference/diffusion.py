@@ -1310,8 +1310,11 @@ class DiffusionBackend:
                         raise RuntimeError(DIFFUSION_CANCELLED_MSG)
                     if self._teardown_drained.wait(timeout = 0.1):
                         break
+            from hub.services.models.account_access import media_generation_slot
             try:
-                yield
+                # Naming the holder keeps a queued request from counting as the running generation.
+                with media_generation_slot("diffusion"):
+                    yield
             finally:
                 with self._generation_cancel_lock:
                     if self._active_generate_cancel is cancel:
