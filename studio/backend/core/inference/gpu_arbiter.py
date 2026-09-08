@@ -126,7 +126,11 @@ class GpuBusyForAnotherAccountError(GpuOwnerBusyError):
 def other_accounts_active(account_id: str) -> int:
     """Generations in flight that do not belong to ``account_id``."""
     from state import active_generations
-    return active_generations.foreign_count(account_id)
+
+    # Image and video jobs never enter active_generations, so ask their own trackers too.
+    from hub.services.models.account_access import foreign_media_generations
+
+    return active_generations.foreign_count(account_id) + foreign_media_generations(account_id)
 
 
 def raise_if_other_accounts_active(account_id: Optional[str] = None) -> None:

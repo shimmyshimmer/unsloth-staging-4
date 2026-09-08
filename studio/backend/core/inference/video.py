@@ -6375,3 +6375,11 @@ def generation_in_flight() -> bool:
     """Read the background-job marker without constructing or locking the backend."""
     backend = _backend
     return backend is not None and bool(backend._generate_job_active)
+
+
+def generation_account_in_flight() -> Optional[str]:
+    """The account whose video job is running, read without constructing the backend."""
+    backend = _backend
+    if backend is None or not backend._generate_job_active:
+        return None
+    return backend._generate_job_account

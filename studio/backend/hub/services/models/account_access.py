@@ -9,6 +9,7 @@ import re
 import json
 import os
 import sqlite3
+import sys
 import threading
 import time
 from collections import deque
@@ -171,6 +172,27 @@ def generation_is_foreign(modality: str) -> bool:
             account != account_id and count
             for account, count in _generation_accounts.get(modality, {}).items()
         )
+
+
+def foreign_media_generations(account_id: str) -> int:
+    """Other accounts' image and video work, tracked outside ``active_generations``.
+
+    No policy or database reads: the trackers stay empty on a one-account install."""
+    total = 0
+    with _generation_lock:
+        for modality, counts in _generation_accounts.items():
+            holders = _generation_holders.get(modality)
+            if holders:
+                continue
+            total += sum(count for account, count in counts.items() if account != account_id)
+        for holders in _generation_holders.values():
+            total += sum(1 for holder in holders if holder != account_id)
+    # sys.modules, not an import: no video job can be in flight before its module is loaded.
+    video = sys.modules.get("core.inference.video")
+    reserved = video.generation_account_in_flight() if video is not None else None
+    if reserved is not None and reserved != account_id:
+        total += 1
+    return total
 
 
 def note_resident_account(modality: str, *references: str) -> None:
