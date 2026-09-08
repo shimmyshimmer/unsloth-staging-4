@@ -36,7 +36,7 @@ import inspect
 import os
 import tempfile
 import threading
-from utils.account_context import account_thread
+from utils.account_context import account_thread, current_account_id
 import time
 import types
 from dataclasses import dataclass
@@ -1058,6 +1058,8 @@ class VideoBackend:
         # Which job the flag belongs to. The flag alone cannot tell "my job" from "the job that replaced mine", so
         # finalising is keyed on this. Compared by identity.
         self._generate_job_token: Optional[object] = None
+        # Account whose reservation started the latest job; progress and cancel follow it.
+        self._generate_job_account: Optional[str] = None
         # The OpenAI /v1/videos job id this run was started under, or None for a Studio-page run
         self._gen_video_id: Optional[str] = None
 
@@ -5072,6 +5074,7 @@ class VideoBackend:
                 )
                 self._generate_job_active = True
                 self._generate_job_token = job_token
+                self._generate_job_account = current_account_id()
                 self._active_generate_cancel = cancel
                 self._gen_video_id = video_id
                 self._gen = {
@@ -5136,6 +5139,10 @@ class VideoBackend:
             "fps": fps if fps is not None else getattr(fam, "default_fps", None),
             "model": getattr(state, "repo_id", None),
         }
+
+    def generate_job_account(self) -> Optional[str]:
+        """The account that reserved the current or most recent job, or None if none ever ran."""
+        return self._generate_job_account
 
     def _run_generate(
         self,

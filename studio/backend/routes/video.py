@@ -415,9 +415,18 @@ def _note_generation_account() -> None:
         _generation_account = current_account().account_id
 
 
-def _generation_hidden(backend) -> bool:
+def _generation_started_by(backend) -> Optional[str]:
+    """The backend's own reservation wins: it is taken before begin_generate returns."""
+    reserved = getattr(backend, "generate_job_account", None)
+    reserved = reserved() if callable(reserved) else None
+    if reserved is not None:
+        return reserved
     with _generation_lock:
-        started_by = _generation_account
+        return _generation_account
+
+
+def _generation_hidden(backend) -> bool:
+    started_by = _generation_started_by(backend)
     if started_by is not None:
         from utils.account_context import current_account
         return account_access.managed_account() and started_by != current_account().account_id
@@ -575,7 +584,7 @@ async def cancel_video_generation(current_subject: str = Depends(get_current_sub
     backend = get_video_backend()
     if _generation_hidden(backend):
         return {"cancelled": False}
-    if _generation_account is None and account_access.foreign_work_active():
+    if _generation_started_by(backend) is None and account_access.foreign_work_active():
         return {"cancelled": False}
     cancelled = await asyncio.to_thread(backend.cancel_generate)
     return {"cancelled": cancelled}
