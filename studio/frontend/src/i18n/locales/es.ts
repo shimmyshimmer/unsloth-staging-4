@@ -969,7 +969,11 @@ export const es = {
         currentStreak: "Racha actual",
         longestStreak: "Racha más larga",
         activityTitle: "Actividad de tokens",
-        activityDescription: "Período: {weeks} · {total}",
+        activityDescription: {
+          daily: "Período: {weeks} · {total}",
+          weekly: "Semana pico {total} · últimas {weeks}",
+          cumulative: "{total} acumulados en las últimas {weeks}",
+        },
         mode: {
           daily: "Diaria",
           weekly: "Semanal",
@@ -2222,6 +2226,7 @@ export const es = {
       memoryEfficient: "Eficiente en memoria",
       weightDecomposed: "Pesos descompuestos",
       notSupportedAppleSilicon: "No compatible con Apple Silicon",
+      doraNeedsVisionLayersOff: "Desactiva el entrenamiento de las capas de visión para usar DoRA",
       optimization: "Optimización",
       schedule: "Programación",
       memory: "Memoria",

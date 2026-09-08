@@ -950,7 +950,11 @@ export const ar = {
         currentStreak: "التتابع الحالي",
         longestStreak: "أطول تتابع",
         activityTitle: "نشاط التوكنات",
-        activityDescription: "{total} خلال آخر {weeks}",
+        activityDescription: {
+          daily: "{total} خلال آخر {weeks}",
+          weekly: "أسبوع الذروة {total} · آخر {weeks}",
+          cumulative: "{total} متراكمة خلال آخر {weeks}",
+        },
         mode: {
           daily: "يومي",
           weekly: "أسبوعي",
@@ -2170,6 +2174,7 @@ export const ar = {
       memoryEfficient: "موفّر للذاكرة",
       weightDecomposed: "أوزان مُفكَّكة",
       notSupportedAppleSilicon: "غير مدعوم على Apple Silicon",
+      doraNeedsVisionLayersOff: "أوقف تدريب طبقات الرؤية لاستخدام DoRA",
       optimization: "التحسين",
       schedule: "الجدولة",
       memory: "الذاكرة",

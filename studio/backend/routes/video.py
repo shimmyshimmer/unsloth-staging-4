@@ -41,6 +41,13 @@ from hub.services.models import account_access
 from hub.services.models.account_access import media_link_account, media_link_target
 from utils.account_context import run_as
 from loggers import get_logger
+from loggers.media_progress import (
+    byte_fraction,
+    log_media_generation_progress,
+    log_media_load_progress,
+    reset_media_generation_progress,
+    reset_media_load_progress,
+)
 from models.inference import (
     DiffusionDownloadPlanResponse,
     GalleryFlagsPatch,
@@ -380,6 +387,7 @@ async def load_video_model_gated(
             user_action = user_initiated,
         )
         account_access.note_resident_account("video", request.model_path)
+        reset_media_load_progress("video")
         return VideoStatusResponse(**status_dict)
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code = 400, detail = redact_native_paths(str(exc)))
@@ -400,7 +408,10 @@ async def video_load_progress(current_subject: str = Depends(get_current_subject
         "video", get_video_backend().status().get("repo_id")
     ):
         return account_access.hidden_resident_response()
-    return VideoLoadProgressResponse(**get_video_backend().load_progress())
+    progress = get_video_backend().load_progress()
+    fraction = byte_fraction(progress.get("downloaded_bytes"), progress.get("expected_bytes"))
+    log_media_load_progress("video", progress.get("phase"), fraction)
+    return VideoLoadProgressResponse(**progress)
 
 
 # Who started the clip in flight: residency names the loader, which may be another account.
@@ -564,6 +575,7 @@ async def generate_video(
         raise HTTPException(status_code = 500, detail = "Video generation failed.")
 
     _note_generation_account()
+    reset_media_generation_progress("video")
     return VideoGenerateResponse()
 
 
@@ -574,7 +586,9 @@ async def video_generate_progress(current_subject: str = Depends(get_current_sub
     backend = get_video_backend()
     if _generation_hidden(backend):
         return account_access.hidden_resident_response()
-    return VideoGenerateProgressResponse(**backend.generate_progress())
+    progress = backend.generate_progress()
+    log_media_generation_progress("video", progress)
+    return VideoGenerateProgressResponse(**progress)
 
 
 @router.post("/video/generate/cancel")
@@ -1547,6 +1561,7 @@ async def _create_openai_video(
 
     # As on /video/generate: the clip belongs to the account that started it.
     _note_generation_account()
+    reset_media_generation_progress("video")
 
     # begin_generate hands back the canvas it resolved. Without it a reference-image
     # request reported the family's first preset while the clip rendered at the source
