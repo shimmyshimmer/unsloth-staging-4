@@ -586,3 +586,37 @@ def test_the_lora_and_controlnet_scanners_read_the_reported_directory(tmp_path, 
         entry.id for entry in run_as(ALICE, diffusion_lora.list_loras) if entry.source == "local"
     ] == []
     assert any(entry.source == "local" for entry in run_as(OWNER, diffusion_lora.list_loras))
+
+
+def test_stt_load_does_not_claim_a_model_another_account_switched_to(monkeypatch):
+    """The sidecar's load lock is released before the route records ownership, so Bob's load
+    can land in between: Alice must not adopt his model or read its id back to him."""
+    import json
+
+    sidecar = SimpleNamespace(loaded_model = None, device = None)
+    monkeypatch.setattr(access, "_resident_accounts", {})
+    monkeypatch.setattr(access, "require_model_access", lambda *a, **k: None)
+    monkeypatch.setattr(inference, "_resolve_serving_stt_engine", lambda engine: "transformers")
+    monkeypatch.setattr(inference, "_stt_sidecar_for", lambda engine: sidecar)
+    monkeypatch.setattr(inference, "_prepare_runtime_fallback_checkpoint", lambda *a, **k: None)
+    monkeypatch.setattr(
+        inference, "_stt_lifecycle", lambda: (lambda *a, **k: None, lambda *a, **k: [])
+    )
+
+    async def _watcher(request, sidecar_, cancel_event):
+        return None
+
+    async def _stop(task):
+        # Bob's load completes and records its ownership while Alice's route is suspended here.
+        sidecar.loaded_model = "bob/private-stt"
+        run_as(BOB, access.note_resident_account, "stt:transformers", "bob/private-stt")
+
+    monkeypatch.setattr(inference, "_await_stt_disconnect_then_cancel", _watcher)
+    monkeypatch.setattr(inference, "_stop_local_disconnect_cancel_watcher", _stop)
+
+    payload = SimpleNamespace(model = "alice/model", engine = "transformers", device = None)
+    response = asyncio.run(
+        arun_as(ALICE, inference.stt_load(payload, SimpleNamespace(), "alice"))
+    )
+    assert json.loads(response.body)["loaded_model"] != "bob/private-stt"
+    assert access._resident_accounts["stt:transformers"][0] == BOB.account_id

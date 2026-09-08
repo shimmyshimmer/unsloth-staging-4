@@ -18169,6 +18169,20 @@ def _stt_repo_reference(model, engine):
     return stt_sidecar.resolve_model_repo(model)
 
 
+def _stt_resolved_model_id(model, engine):
+    """The id the sidecar records for this request, resolved as its loader does."""
+    from core.inference import stt_ggml_sidecar, stt_mtmd_sidecar, stt_sidecar
+
+    try:
+        if engine == "gguf":
+            return stt_ggml_sidecar.resolve_ggml_model_id(model)
+        if engine == "mtmd":
+            return stt_mtmd_sidecar.resolve_mtmd_model_id(model)
+        return stt_sidecar.resolve_model_id(model)
+    except Exception:  # noqa: BLE001 - an id the loader would refuse is not what it loaded
+        return None
+
+
 def _account_stt_status(status):
     for engine in ("transformers", "gguf", "mtmd"):
         section = status[engine]
@@ -18403,8 +18417,15 @@ async def stt_load(
         raise HTTPException(status_code = 500, detail = safe_error_detail(e))
     finally:
         await _stop_local_disconnect_cancel_watcher(disconnect_watcher)
-    account_access.note_resident_account(f"stt:{engine}", sidecar.loaded_model)
-    return JSONResponse(content = {"loaded_model": sidecar.loaded_model, "device": sidecar.device})
+    # The load lock is released; another account may have switched the engine, so claim only ours.
+    loaded = sidecar.loaded_model
+    if loaded is not None and loaded == _stt_resolved_model_id(payload.model, engine):
+        account_access.note_resident_account(f"stt:{engine}", loaded)
+    else:
+        loaded = None
+    return JSONResponse(
+        content = {"loaded_model": loaded, "device": sidecar.device if loaded else None}
+    )
 
 
 @studio_router.post("/audio/stt/validate")
