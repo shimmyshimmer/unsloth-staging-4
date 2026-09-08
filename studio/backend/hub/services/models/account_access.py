@@ -633,7 +633,11 @@ def foreign_work_active() -> bool:
     return bool(active_generations.foreign_count(current_account_id()))
 
 
-def require_download_progress_access(registry, repo_id: str, repo_type: str = "model") -> None:
+def require_download_progress_access(
+    registry,
+    repo_id: str,
+    repo_type: str = "model",
+) -> None:
     if not managed_account():
         return
     from hub.services import download_lifecycle

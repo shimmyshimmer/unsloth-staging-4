@@ -5496,7 +5496,14 @@ def test_model_download_watcher_invalidates_hf_cache_scan(monkeypatch):
             return SimpleNamespace(state = "complete", error = None)
 
     class _ImmediateThread:
-        def __init__(self, *, target, args = (), kwargs = None, **_kwargs):
+        def __init__(
+            self,
+            *,
+            target,
+            args = (),
+            kwargs = None,
+            **_kwargs,
+        ):
             self._target, self._args, self._kwargs = target, args, kwargs or {}
 
         def start(self):

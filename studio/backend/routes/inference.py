@@ -18172,7 +18172,6 @@ def _stt_repo_reference(model, engine):
 def _stt_resolved_model_id(model, engine):
     """The id the sidecar records for this request, resolved as its loader does."""
     from core.inference import stt_ggml_sidecar, stt_mtmd_sidecar, stt_sidecar
-
     try:
         if engine == "gguf":
             return stt_ggml_sidecar.resolve_ggml_model_id(model)

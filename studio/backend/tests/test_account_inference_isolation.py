@@ -615,8 +615,6 @@ def test_stt_load_does_not_claim_a_model_another_account_switched_to(monkeypatch
     monkeypatch.setattr(inference, "_stop_local_disconnect_cancel_watcher", _stop)
 
     payload = SimpleNamespace(model = "alice/model", engine = "transformers", device = None)
-    response = asyncio.run(
-        arun_as(ALICE, inference.stt_load(payload, SimpleNamespace(), "alice"))
-    )
+    response = asyncio.run(arun_as(ALICE, inference.stt_load(payload, SimpleNamespace(), "alice")))
     assert json.loads(response.body)["loaded_model"] != "bob/private-stt"
     assert access._resident_accounts["stt:transformers"][0] == BOB.account_id
