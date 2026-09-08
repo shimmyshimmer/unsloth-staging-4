@@ -28,6 +28,8 @@ _owner_epoch = 0
 # The account whose load put the current owner on the GPU, so routes can refuse to evict
 # another account's in-use model and hide a private model's identity from everyone else.
 _owner_account: Optional[str] = None
+# Account displaced by a still-uncommitted claim, handed back if its async load fails.
+_prior_account: Optional[str] = None
 
 
 class OwnerChangedError(RuntimeError):
@@ -180,7 +182,7 @@ def acquire_for(
     ``register`` or ``replacing`` marks a real load; a plain ownership reassertion sets neither,
     so accounts share the llama slots.
     """
-    global _owner, _owner_epoch, _owner_account
+    global _owner, _owner_epoch, _owner_account, _prior_account
     if owner not in _EVICTORS:
         raise ValueError(f"unknown GPU owner: {owner!r}")
     from utils.account_context import current_account_id
@@ -210,17 +212,33 @@ def acquire_for(
         result = register() if register is not None else None
         # After ``register``: a raising registration loaded nothing and must not take residency.
         if claims:
-            _owner_account = acting
+            _prior_account, _owner_account = _owner_account, acting
         return result
+
+
+def restore_owner_account(owner: str, account_id: Optional[str] = None) -> bool:
+    """Hand residency back to the displaced account when a claim's async load never committed.
+
+    No-op once anything else has taken residency. Returns True iff handed back."""
+    global _owner_account, _prior_account
+    from utils.account_context import current_account_id
+
+    with _lock:
+        acting = account_id or current_account_id()
+        if _owner != owner or _owner_account != acting or _prior_account is None:
+            return False
+        _owner_account, _prior_account = _prior_account, None
+        return True
 
 
 def release(owner: str) -> None:
     """Drop ``owner``'s claim (no-op if it isn't the current owner)."""
-    global _owner, _owner_epoch, _owner_account
+    global _owner, _owner_epoch, _owner_account, _prior_account
     with _lock:
         if _owner == owner:
             _owner = None
             _owner_account = None
+            _prior_account = None
             _owner_epoch += 1
 
 
@@ -231,12 +249,13 @@ def release_if(owner: str, predicate: Callable[[], bool]) -> bool:
     whose ``acquire_for(register=...)`` re-registers ownership under this lock; evaluating the
     predicate under the lock keeps them atomic so ``release`` never clears the newer claim.
     ``predicate`` must be quick and not re-enter the arbiter. Returns True iff ownership was dropped."""
-    global _owner, _owner_epoch, _owner_account
+    global _owner, _owner_epoch, _owner_account, _prior_account
     with _lock:
         if _owner != owner or not predicate():
             return False
         _owner = None
         _owner_account = None
+        _prior_account = None
         _owner_epoch += 1
         return True
 

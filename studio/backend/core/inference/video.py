@@ -1650,6 +1650,10 @@ class VideoBackend:
             if self._load_token != token:
                 return
             logger.error("video.load_failed: %s", exc)
+            if self._state is not None:
+                # The previous model is still resident: residency goes back to its account.
+                from .gpu_arbiter import VIDEO, restore_owner_account
+                restore_owner_account(VIDEO)
             # Free the debris of a failed construction: nothing was committed, so nothing else releases the VRAM.
             try:
                 clear_gpu_cache()

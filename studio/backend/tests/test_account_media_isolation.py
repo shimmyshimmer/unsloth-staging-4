@@ -205,3 +205,43 @@ def test_clearing_a_managed_chat_history_reaps_only_its_own_thumbnails(monkeypat
     run_as(ALICE, search_images.clear_cache, snapshot)
     assert run_as(ALICE, search_images.thumbnail_bytes, ids[ALICE]) is None
     assert run_as(BOB, search_images.thumbnail_bytes, ids[BOB]) == b"thumbnail"
+
+
+def test_a_failed_replacement_load_leaves_residency_with_the_resident_model(monkeypatch):
+    """A media register only STARTS the load: Alice's model is still the resident one."""
+    import threading
+
+    from core.inference import gpu_arbiter, video as video_module
+
+    backend = video_module.get_video_backend()
+    monkeypatch.setattr(gpu_arbiter, "_owner", None)
+    monkeypatch.setattr(gpu_arbiter, "_owner_account", None)
+    monkeypatch.setattr(gpu_arbiter, "_prior_account", None, raising = False)
+    resident = {**backend.status(), "loaded": True, "repo_id": "alice/private-video"}
+    monkeypatch.setattr(backend, "status", lambda: resident)
+    monkeypatch.setattr(backend, "_state", object())
+    unloaded: list[str] = []
+    monkeypatch.setattr(backend, "unload", lambda: unloaded.append("unload") or resident)
+    # Alice's private model is committed and resident.
+    run_as(ALICE, gpu_arbiter.acquire_for, gpu_arbiter.VIDEO, lambda: None)
+    # Bob starts an authorized replacement whose background load then fails.
+    run_as(BOB, gpu_arbiter.acquire_for, gpu_arbiter.VIDEO, lambda: None)
+    monkeypatch.setattr(
+        video_module,
+        "_detect_load_family",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    run_as(
+        BOB,
+        backend._run_load,
+        repo_id = "bob/model",
+        _load_token = backend._load_token,
+        _cancel_event = threading.Event(),
+    )
+    assert gpu_arbiter.owner_account() == ALICE.account_id
+    with _client(BOB) as client:
+        assert client.get("/api/inference/video/status").json() == {"loaded": True, "yours": False}
+        assert client.post("/api/inference/video/unload").status_code == 404
+    assert unloaded == []
+    with _client(ALICE) as client:
+        assert client.get("/api/inference/video/status").json()["repo_id"] == "alice/private-video"

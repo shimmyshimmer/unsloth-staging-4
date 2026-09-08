@@ -2225,6 +2225,10 @@ class DiffusionBackend:
             if self._load_token != token:
                 return
             logger.error("diffusion.load_failed: %s", exc)
+            if self._state is not None:
+                # The previous pipeline is still resident: residency goes back to its account.
+                from .gpu_arbiter import DIFFUSION, restore_owner_account
+                restore_owner_account(DIFFUSION)
             try:
                 clear_gpu_cache()
             except Exception:  # noqa: BLE001
