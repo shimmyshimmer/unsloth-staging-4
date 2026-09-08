@@ -16875,8 +16875,11 @@ async def generate_stream(
 
     For vision models, provide image_base64 (base64-encoded image).
     """
-    if account_access.managed_account():
-        await asyncio.to_thread(account_access.require_model_access, request.model_path)
+    # The request names no model: authorize the resident one, as _maybe_auto_switch_model does.
+    if account_access.managed_account() and await asyncio.to_thread(
+        lambda: account_access.resident_hidden("chat", _loaded_slot_ident())
+    ):
+        raise HTTPException(status_code = 404, detail = "Model not found")
     # Enforce the preview-swap reject FIRST, before reading any backend state. If a public
     # preview loaded a different checkpoint while this native Unsloth request waited on the
     # keep-warm gate, the middleware flagged the scope; the loaded-model and image-capability

@@ -618,3 +618,16 @@ def test_stt_load_does_not_claim_a_model_another_account_switched_to(monkeypatch
     response = asyncio.run(arun_as(ALICE, inference.stt_load(payload, SimpleNamespace(), "alice")))
     assert json.loads(response.body)["loaded_model"] != "bob/private-stt"
     assert access._resident_accounts["stt:transformers"][0] == BOB.account_id
+
+
+def test_legacy_generate_stream_refuses_another_accounts_resident_model(monkeypatch):
+    """The body names no model, so the route must authorize the resident one, not a request field."""
+    monkeypatch.setattr(gpu_arbiter, "_owner", "chat")
+    monkeypatch.setattr(gpu_arbiter, "_owner_account", ALICE.account_id)
+    with client_for(BOB) as client:
+        response = client.post(
+            "/api/inference/generate/stream",
+            json = {"messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert response.status_code == 404, response.text
+    assert "model_path" not in response.text
