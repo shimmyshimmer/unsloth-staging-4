@@ -24,6 +24,11 @@ export const ACCOUNT_CHROME_KEYS = new Set([
 export const ACCOUNT_CHROME_PREFIXES = [
   "unsloth_web_update_dismissed:",
 ] as const;
+/** Per-tab flags about the browser session, not the account. Never add content. */
+export const ACCOUNT_SESSION_CHROME_KEYS = new Set([
+  // USER_STOPPED_KEY in src/hooks/server-stop-intent.ts: a stop the user asked for.
+  "unsloth_server_user_stopped",
+]);
 export const ACCOUNT_DATABASES = [
   "unsloth-data-recipes",
   "unsloth-data-recipe-executions",
@@ -33,7 +38,7 @@ export const ACCOUNT_DATABASES = [
 
 export type AccountTransitionBrowser = Pick<
   Window,
-  "localStorage" | "indexedDB" | "location"
+  "localStorage" | "sessionStorage" | "indexedDB" | "location"
 >;
 
 /**
@@ -97,6 +102,22 @@ export function resetFullAccessForMultiUser(storage: Storage): void {
   }
 }
 
+/** A tab session holds only the previous account's work: everything unlisted goes. */
+function clearAccountSessionStorage(browser: AccountTransitionBrowser): void {
+  try {
+    const storage = browser.sessionStorage;
+    const keys = Array.from({ length: storage.length }, (_, index) =>
+      storage.key(index),
+    );
+    for (const key of keys) {
+      if (!key || ACCOUNT_SESSION_CHROME_KEYS.has(key)) continue;
+      storage.removeItem(key);
+    }
+  } catch {
+    // Blocked or opaque session storage carries nothing over.
+  }
+}
+
 function deleteAccountDatabase(
   indexedDB: IDBFactory,
   name: string,
@@ -147,6 +168,7 @@ export async function transitionBrowserAccount(
       if (key.startsWith("unsloth") || key.startsWith("chat-draft"))
         storage.removeItem(key);
     }
+    clearAccountSessionStorage(browser);
     await Promise.all(
       ACCOUNT_DATABASES.map((name) =>
         deleteAccountDatabase(browser.indexedDB, name),

@@ -17,8 +17,10 @@ import {
 function browserWith(
   values: Record<string, string> = {},
   databaseResult = "success",
+  sessionValues: Record<string, string> = {},
 ) {
   const data = new Map(Object.entries(values));
+  const sessionData = new Map(Object.entries(sessionValues));
   const removed: string[] = [];
   const deleted: string[] = [];
   const replaced: string[] = [];
@@ -38,8 +40,22 @@ function browserWith(
       data.delete(key);
     },
   } as Storage;
+  const sessionStorage = {
+    get length() {
+      return sessionData.size;
+    },
+    key: (index: number) => [...sessionData.keys()][index] ?? null,
+    getItem: (key: string) => sessionData.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      sessionData.set(key, value);
+    },
+    removeItem: (key: string) => {
+      sessionData.delete(key);
+    },
+  } as Storage;
   const browser = {
     localStorage: storage,
+    sessionStorage,
     indexedDB: {
       deleteDatabase: (name: string) => {
         deleted.push(name);
@@ -74,6 +90,7 @@ function browserWith(
   return {
     browser,
     data,
+    sessionData,
     removed,
     deleted,
     replaced,
@@ -443,4 +460,54 @@ test("the owner's own first login keeps the legacy chat store to import", async 
   const b = browserWith({});
   await transitionBrowserAccount("unsloth", "/chat", () => {}, b.browser);
   assert.deepEqual(b.deleted, []);
+});
+
+test("switching accounts clears session content and keeps neutral session flags", async () => {
+  // The compare handoff carries the previous account's base model and auto-loads it on /chat.
+  const b = browserWith({ [BROWSER_ACCOUNT_KEY]: "alice" }, "success", {
+    "chat:training-compare-handoff:v1": JSON.stringify({
+      intent: "compare",
+      baseModel: "alice-private/base",
+      requestedAt: Date.now(),
+    }),
+    "unsloth.reload-snapshot.v1": "<div>alice</div>",
+    "data-recipes:open-learning-recipes": "1",
+    // USER_STOPPED_KEY: neutral, and clearing it would restart a server the user stopped.
+    unsloth_server_user_stopped: "1",
+  });
+  assert.equal(
+    await transitionBrowserAccount("bob", "/chat", () => {}, b.browser),
+    true,
+  );
+  assert.equal(b.sessionData.has("chat:training-compare-handoff:v1"), false);
+  assert.equal(b.sessionData.has("unsloth.reload-snapshot.v1"), false);
+  assert.equal(b.sessionData.has("data-recipes:open-learning-recipes"), false);
+  assert.equal(b.sessionData.get("unsloth_server_user_stopped"), "1");
+});
+
+test("the same account keeps a pending compare handoff", async () => {
+  const b = browserWith({ [BROWSER_ACCOUNT_KEY]: "alice" }, "success", {
+    "chat:training-compare-handoff:v1": "pending",
+  });
+  assert.equal(
+    await transitionBrowserAccount("ALICE", "/chat", () => {}, b.browser),
+    false,
+  );
+  assert.equal(
+    b.sessionData.get("chat:training-compare-handoff:v1"),
+    "pending",
+  );
+});
+
+test("unreadable session storage never fails a sign-in", async () => {
+  const b = browserWith({ [BROWSER_ACCOUNT_KEY]: "alice" });
+  Object.defineProperty(b.browser, "sessionStorage", {
+    get() {
+      throw new Error("blocked");
+    },
+  });
+  assert.equal(
+    await transitionBrowserAccount("bob", "/chat", () => {}, b.browser),
+    true,
+  );
 });
