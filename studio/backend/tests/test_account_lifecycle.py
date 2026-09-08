@@ -731,3 +731,35 @@ def test_recreated_account_rejects_late_tokens_from_the_deleted_identity(matrix)
     )
     assert login(client, "alice", "alice-password").status_code == 401
     assert login(client, "alice", fresh["setup_code"]).status_code == 200
+
+
+def test_logout_from_a_deleted_identity_spares_the_recreated_account(matrix):
+    client, auth, _ = matrix
+    old = storage.get_user_record("alice")
+    old_access = authentication.create_access_token("alice", secret = old["jwt_secret"])
+    replacement = {}
+
+    def delete_and_recreate_alice() -> bool:
+        # Runs between this request's authentication and the handler body.
+        storage.delete_account(old["account_id"], lambda account: None)
+        storage.create_initial_user("alice", "second-password", secrets.token_urlsafe(64))
+        fresh = storage.get_user_record("alice")
+        replacement["account_id"] = fresh["account_id"]
+        replacement["refresh"] = authentication.create_refresh_token(
+            "alice", secret = fresh["jwt_secret"]
+        )
+        return False
+
+    client.app.dependency_overrides[auth.authenticated_without_credential] = (
+        delete_and_recreate_alice
+    )
+    try:
+        response = client.post(
+            "/api/auth/logout", headers = {"Authorization": "Bearer " + old_access}
+        )
+    finally:
+        client.app.dependency_overrides.clear()
+
+    assert response.status_code == 204
+    assert replacement["account_id"] != old["account_id"]
+    assert storage.verify_refresh_token(replacement["refresh"]) == ("alice", False)

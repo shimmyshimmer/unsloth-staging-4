@@ -1495,12 +1495,22 @@ def verify_refresh_token(token: str) -> Optional[Tuple[str, bool]]:
         conn.close()
 
 
-def revoke_user_refresh_tokens(username: str) -> None:
-    """Revoke all refresh tokens for a user (e.g. on logout)."""
+def revoke_user_refresh_tokens(username: str, *, account_id: Optional[str] = None) -> None:
+    """Revoke all refresh tokens for a user (e.g. on logout).
+
+    ``account_id`` pins the username-keyed table to the immutable identity, so a
+    recreated namesake keeps its sessions."""
     conn = get_connection()
     try:
-        conn.execute("DELETE FROM refresh_tokens WHERE username = ?", (username,))
-        conn.commit()
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if account_id is not None:
+                row = conn.execute(
+                    "SELECT username FROM auth_user WHERE account_id = ?", (account_id,)
+                ).fetchone()
+                if row is None or row["username"] != username:
+                    return
+            conn.execute("DELETE FROM refresh_tokens WHERE username = ?", (username,))
     finally:
         conn.close()
 

@@ -541,7 +541,8 @@ async def logout(
 ) -> Response:
     """Revoke refresh tokens for the subject; the access token is stateless and expires on its own."""
     try:
-        storage.revoke_user_refresh_tokens(current_subject)
+        # Scoped to the immutable account: a namesake recreated mid-request keeps its sessions.
+        storage.revoke_user_refresh_tokens(current_subject, account_id = _key_account_scope())
     except Exception:
         pass
     if current_subject == storage.DEFAULT_ADMIN_USERNAME:
