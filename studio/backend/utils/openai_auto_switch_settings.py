@@ -105,6 +105,7 @@ def _cached_setting(key: str, default: Any) -> Any:
             return hit[1]
     try:
         from storage.studio_db import get_app_setting
+
         # Owner-only, install-wide setting: read from the owner's database.
         stored = run_as(OWNER, get_app_setting, key, None)
     except Exception:

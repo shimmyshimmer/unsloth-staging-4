@@ -96,6 +96,7 @@ def get_stored_custom_llama_cpp_path() -> Optional[Path]:
     try:
         from storage.studio_db import get_app_setting
         from utils.account_context import OWNER, run_as
+
         # Owner-only, install-wide binary pin: read from the owner's database.
         value = run_as(OWNER, get_app_setting, CUSTOM_LLAMA_CPP_PATH_SETTING_KEY, None)
     except Exception:

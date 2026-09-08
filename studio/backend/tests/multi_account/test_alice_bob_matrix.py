@@ -143,9 +143,9 @@ def test_inventory_contains_hidden_routes_and_no_duplicate_method_paths():
     assert ROUTES == collect_routes()
     assert len({case.key for case in ROUTES}) == len(ROUTES)
     assert "routes.rag:GET:/jobs/{job_id}/events" in {case.key for case in ROUTES}
-    assert set(FACTORIES) <= {case.key for case in OBJECT_ROUTES}, (
-        "A registered route disappeared or changed shape"
-    )
+    assert set(FACTORIES) <= {
+        case.key for case in OBJECT_ROUTES
+    }, "A registered route disappeared or changed shape"
     generated = {
         (parameter.values[0].key, parameter.values[1]) for parameter in matrix_parameters()
     }

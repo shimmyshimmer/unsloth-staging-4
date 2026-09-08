@@ -34,7 +34,14 @@ class _Proc:
 
 
 class _ImmediateThread:
-    def __init__(self, *, target, args = (), kwargs = None, **_kwargs):
+    def __init__(
+        self,
+        *,
+        target,
+        args = (),
+        kwargs = None,
+        **_kwargs,
+    ):
         self.target, self.args, self.kwargs = target, args, kwargs or {}
 
     def start(self):

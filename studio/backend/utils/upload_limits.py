@@ -59,6 +59,7 @@ def get_upload_limit_mb() -> int:
     try:
         from storage.studio_db import get_app_setting
         from utils.account_context import OWNER, run_as
+
         # Owner-only, install-wide setting: read from the owner's database.
         stored = run_as(OWNER, get_app_setting, UPLOAD_LIMIT_SETTING_KEY, None)
     except Exception:

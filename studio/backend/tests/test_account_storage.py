@@ -478,9 +478,9 @@ def test_warm_owner_connections_do_not_resolve_database_again(
     original = Path.resolve
 
     def resolve(candidate, *args, **kwargs):
-        assert candidate != path, (
-            "Warm owner connections must not repeat database realpath resolution"
-        )
+        assert (
+            candidate != path
+        ), "Warm owner connections must not repeat database realpath resolution"
         return original(candidate, *args, **kwargs)
 
     monkeypatch.setattr(Path, "resolve", resolve)
