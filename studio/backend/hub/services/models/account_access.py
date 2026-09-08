@@ -633,7 +633,7 @@ def foreign_work_active() -> bool:
     return bool(active_generations.foreign_count(current_account_id()))
 
 
-def require_download_progress_access(registry, repo_id: str) -> None:
+def require_download_progress_access(registry, repo_id: str, repo_type: str = "model") -> None:
     if not managed_account():
         return
     from hub.services import download_lifecycle
@@ -641,7 +641,7 @@ def require_download_progress_access(registry, repo_id: str) -> None:
         download_lifecycle.download_belongs_to_account(registry, ref.key)
         for ref in registry.active_job_refs(repo_id)
     ):
-        require_model_access(repo_id)
+        require_model_access(repo_id, repo_type)
 
 
 def require_media_adapters(request) -> None:

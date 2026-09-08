@@ -981,3 +981,58 @@ def test_an_account_registry_opened_during_a_delete_cannot_claim(monkeypatch):
     assert run_as(BOB, downloads._account_registry).claim(
         "org/dataset", "http", repo_type = "dataset", repo_id = "org/dataset"
     )[0]
+
+
+def test_dataset_download_progress_refuses_another_accounts_private_repo(monkeypatch):
+    from hub.services.datasets import downloads
+    from hub.services.models import account_access
+
+    monkeypatch.setattr(downloads, "_account_registries", {})
+    monkeypatch.setattr(account_access, "repo_is_public", lambda *a, **k: False)
+    monkeypatch.setattr(
+        account_access,
+        "model_grants",
+        lambda: {"dataset:org/private-set"} if current_account() == ALICE else set(),
+    )
+    scanned = []
+
+    async def progress(**kwargs):
+        scanned.append(kwargs["repo_id"])
+        return {"downloaded_bytes": 41, "cache_path": "/shared/hub/datasets--org--private-set"}
+
+    monkeypatch.setattr(downloads.snapshot_progress, "snapshot_progress_response", progress)
+    read = downloads.get_dataset_download_progress_response("org/private-set")
+    assert asyncio.run(arun_as(ALICE, read))["downloaded_bytes"] == 41
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            arun_as(BOB, downloads.get_dataset_download_progress_response("org/private-set"))
+        )
+    assert exc.value.status_code == 404
+    assert scanned == ["org/private-set"]
+
+
+def test_a_second_account_cannot_start_the_same_dataset_download(monkeypatch):
+    from hub.services.datasets import downloads
+
+    monkeypatch.setattr(downloads, "_account_registries", {})
+    monkeypatch.setattr(downloads, "_deleting", set(), raising = False)
+    monkeypatch.setattr(downloads, "resolve_cached_repo_id_case", lambda repo_id, **_k: repo_id)
+    monkeypatch.setattr(
+        downloads.download_registry, "download_transport_unavailable_reason", lambda _t: None
+    )
+    monkeypatch.setattr(downloads.download_manifest, "clear_cancel_marker", lambda *a, **k: None)
+    launched = []
+    monkeypatch.setattr(
+        downloads.download_lifecycle,
+        "launch_worker",
+        lambda registry, key, **kwargs: launched.append(key) or "running",
+    )
+
+    def start(account):
+        request = SimpleNamespace(repo_id = "Org/Data", use_xet = False, transport_mode = "http")
+        return asyncio.run(arun_as(account, downloads.download_dataset_response(request)))
+
+    assert start(ALICE)["accepted"]
+    bob = start(BOB)
+    assert not bob["accepted"] and not bob["attached"]
+    assert launched == ["org/data"]

@@ -24,6 +24,7 @@ from hub.schemas.downloads import (
 )
 from hub.services import snapshot_progress
 from hub.services import download_lifecycle
+from hub.services.models import account_access
 from hub.utils import download_manifest
 from hub.utils import download_registry
 from hub.utils import inventory_scan as hf_cache_scan
@@ -98,6 +99,18 @@ def _download_job_key(repo_id: str) -> str:
     return download_registry.normalize_repo_key(repo_id)
 
 
+def _claim_dataset_download(registry, key: str, transport: str, **kwargs) -> tuple[bool, str]:
+    """One dataset repo at a time across accounts: a second worker purges the first one's partials."""
+    repo_id = kwargs.get("repo_id") or key
+    with _account_registry_lock:
+        for other in (_registry, *_account_registries.values()):
+            if other is registry:
+                continue
+            for ref in other.active_job_refs(repo_id):
+                return False, ref.state
+        return registry.claim(key, transport, **kwargs)
+
+
 def get_dataset_snapshot_metadata_cached(
     repo_id: str, hf_token: Optional[str] = None
 ) -> tuple[int, frozenset[str]]:
@@ -167,13 +180,19 @@ async def get_dataset_download_progress_response(
     with the model path via ``snapshot_progress``. Returns ``cache_path`` for the
     UI."""
     hf_token = account_hf_token(hf_token)
+    registry = _account_registry()
+    if managed_account():
+        # The dataset cache is shared, so reading it needs the same grant as the model path.
+        await asyncio.to_thread(
+            account_access.require_download_progress_access, registry, repo_id, "dataset"
+        )
     return await snapshot_progress.snapshot_progress_response(
         repo_type = "dataset",
         repo_id = repo_id,
         job_key = _download_job_key(repo_id),
         expected_bytes = expected_bytes,
         hf_token = hf_token,
-        registry = _account_registry(),
+        registry = registry,
         metadata_resolver = get_dataset_snapshot_metadata_cached,
     )
 
@@ -228,7 +247,9 @@ async def download_dataset_response(
     cache_paths = get_hf_cache_paths()
     cache_env = cache_paths.child_env({})
 
-    claimed, claim_state = _account_registry().claim(
+    registry = _account_registry()
+    claimed, claim_state = _claim_dataset_download(
+        registry,
         key,
         transport,
         repo_type = "dataset",
@@ -236,11 +257,11 @@ async def download_dataset_response(
         hub_cache = str(cache_paths.hub_cache),
         xet_cache = str(cache_paths.xet_cache),
     )
-    generation = _account_registry().current_generation(key)
+    generation = registry.current_generation(key)
     if not claimed:
         # Both come from adoptable: an in-progress delete leaves no job, and only an in-flight job of this
         # repo attached to anything.
-        adoptable = _account_registry().adoptable(key)
+        adoptable = registry.adoptable(key)
         return {
             "repo_id": repo_id,
             "state": claim_state,
@@ -249,10 +270,10 @@ async def download_dataset_response(
             "generation": generation,
             # An adopted job keeps the transport it started on, so report it rather than let the caller assume
             # the one it asked for.
-            "transport": _account_registry().job_transport(key),
+            "transport": registry.job_transport(key),
             # And its cancel marker: a run that fell back from Xet to HTTP still cancels into a restart-only
             # partial.
-            "cancel_transport": _account_registry().job_cancel_transport(key),
+            "cancel_transport": registry.job_cancel_transport(key),
         }
     download_manifest.clear_cancel_marker(
         "dataset",
@@ -262,7 +283,7 @@ async def download_dataset_response(
     )
 
     state = download_lifecycle.launch_worker(
-        _account_registry(),
+        registry,
         key,
         spawn = lambda: download_lifecycle.spawn_worker(
             ["--repo-id", repo_id, "--dataset"],
