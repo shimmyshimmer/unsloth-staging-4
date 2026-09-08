@@ -84,11 +84,17 @@ def test_owner_recipe_mcp_is_unchanged():
 
 
 def test_single_account_installs_keep_recipe_mcp(monkeypatch):
+    """A single-account install only ever runs as the owner. Deactivating the last managed
+    account drops the active count back to one, and a request already bound to that account
+    keeps the refusal for its whole life."""
     from core.data_recipe.service import build_mcp_providers
 
     monkeypatch.setattr(policy, "installation_is_multi_user", lambda: False)
-    built = run_as(ALICE, build_mcp_providers, _recipe(_PRIVATE_ENDPOINTS[0]))
+    built = run_as(OWNER, build_mcp_providers, _recipe(_PRIVATE_ENDPOINTS[0]))
     assert [provider.endpoint for provider in built] == [_PRIVATE_ENDPOINTS[0]]
+    with pytest.raises(HTTPException) as refused:
+        run_as(ALICE, build_mcp_providers, _recipe(_PRIVATE_ENDPOINTS[0]))
+    assert refused.value.status_code == 403
 
 
 def test_managed_recipe_stdio_provider_is_still_dropped(monkeypatch):

@@ -248,9 +248,7 @@ def set_keyless_api_access(value: Any, *, tools: Any = None) -> tuple[str, bool]
     """Persist which routes are served without a key, and whether tools come with them."""
     global _cached_settings, _settings_generation, _settings_write_inflight
     if not is_owner_context():
-        from auth import policy
-        if policy.installation_is_multi_user():
-            raise ValueError("Only the installation owner can change keyless API access.")
+        raise ValueError("Only the installation owner can change keyless API access.")
     scope = _coerce_scope(value)
     if scope is None:
         raise ValueError(f"Keyless API access scope must be one of: {', '.join(KEYLESS_SCOPES)}.")

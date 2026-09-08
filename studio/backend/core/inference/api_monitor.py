@@ -1054,6 +1054,5 @@ def _lifecycle_row_visible_to_caller(entry: "ApiMonitorEntry", subject: str) -> 
 
     if is_owner_context():
         return True
-    from auth.policy import installation_is_multi_user
-
-    return not installation_is_multi_user()
+    # Role, not live counts: the row stays private after a deactivation.
+    return False

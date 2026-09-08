@@ -459,7 +459,11 @@ def test_owner_setting_keeps_200_and_single_account_policy_is_inert(client, monk
     response = client.get("/settings/llama-cpp-path", headers = {"x-test-account": "unsloth"})
     assert response.status_code == 200, response.text
     monkeypatch.setattr(policy, "installation_is_multi_user", lambda: False)
-    assert client.get("/settings/llama-cpp-path").status_code == 200
+    # A single-account install only ever runs as the owner; deactivating the last managed
+    # account must not open an owner-only setting to a request still bound to it.
+    owner = client.get("/settings/llama-cpp-path", headers = {"x-test-account": "unsloth"})
+    assert owner.status_code == 200
+    assert client.get("/settings/llama-cpp-path").status_code == 403
 
 
 def test_managed_last_model_key_survives_username_rename(client):

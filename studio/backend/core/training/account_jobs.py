@@ -39,7 +39,8 @@ def _has_managed_accounts() -> bool:
 
 
 def managed_account() -> bool:
-    return not current_account().is_owner and _multi_user()
+    # Role, not live counts: a deactivation must not unwrap a bound request.
+    return not current_account().is_owner
 
 
 def account_key(value: str):
@@ -322,7 +323,7 @@ def account_process_spec(module: str, target: str, env: dict, kwargs: dict):
     """Keep the legacy single-account spawn exactly; carry identity in multi mode."""
     if account_is_retired():
         raise HTTPException(status_code = 403, detail = "Account is retired")
-    if not _multi_user():
+    if not managed_account():
         return (module, target, env), kwargs
     return ("core.training.account_jobs", "run_account_child", env), {
         **kwargs,

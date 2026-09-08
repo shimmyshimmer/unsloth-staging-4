@@ -187,13 +187,13 @@ from utils.media_generation_preset_settings import (
 
 
 async def _require_installation_owner(current_subject: str = Depends(get_current_subject)) -> None:
-    if policy.installation_is_multi_user():
-        await policy.require_owner()
+    # Role, not live counts: a managed account stays refused after a deactivation.
+    await policy.require_owner()
 
 
 async def _shared_policy_read(current_subject: str = Depends(get_current_subject)):
     marker = None
-    if policy.installation_is_multi_user() and not current_account().is_owner:
+    if not current_account().is_owner:
         marker = bind_account(OWNER)
     try:
         yield

@@ -54,10 +54,8 @@ _account_oauth_token_stores: dict[str, Any] = {}
 
 
 def _managed_mcp_restricted() -> bool:
-    if is_owner_context():
-        return False
-    from auth.policy import installation_is_multi_user
-    return installation_is_multi_user()
+    # Role, not live counts: a deactivation must not reopen the network.
+    return not is_owner_context()
 
 
 def _account_key(value):

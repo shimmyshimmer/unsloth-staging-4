@@ -175,11 +175,13 @@ def test_monitor_hides_a_foreign_load_row_from_managed_accounts():
     assert run_as(ALICE, monitor._visible, entry, "alice")
     assert run_as(OWNER, monitor._visible, entry, "unsloth")
     assert not run_as(BOB, monitor._visible, entry, "bob")
-    # Single-account installs are unchanged.
+    # A single-account install only ever runs as the owner, and a request bound to a managed
+    # account stays refused after deactivation drops the active count back to one.
     monkeypatch_single = policy.installation_is_multi_user
     policy.installation_is_multi_user = lambda: False
     try:
-        assert run_as(BOB, monitor._visible, entry, "bob")
+        assert run_as(OWNER, monitor._visible, entry, "unsloth")
+        assert not run_as(BOB, monitor._visible, entry, "bob")
     finally:
         policy.installation_is_multi_user = monkeypatch_single
 

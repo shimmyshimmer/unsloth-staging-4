@@ -7804,9 +7804,7 @@ def _project_workdir_for(session_id: "str | None") -> "str | None":
 def _get_project_workdir(session_id: str) -> str | None:
     # Host project paths are single-user only; managed accounts use their sandbox.
     if not is_owner_context():
-        from auth.policy import installation_is_multi_user
-        if installation_is_multi_user():
-            return None
+        return None
     if not session_id.startswith(_PROJECT_SESSION_PREFIX):
         return None
     project_id = session_id[len(_PROJECT_SESSION_PREFIX) :]

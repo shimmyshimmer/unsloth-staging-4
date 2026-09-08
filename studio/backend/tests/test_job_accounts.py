@@ -347,6 +347,45 @@ def test_deactivating_the_last_managed_account_keeps_its_job_private(training, m
     assert proc.is_alive()
 
 
+def test_deactivating_the_last_managed_account_keeps_an_in_flight_start_contained(monkeypatch):
+    """An async start authenticated as alice can still be validating and spawning when the
+    owner deactivates her. The active count drops back to one, but the request is a managed
+    one for its whole life: containment and the wrapped child must both stay on."""
+    monkeypatch.setattr(policy, "installation_is_multi_user", lambda: False)
+    monkeypatch.setattr(policy, "installation_has_managed_accounts", lambda: True)
+
+    assert run_as(ALICE, jobs.managed_account) is True
+    with pytest.raises(HTTPException) as exc:
+        run_as(ALICE, jobs.validate_job_paths, {"output_dir": "/owner/private/outputs"})
+    assert exc.value.status_code == 403
+    assert run_as(ALICE, jobs.account_hf_token, "") is False
+
+    args, kwargs = run_as(
+        ALICE,
+        jobs.account_process_spec,
+        "core.training.worker",
+        "run_training_process",
+        {},
+        {"config": {"model_name": "org/model"}},
+    )
+    assert args[0:2] == ("core.training.account_jobs", "run_account_child")
+    assert kwargs["account"] == ALICE
+    assert kwargs["job_module"] == "core.training.worker"
+    assert kwargs["job_target"] == "run_training_process"
+
+
+def test_an_owner_request_keeps_the_legacy_spawn_and_paths(monkeypatch):
+    monkeypatch.setattr(policy, "installation_has_managed_accounts", lambda: True)
+
+    assert jobs.managed_account() is False
+    run_as(OWNER, jobs.validate_job_paths, {"output_dir": "/arbitrary/outputs"})
+    args, kwargs = run_as(
+        OWNER, jobs.account_process_spec, "core.training.worker", "run_training_process", {}, {}
+    )
+    assert args[0:2] == ("core.training.worker", "run_training_process")
+    assert "account" not in kwargs
+
+
 def test_reactivation_clears_the_retirement_left_by_a_failed_delete(monkeypatch):
     """A delete that fails after retiring the jobs leaves the row disabled and the id
     tombstoned in this process. Reactivating has to lift it, or the account can log in
