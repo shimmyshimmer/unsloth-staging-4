@@ -169,10 +169,10 @@ def foreign_count(account_id: str) -> int:
 def cancel_all(account_id: Optional[str] = None) -> int:
     """Signal in-flight generations to stop; returns how many were signalled.
 
-    ``account_id`` limits the cancel to one account, which every request-driven
-    caller must pass so a forced reload never stops another user's chats; None is
-    everyone, for shutdown only. Only sets the events: each entry is removed by its
-    own __exit__, so one mid-cleanup is neither lost nor double counted.
+    ``account_id`` limits the cancel to one account and every request-driven caller must
+    pass it, so a forced reload never stops another user's chats; None is everyone, for
+    shutdown only. Only sets events: each entry is removed by its own __exit__, so one
+    mid-cleanup is neither lost nor double counted.
     """
     with _LOCK:
         events = [

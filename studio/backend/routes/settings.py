@@ -10,9 +10,9 @@ process limits, shared downloads and caches, executables, memory/VRAM policy, sh
 signing secrets, listeners and tunnels, keyless API access, and logs (which span all accounts).
 
 Groups carry their dependencies on subrouters; the shared read group binds the owner for the
-read and restores the authenticated account afterwards. Single-account installs keep the
-existing handlers and stored keys. Update checks, whisper/sd executable selection and cache
-cleanup live in other route modules, which must apply the same owner policy.
+read and restores the authenticated account afterwards. Single-account installs are unchanged.
+Update checks, whisper/sd executable selection and cache cleanup live in other route modules,
+which must apply the same owner policy.
 """
 
 import functools

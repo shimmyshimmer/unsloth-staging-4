@@ -137,7 +137,7 @@ def raise_if_other_accounts_active(account_id: Optional[str] = None) -> None:
     """Guard a destructive reload or teardown in a multi-account install.
 
     Call under the lifecycle gate before touching any backend, including replacements
-    within CHAT or DIFFUSION where the modality owner does not change.
+    within one modality where the owner does not change.
     """
     from utils.account_context import current_account_id
 
@@ -179,12 +179,12 @@ def acquire_for(
 ) -> Any:
     """Make ``owner`` the sole GPU owner, evicting the other if it holds it.
 
-    ``register`` runs under the arbiter lock right after ownership transfers and its return
-    value is returned; marking the in-flight load here rather than after this call closes the
-    window where a competing acquire evicts this owner and both loaders allocate VRAM at once.
-    It must be quick and not re-enter the arbiter; if it raises, ownership stays with ``owner``.
-    ``register`` or ``replacing`` marks a real load; a plain ownership reassertion sets neither,
-    so accounts share the llama slots.
+    ``register`` runs under the arbiter lock right after ownership transfers and its value is
+    returned; marking the in-flight load here rather than after this call closes the window
+    where a competing acquire evicts this owner and both loaders allocate VRAM at once. It
+    must be quick and must not re-enter the arbiter; if it raises, ownership stays with
+    ``owner``. ``register`` or ``replacing`` marks a real load; a plain reassertion sets
+    neither, so accounts share the llama slots.
     """
     global _owner, _owner_epoch, _owner_account, _prior_account
     if owner not in _EVICTORS:
@@ -206,10 +206,9 @@ def acquire_for(
                 raise GpuBusyForAnotherAccountError(_owner, busy)
             logger.info("gpu_arbiter: evicting %s for %s", _owner, owner)
             _EVICTORS[_owner]()
-        # ``_owner_account`` records who LOADED the resident model, so a plain reassertion
-        # must not rewrite it: the already-loaded fast paths in routes/inference.py re-assert
-        # CHAT without register/``replacing``, and overwriting handed the model to whoever
-        # asked last, hiding it from the account that loaded it.
+        # ``_owner_account`` records who LOADED the resident model. The already-loaded fast
+        # paths re-assert CHAT with no register/``replacing``; rewriting it there handed the
+        # model to whoever asked last, hiding it from the loader.
         claims = _owner != owner or register is not None or replacing
         _owner = owner
         _owner_epoch += 1

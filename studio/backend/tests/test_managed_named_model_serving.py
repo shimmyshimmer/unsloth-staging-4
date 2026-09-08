@@ -4,10 +4,9 @@
 """A managed account that names a model is never served by another account's
 resident model under that name.
 
-With auto-switch off (or an unknown name) the OpenAI routes fall through to
-whatever is resident. For the owner that is the drop-in behaviour; for a managed
-account it would run its prompt through a model it cannot even see on the
-status routes. The switch helper therefore refuses at its exit unless the
+With auto-switch off (or an unknown name) the OpenAI routes fall through to whatever is
+resident. For the owner that is the drop-in behaviour; a managed account would run its
+prompt through a model it cannot even see. The switch helper therefore refuses unless the
 resident model is the caller's own or answers to the requested name.
 """
 

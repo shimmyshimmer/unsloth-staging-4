@@ -3,14 +3,14 @@
 
 """The whole account-policy table, in one place.
 
-Two predicates ride on the same counts and they deliberately disagree. ``login_mode`` and
-``installation_is_multi_user`` follow the number of ACTIVE accounts, so a deactivated one
-keeps the single login form. ``installation_has_managed_accounts`` and the full-access gate
-follow whether any managed account exists at all, active or not, because its files are still
-on disk. The unreadable-database fallback splits them on purpose: one login form, closed host.
+Two predicates ride on the same counts and deliberately disagree. ``login_mode`` and
+``installation_is_multi_user`` follow the ACTIVE count, so a deactivated account keeps the
+single login form. ``installation_has_managed_accounts`` and the full-access gate follow
+whether any managed account exists at all, because its files are still on disk. The
+unreadable-database fallback splits them on purpose: one login form, closed host.
 
-Five independent attempts at collapsing these predicates broke exactly this table, so the
-four states are asserted together rather than one per test.
+Collapsing these predicates breaks exactly this table, so the four states are asserted
+together rather than one per test.
 """
 
 import secrets

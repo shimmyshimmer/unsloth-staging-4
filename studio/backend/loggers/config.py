@@ -491,10 +491,10 @@ _STDOUT_LOCK = threading.Lock()
 class _CurrentStdoutLogger:
     """A structlog logger that resolves ``sys.stdout`` per record.
 
-    ``cache_logger_on_first_use`` plus ``PrintLogger``'s build-time stream binding
-    would pin a module's output forever to whatever stdout was on its first line,
-    losing later records once a tee, redirect or test capture replaces it. One lock
-    and one write per record keeps a record adjacent to its echoed traceback.
+    ``cache_logger_on_first_use`` plus ``PrintLogger``'s build-time stream binding pins a
+    module's output to whatever stdout was on its first line, losing later records once a
+    tee, redirect or test capture replaces it. One lock and one write per record keeps a
+    record adjacent to its echoed traceback.
     """
 
     def msg(self, message: str) -> None:

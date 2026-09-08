@@ -49,10 +49,9 @@ router = APIRouter()
 def _account_id_of(username: str) -> "str | None":
     """Immutable id of ``username``'s account, for clients that key state on it.
 
-    The owner's id is fixed: its username is reserved (``auth/storage.py``) and there is
-    no rename path, so the lookup is skipped. Managed usernames can be renamed or reused,
-    so state keyed on the name alone would hand a recreated account its predecessor's
-    data; resolve their immutable id from storage. None if the managed row is gone.
+    The owner's id is fixed (its name is reserved and cannot be renamed), so that lookup is
+    skipped. Managed names can be reused, and state keyed on the name alone would hand a
+    recreated account its predecessor's data. None if the managed row is gone.
     """
     if username == storage.DEFAULT_ADMIN_USERNAME:
         return OWNER_ACCOUNT_ID
@@ -462,9 +461,9 @@ def _login_failure_detail() -> str:
     """Recovery hint for a rejected login.
 
     ``reset-password`` refuses without a target once more than one account is active, so the
-    single-user wording would print a command that exits 1 on exactly the installs that need it.
-    The name is a placeholder, never the submitted one: that text is attacker-controlled and ends
-    up in a command the reader is invited to run.
+    single-user wording would print a command that exits 1 on exactly the installs that need
+    it. The name is a placeholder, never the submitted one, which is attacker-controlled and
+    ends up in a command the reader is invited to run.
     """
     if policy.installation_is_multi_user():
         return (

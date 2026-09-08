@@ -7,10 +7,9 @@ A preview ref is a guessable outputs-root path, so access is gated on a token
 signing the canonical ref with a server-side secret; rotating that secret
 (``auth.storage.rotate_preview_link_secret``) revokes every link at once.
 
-Tokens are also bound to the minting account. Owner tokens keep the original
-shape so existing links still work; a managed account's token carries its
-account id ahead of the signature and the signature covers it, so identically
-named runs in two accounts get different tokens and neither opens the other's.
+Tokens are bound to the minting account. Owner tokens keep the original shape so existing
+links still work; a managed token carries its account id ahead of a signature that covers
+it, so identically named runs in two accounts never open each other's.
 """
 
 from __future__ import annotations

@@ -66,9 +66,9 @@ def test_api_key_is_bound_from_the_row_it_was_validated_against(auth_db):
 def test_api_key_of_a_replaced_username_never_binds_the_replacement(auth_db, monkeypatch):
     """The auth dependency resolves identity from the validated row alone.
 
-    The old key was revoked with the account, so it no longer validates. To show
-    that no second lookup by username exists, the validation is pinned to the
-    old account's row while the name already belongs to the new account.
+    The old key was revoked with the account, so it no longer validates. To show there is
+    no second lookup by username, validation is pinned to the old account's row while the
+    name already belongs to the new one.
     """
     old = _managed("alice")
     raw = storage.create_api_key("alice", name = "cli")[0]
@@ -166,7 +166,7 @@ def test_the_owner_login_id_needs_no_account_lookup(auth_db, monkeypatch):
 def test_a_token_that_fails_to_verify_binds_nothing(auth_db):
     """The identity came from an unverified ``sub`` claim, so publishing it into the request
     ContextVar before the signature check bound an account the caller never proved. Read
-    inside the dependency's own context, which is where the binding would be visible."""
+    inside the dependency's own context, where that binding would be visible."""
     alice = _managed("alice")
     forged = jwt.encode({"sub": alice["username"]}, secrets.token_urlsafe(48), algorithm = "HS256")
 

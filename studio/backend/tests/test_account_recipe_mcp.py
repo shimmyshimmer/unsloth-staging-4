@@ -3,10 +3,9 @@
 
 """A managed account's recipe MCP providers obey the chat MCP network boundary.
 
-Chat validates every resolved MCP address and pins the connection to it, so a
-managed account cannot reach loopback or the LAN. The Data Designer engine opens
-its own connections, so a recipe provider used to be built from an endpoint chat
-refuses outright.
+Chat validates every resolved MCP address and pins the connection to it, so a managed
+account cannot reach loopback or the LAN. The Data Designer engine opens its own
+connections, so a recipe provider used to be built from an endpoint chat refuses.
 """
 
 from __future__ import annotations

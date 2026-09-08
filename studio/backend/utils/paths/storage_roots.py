@@ -95,11 +95,10 @@ def studio_bin_root() -> Path:
 def account_path(relative: str) -> Path:
     """``workspace_root() / relative`` for the acting account.
 
-    The owner gets the plain join, exactly as before. For a managed account the
-    entry must really live inside its own workspace: one of its directories
-    replaced by a link to another account's tree would otherwise carry every
-    reader and writer of that directory into the other account. Checked here,
-    once per resolution, rather than in each of the callers.
+    The owner gets the plain join, as before. For a managed account the entry must really
+    live inside its own workspace: a directory replaced by a link into another account's
+    tree would otherwise carry every reader and writer there. Checked once per resolution
+    here rather than in each caller.
     """
     path = workspace_root() / relative
     if not is_owner_context() and not within_account(path):

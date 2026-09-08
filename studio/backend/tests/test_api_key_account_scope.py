@@ -3,10 +3,9 @@
 
 """A managed account's API keys are addressed by its immutable id.
 
-A request that authenticated before its account was deleted and the name
-created again still carries the old account. Listing or revoking under that
-request must not reach the namesake's keys. The owner's keys keep the plain
-username query.
+A request that authenticated before its account was deleted and the name recreated still
+carries the old account, so listing or revoking under it must not reach the namesake's
+keys. The owner's keys keep the plain username query.
 """
 
 import secrets

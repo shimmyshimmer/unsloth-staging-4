@@ -3,12 +3,12 @@
 
 """The media resolver index is one account's answer, not whoever warmed it first.
 
-Its scan reads ``collect_local_models``, which reads the acting account's own scan folder
+Its scan reads ``collect_local_models`` against the acting account's own scan-folder
 database, so a cache keyed only by task hands the next account the previous one's picks for
-the whole TTL: its own models are missing and a "not found" error lists the other account's.
+the whole TTL: its own models are missing and a "not found" error lists the other's.
 
-Only the task classifier is faked here. The scan, the per-account ``studio.db`` and the
-account binding are the real ones, since the per-account read is the whole point.
+Only the task classifier is faked; the scan, the per-account ``studio.db`` and the account
+binding are real, since the per-account read is the whole point.
 """
 
 from __future__ import annotations

@@ -241,9 +241,9 @@ def seed_account(account) -> dict[str, str]:
 def seed_retirable_account(account) -> dict[str, str]:
     """A managed account of its own, created and populated through the product's own paths.
 
-    Deletion retires the target's private root by renaming it, which is a real owner success
-    the matrix cannot express against alice: its unchanged-workspace assertion runs for the
-    owner actor too, and a moved root reads as erased. Verified, see the report.
+    Deletion retires the target's private root by renaming it, a real owner success the
+    matrix cannot express against alice: its unchanged-workspace assertion also runs for the
+    owner actor, and a moved root reads as erased.
     """
     from auth import storage
     from storage import studio_db

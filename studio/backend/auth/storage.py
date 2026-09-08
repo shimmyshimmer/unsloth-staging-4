@@ -229,10 +229,9 @@ def credential_generation(jwt_secret: str) -> str:
     return hashlib.sha256(jwt_secret.encode("utf-8")).hexdigest()
 
 
-# The downgrade fence: a managed account's real credentials live in the
-# ``account_*`` columns, and its legacy columns and hash prefixes can never
-# verify, so a build without account support 401s a managed login instead of
-# serving the owner's data. The owner's rows are byte for byte unchanged.
+# The downgrade fence: a managed account's real credentials live in the ``account_*``
+# columns and its hashes carry a prefix, so a build without account support 401s a
+# managed login instead of serving the owner's data. Owner rows are untouched.
 _FENCE_PREFIX = "account:"
 _FENCED_HASH_SQL = "IN (?, ?)"
 _LEGACY_PASSWORD_HASH_SENTINEL = "managed-account"
@@ -381,8 +380,8 @@ def get_connection() -> sqlite3.Connection:
 _api_key_pbkdf2_salt_cache: Optional[bytes] = None
 
 
-# Storage keys on the immutable ``account_id``, never the username, which can be
-# renamed or reused. The seeded owner keeps the fixed id ``owner``.
+# Keyed on the immutable ``account_id``, never a renameable username. The seeded
+# owner keeps the fixed id ``owner``.
 _ACCOUNT_COLUMNS = (
     ("account_id", "TEXT"),
     ("role", "TEXT NOT NULL DEFAULT 'user'"),
@@ -403,10 +402,9 @@ _owner_id_repaired: set[str] = set()
 def _repair_owner_account_id(conn: sqlite3.Connection) -> None:
     """Give the owner back an identity when the columns exist but its row has none.
 
-    Reachable by a crash inside this build's first bootstrap followed by an older build
-    seeding the owner, which writes no ``account_id``. The backfill below no longer runs
-    for that database, and every authenticated request fails without an id. Once per
-    process per database, so a warm connection issues nothing.
+    Reachable when a crash in this build's first bootstrap is followed by an older build
+    seeding the owner: the backfill below no longer runs, and every request 500s without
+    an id. Once per process per database, so a warm connection issues nothing.
     """
     db_key = str(DB_PATH)
     if db_key in _owner_id_repaired:
@@ -436,8 +434,8 @@ def _ensure_account_columns(conn: sqlite3.Connection, existing: set) -> None:
     if all(name in existing for name, _decl in _ACCOUNT_COLUMNS):
         _repair_owner_account_id(conn)
         return
-    # Two connections can both see the columns missing, so take the write lock and
-    # re-read; an ALTER that still loses is the other side's, not an error.
+    # Two connections can both see the columns missing: take the write lock and re-read;
+    # an ALTER that still loses is the other side's, not an error.
     conn.execute("BEGIN IMMEDIATE")
     try:
         existing = {row[1] for row in conn.execute("PRAGMA table_info(auth_user)")}
@@ -469,14 +467,13 @@ _account_keys_synced: set[str] = set()
 
 
 def _ensure_account_api_keys(conn: sqlite3.Connection, existing: set) -> None:
-    """Pin managed API keys to the immutable ``account_id``, and mirror them into
+    """Pin managed API keys to the immutable ``account_id`` and mirror them into
     ``account_api_keys``.
 
-    The key table names its account by username, which can be deleted and recreated,
-    so listing and revoking scope on the id instead; the owner's rows keep NULL. The
-    mirror table is one an older build never empties on a password reset, so managed
-    keys missing at the next start are restored from it. Idempotent, once per process
-    per database.
+    The key table names its account by a username that can be recreated, so listing and
+    revoking scope on the id instead; owner rows keep NULL. An older build never empties
+    the mirror on a password reset, so keys missing at the next start are restored from
+    it. Idempotent, once per process per database.
     """
     db_key = str(DB_PATH)
     if db_key in _account_keys_synced and "account_id" in existing:
@@ -578,8 +575,8 @@ def _fence_managed_credentials(conn: sqlite3.Connection) -> None:
 
 
 def get_user_record(username: str) -> Optional[dict]:
-    """Everything the auth dependency needs about a login, in one query: the
-    credential columns plus the account identity that the request binds to."""
+    """One query for what the auth dependency needs: credential columns plus the
+    account identity the request binds to."""
     conn = get_connection()
     try:
         row = conn.execute(
@@ -762,8 +759,8 @@ def authenticate_account_login(
 ) -> Optional[Tuple[str, str, str, bool]]:
     """Managed login: consume a setup code once, retaining its password hash for setup.
 
-    A consumed code cannot log in again: must_change_password without a pending
-    code admits only the already-issued session's change-password request.
+    A consumed code cannot log in again: must_change_password with no pending code
+    admits only the already-issued session's change-password request.
     """
     from auth.hashing import verify_password
 
@@ -877,8 +874,8 @@ def delete_account(account_id: str, retire) -> None:
             retire(AccountContext(row["account_id"], row["username"], row["role"]))
             conn.execute("DELETE FROM auth_user WHERE account_id = ?", (account_id,))
     except OSError:
-        # Another owner request can reactivate between the initial revocation
-        # and this write lock. A failed rename must still leave login disabled.
+        # An owner request can reactivate between the revocation and this write lock;
+        # a failed rename must still leave login disabled.
         set_account_active(account_id, False)
         raise
     finally:
@@ -1708,8 +1705,7 @@ def _revoke_key_copy(conn: sqlite3.Connection, key_id: int) -> None:
 
 
 def _key_scope(username: str, account_id: Optional[str]) -> Tuple[str, tuple]:
-    """WHERE clause selecting one account's keys: by name for the owner, by
-    immutable id as well for a managed account."""
+    """Select one account's keys: by name for the owner, also by immutable id if managed."""
     if account_id is None:
         return "username = ?", (username,)
     return "username = ? AND account_id = ?", (username, account_id)
@@ -1842,14 +1838,13 @@ def validate_api_key_with_credential(
 def validate_api_key_account(raw_key: str, *, touch: bool = True) -> Optional[Tuple[dict, str]]:
     """Validate *raw_key* and return ``(account record, jwt_secret)``, or ``None``.
 
-    The record is read in the statement that matched the key, so the request binds to
-    that identity rather than a second lookup by a username that may be recreated
-    meanwhile. The join carries the id too, so a key row that outlived its account is
-    not resolved by a namesake; only the owner's rows are allowed to carry no id. A
-    deactivated account does not validate.
+    The record comes from the statement that matched the key, so no second lookup by a
+    recreated username can bind. The join carries the id, so a key row that outlived its
+    account is not resolved by a namesake; only owner rows may carry none. A deactivated
+    account does not validate.
 
-    The key check and the credential read share one write transaction, so a reset
-    committing right after cannot hand its new generation to this request.
+    Key check and credential read share one write transaction, so a reset committing
+    right after cannot hand its new generation to this request.
 
     ``touch=False`` drops the ``last_used_at`` stamp and its write transaction for an
     advisory check, which must not count as a use or take sqlite's global write lock.

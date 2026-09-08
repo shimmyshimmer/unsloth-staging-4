@@ -3,12 +3,11 @@
 
 """A build without account support cannot authenticate a managed account.
 
-Downgrading an install that has managed accounts must not hand those accounts
-the owner's data. The older build reads the legacy credential columns and looks
-hashes up by their plain digest; a managed account's real credentials live in
-columns it never reads and its hashes carry a prefix it never computes, so every
-one of its credentials gets 401 there. The owner's row is unchanged, and this
-build reads the real values, so an upgrade brings the accounts straight back.
+An older build reads the legacy credential columns and looks hashes up by their plain
+digest. A managed account's real credentials live in columns it never reads, behind a
+hash prefix it never computes, so every one of its credentials gets 401 there. The
+owner's row is unchanged and this build reads the real values, so an upgrade restores
+the accounts.
 """
 
 import secrets

@@ -44,9 +44,8 @@ export type AccountTransitionBrowser = Pick<
 >;
 
 /**
- * Who the browser now belongs to. Usernames can be renamed and recreated, so the immutable
- * `accountId` decides whether this browser's data carries over; it is absent only against a
- * server too old to send it.
+ * Who the browser now belongs to. Usernames can be recreated, so the immutable `accountId`
+ * decides whether this browser's data carries over; absent only on an older server.
  */
 export type BrowserAccount = { username: string; accountId?: string | null };
 
@@ -58,8 +57,8 @@ export function normalizeAccountUsername(username: string): string {
 }
 
 /**
- * The value stored under {@link BROWSER_ACCOUNT_KEY}: `account:<id>:<username>` once the server
- * supplies an id, else the bare normalized username, so markers from either build stay comparable.
+ * Stored under {@link BROWSER_ACCOUNT_KEY}: `account:<id>:<username>` when the server supplies
+ * an id, else the bare normalized username, so markers from either build stay comparable.
  */
 export function browserAccountMarker(account: BrowserAccount | string): string {
   const identity: BrowserAccount =
@@ -89,8 +88,8 @@ function parseAccountMarker(marker: string): MarkedAccount {
 }
 
 /**
- * Whether the browser's data may carry over. Ids decide it when both sides have one; falling back
- * to the reusable username cannot tell a recreated account apart.
+ * Whether the browser's data may carry over. Ids decide when both sides have one; the username
+ * fallback cannot tell a recreated account apart.
  */
 function isSameAccount(previous: MarkedAccount, next: MarkedAccount): boolean {
   if (previous.accountId && next.accountId)
@@ -139,9 +138,9 @@ function deleteAccountDatabase(
 }
 
 /**
- * Run before publishing new tokens; an absent marker means the historical owner browser. The marker
- * is published last so other tabs reload only once the new session is ready. Returns true when a
- * document navigation replaces every hydrated store.
+ * Run before publishing new tokens; an absent marker means the historical owner browser. The
+ * marker is published last so other tabs reload only once the new session is ready. Returns
+ * true when a document navigation replaces every hydrated store.
  */
 export async function transitionBrowserAccount(
   account: BrowserAccount | string,

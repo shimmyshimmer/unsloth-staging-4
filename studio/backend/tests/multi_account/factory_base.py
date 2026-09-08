@@ -4,10 +4,9 @@
 """Shared factory vocabulary for the route isolation matrix.
 
 A factory names a seeder that creates the resource inside the acting account and returns the
-path parameters the route needs. Actor expectations default to the isolation contract: the
-owner and the other account get 404, the resource's account gets the success code, an
-unauthenticated caller gets 401/403 and a deactivated account gets 401. Any route whose real
-contract differs states the deviation together with a one-line reason.
+route's path parameters. Actor expectations default to the isolation contract: owner and other
+account 404, the resource's account the success code, unauthenticated 401/403, deactivated 401.
+A route whose real contract differs states the deviation with a one-line reason.
 """
 
 from __future__ import annotations

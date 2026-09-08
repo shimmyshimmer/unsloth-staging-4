@@ -233,9 +233,9 @@ def owned_job(*, continuation: bool = False):
     """Reserve ownership across validation/spawn and retain it while work is live.
 
     Finished results keep their account tag separately, so releasing the reservation never
-    makes an old model, log or metric public. Skipped on installs that never had a managed
-    account, not merely single-user ones: after deactivating the last account, its tag is
-    still on the service, so an owner job would inherit that attribution.
+    makes an old model, log or metric public. Skipped only on installs that never had a
+    managed account: after the last one is deactivated its tag is still on the service, so
+    an owner job would inherit that attribution.
     """
 
     def decorate(fn):

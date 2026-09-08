@@ -5,18 +5,17 @@
 
 The sandbox in ``tools.py`` does not stop a child from opening another account's
 root or the install root, which holds the owner's data and the auth database, so
-for a managed account only every sandboxed child is also confined:
+a managed account's sandboxed children are also confined:
 
 * Linux: a Landlock ruleset (kernel 5.13+, no privileges) applied in the forked
   child, inherited by every descendant and impossible to lift. System paths stay
-  readable and executable, the account's own roots are writable, everything else
-  does not exist for the child.
+  readable, the account's own roots writable, everything else invisible.
 * macOS: ``sandbox-exec`` with an equivalent profile wrapping the command.
-* Anywhere else: refused rather than run unconfined, unless the owner sets
+* Anywhere else: refused, unless the owner sets
   ``UNSLOTH_STUDIO_ALLOW_UNCONFINED_TOOLS=1``.
 
 ``account_confinement`` returns ``None`` for the owner, so a single-account
-install spawns its tools exactly as before.
+install spawns tools exactly as before.
 """
 
 from __future__ import annotations
@@ -79,8 +78,7 @@ class ToolConfinementUnavailable(RuntimeError):
 
 @dataclass(frozen = True)
 class Confinement:
-    """How a managed account's child is confined: ``preexec`` runs in the forked
-    child (Linux), ``wrap`` rewrites the argv (macOS), ``mechanism`` names which."""
+    """``preexec`` runs in the forked child (Linux), ``wrap`` rewrites the argv (macOS)."""
 
     mechanism: str
     preexec: Optional[Callable[[], None]] = None
@@ -143,15 +141,14 @@ def _ensure_dirs(paths) -> list[str]:
 
 
 def _readable_account_roots() -> list[str]:
-    """The account's workspace, readable but never writable: its database and its
-    recorded grants live here, and a tool could otherwise grant itself access."""
+    """The account's workspace, readable but never writable: a tool could otherwise
+    rewrite the database of grants that authorizes it."""
     from utils.paths.storage_roots import workspace_root
     return _ensure_dirs((workspace_root(),))
 
 
 def _writable_roots() -> list[str]:
-    """Where a tool may write: its account-resolved sandbox, temporary root and
-    project workspaces."""
+    """Where a tool may write: account-resolved sandbox, tmp and project workspaces."""
     from core.inference.tools import sandbox_root
     from utils.paths.storage_roots import project_workspaces_root, tmp_root
 
@@ -355,8 +352,7 @@ def _linux_confinement(sandbox_site_dir: str) -> Optional[Confinement]:
     return Confinement(
         mechanism = f"landlock-abi{abi}",
         # Signals stay inside the child's own domain (ABI 6), so a tool cannot stop
-        # another account's. /proc stays readable, but ptrace rules leave only the
-        # command line visible.
+        # another account's. /proc stays readable, but ptrace leaves only the cmdline.
         preexec = partial(_landlock_preexec, handled, rules, _SCOPE_SIGNAL if abi >= 6 else 0),
     )
 

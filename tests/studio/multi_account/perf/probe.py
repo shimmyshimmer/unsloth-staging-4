@@ -47,9 +47,8 @@ def measure_cost(operation, warm = None) -> dict:
         counters["directories_created"] += 1
         return result
 
-    # Warm right before the measured call: the keyless-access settings cache
-    # revalidates after one second of idle, and a scheduler pause between the
-    # warm-up loop and this call would count that revalidation as hot-path cost.
+    # Warm right before the measured call: the keyless-access settings cache revalidates
+    # after one second idle, and a scheduler pause would bill that to the hot path.
     if warm is not None:
         warm()
     with (

@@ -8,8 +8,8 @@ deliberately NOT inherited by new threads or processes: those rebind through
 ``run_as`` / ``account_thread``. It defaults to the installation owner, so a
 single-account install behaves exactly as it did before accounts existed.
 
-Accounts are keyed by immutable ``account_id``, never username: usernames can be
-renamed or reused, and the next holder of a name would inherit the old files.
+Keyed by immutable ``account_id``, never username: the next holder of a reused name
+would otherwise inherit the old files.
 """
 
 from __future__ import annotations

@@ -3,10 +3,10 @@
 
 """Signed links carry their own account, and die with it.
 
-These are the routes with no auth dependency: an HMAC token stands in for the bearer so a
-browser can range-request a PDF or drop a URL into an <img>. The auth dependency is also
-the only thing that binds an account, so each of these has to resolve the account from the
-signed target itself, and re-check that the account is still there.
+These routes have no auth dependency: an HMAC token stands in for the bearer so a browser
+can range-request a PDF or drop a URL into an <img>. That dependency is also the only thing
+that binds an account, so each route resolves the account from the signed target itself and
+re-checks that it still exists.
 """
 
 import secrets
