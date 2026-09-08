@@ -477,6 +477,28 @@ def test_failed_retirement_leaves_disabled_retryable_account(matrix, monkeypatch
     )
 
 
+def test_reactivating_after_a_failed_delete_lifts_the_job_retirement(matrix, monkeypatch):
+    client, _, accounts = matrix
+    from core.training import account_jobs as jobs
+
+    monkeypatch.setattr(jobs, "_retired", set())
+    account = storage.get_account("alice")
+    run_as(account, storage_roots.workspace_root).mkdir(parents = True, exist_ok = True)
+
+    class FailingRename:
+        @staticmethod
+        def rename(root, destination):
+            raise PermissionError("locked directory")
+
+    monkeypatch.setattr(accounts, "Path", FailingRename)
+    url = f"/api/accounts/{account.account_id}"
+    assert client.delete(url, headers = headers()).status_code == 409
+    assert run_as(account, jobs.account_is_retired) is True
+
+    assert client.patch(url, headers = headers(), json = {"is_active": True}).status_code == 200
+    assert run_as(account, jobs.account_is_retired) is False
+
+
 def test_managed_password_change_cannot_overwrite_a_rotated_credential(matrix):
     record = storage.get_user_record("alice")
     storage.set_account_active(record["account_id"], False)

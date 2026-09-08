@@ -99,7 +99,11 @@ def regenerate_setup_code(account_id: str):
 def set_account_active(account_id: str, payload: AccountActiveRequest):
     with _account_errors():
         result = storage.set_account_active(account_id, payload.is_active)
-        if not payload.is_active:
+        if payload.is_active:
+            # A delete that failed after retiring the jobs left the id tombstoned in-process.
+            from core.training.account_jobs import restore_account_jobs
+            restore_account_jobs(account_id)
+        else:
             active_generations.cancel_all(account_id)
         return result
 
