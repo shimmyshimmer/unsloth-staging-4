@@ -12,7 +12,14 @@ from __future__ import annotations
 import pytest
 
 from auth import policy
-from utils import model_memory_settings, openai_auto_switch_settings, vram_budget_settings
+from utils import (
+    llama_cpp_path_settings,
+    model_memory_settings,
+    openai_auto_switch_settings,
+    preview_sharing_settings,
+    upload_limits,
+    vram_budget_settings,
+)
 from utils.account_context import OWNER, AccountContext, run_as
 
 ALICE = AccountContext("a" * 32, "alice")
@@ -43,3 +50,26 @@ def test_a_managed_load_reads_the_owners_vram_budget():
 def test_a_managed_request_reads_the_owners_auto_switch_policy():
     run_as(OWNER, openai_auto_switch_settings.set_openai_auto_switch, True, None)
     assert run_as(ALICE, openai_auto_switch_settings.get_openai_auto_switch_enabled) is True
+
+
+def test_a_managed_upload_reads_the_owners_upload_limit():
+    run_as(OWNER, upload_limits.set_upload_limit_mb, 2048)
+    assert run_as(ALICE, upload_limits.get_upload_limit_mb) == 2048
+    assert run_as(ALICE, upload_limits.get_upload_limit_bytes) == 2048 * 1024 * 1024
+
+
+def test_a_managed_request_reads_the_owners_preview_sharing_switch():
+    run_as(OWNER, preview_sharing_settings.set_preview_sharing_enabled, False)
+    assert run_as(ALICE, preview_sharing_settings.get_preview_sharing_enabled) is False
+
+
+def test_a_managed_load_reads_the_owners_llama_cpp_path(tmp_path, monkeypatch):
+    binary = tmp_path / "llama" / llama_cpp_path_settings.llama_server_binary_name()
+    binary.parent.mkdir(parents = True, exist_ok = True)
+    binary.write_text("")
+    binary.chmod(0o755)
+    monkeypatch.delenv("LLAMA_SERVER_PATH", raising = False)
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_PATH", raising = False)
+    run_as(OWNER, llama_cpp_path_settings.set_custom_llama_cpp_path, str(binary.parent))
+    assert run_as(ALICE, llama_cpp_path_settings.get_stored_custom_llama_cpp_path) is not None
+    assert run_as(ALICE, llama_cpp_path_settings.custom_llama_cpp_path_source) == "studio"
