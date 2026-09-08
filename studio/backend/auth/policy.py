@@ -48,7 +48,9 @@ def _account_counts() -> tuple[int, int]:
         active, managed = storage.account_counts()
     except Exception:  # noqa: BLE001 - an unreadable auth.db is a one-user install
         # Never cached: a transient read error would hold full access off until restart.
-        return 1, 1
+        from utils.account_context import is_owner_context
+        # A bound managed account proves a multi-user install, so isolation stays on.
+        return (1 if is_owner_context() else 2), 1
     with _lock:
         if generation == _generation:
             _cached = (generation, active, managed)

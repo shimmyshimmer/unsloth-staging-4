@@ -62,3 +62,16 @@ def test_an_unreadable_auth_database(auth_db, monkeypatch):
 
     monkeypatch.setattr(storage, "account_counts", boom)
     assert _state() == ("single", False, True, False)
+
+
+def test_a_count_read_failure_keeps_a_bound_managed_account_isolated(auth_db, monkeypatch):
+    """The fallback answers for the login form, which is unauthenticated; a request already
+    bound to a managed account is proof of a multi-user install, so isolation stays on."""
+    from utils.account_context import AccountContext, run_as
+
+    def boom():
+        raise OSError("auth.db unreadable")
+
+    monkeypatch.setattr(storage, "account_counts", boom)
+    policy.invalidate_account_cache()
+    assert run_as(AccountContext("a" * 32, "alice"), policy.installation_is_multi_user) is True
