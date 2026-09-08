@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { USER_STOPPED_KEY } from "../hooks/server-stop-intent.ts";
+
 export const BROWSER_ACCOUNT_KEY = "unsloth.browser-account.v1";
 /** Owner marker; also what an unmarked browser compares as. */
 export const OWNER_BROWSER_ACCOUNT = "unsloth";
@@ -26,8 +28,8 @@ export const ACCOUNT_CHROME_PREFIXES = [
 ] as const;
 /** Per-tab flags about the browser session, not the account. Never add content. */
 export const ACCOUNT_SESSION_CHROME_KEYS = new Set([
-  // USER_STOPPED_KEY in src/hooks/server-stop-intent.ts: a stop the user asked for.
-  "unsloth_server_user_stopped",
+  // A stop the user asked for is about this browser session, not the account.
+  USER_STOPPED_KEY,
 ]);
 export const ACCOUNT_DATABASES = [
   "unsloth-data-recipes",
