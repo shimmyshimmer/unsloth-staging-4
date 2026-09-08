@@ -530,3 +530,65 @@ def test_default_layout_denies_exactly_the_previous_macos_roots(tmp_path, monkey
         str((shared_tmp / "unsloth-studio").resolve()),
         str(home.resolve()),
     }
+
+
+@pytest.mark.skipif(not LANDLOCK, reason = "Landlock not available on this kernel")
+def test_link_to_an_ancestor_of_the_install_root_stays_hidden(tmp_path, monkeypatch):
+    """A symlink inside a read root pointing at an ancestor of the install root is
+    opened as that ancestor, so it must not become a rule of its own."""
+    prefix = Path(os.path.realpath(sys.prefix))
+    parent = prefix / f"mu-ancestor-{os.getpid()}"
+    home = parent / "unsloth-studio"
+    link = prefix / f"mu-root-link-{os.getpid()}"
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(home))
+    try:
+        auth = home / "auth" / "auth.db"
+        auth.parent.mkdir(parents = True, exist_ok = True)
+        auth.write_text("OWNER_AUTH_DB", encoding = "utf-8")
+        link.symlink_to(parent, target_is_directory = True)
+        out = run_as(
+            BOB,
+            tools._bash_exec,
+            f"cat {link}/unsloth-studio/auth/auth.db; echo rc=$?; "
+            "echo mine > own.txt; cat own.txt; echo own_rc=$?",
+            session_id = "chat",
+        )
+        assert "OWNER_AUTH_DB" not in out and "rc=0" not in out.replace("own_rc=0", ""), out
+        assert "own_rc=0" in out and "mine" in out, out
+        rules = run_as(BOB, tool_confinement._landlock_rules, 3, tools._SANDBOX_SITE_DIR)
+        assert all(not tool_confinement._contains(p, str(link)) for p, _ in rules), rules
+    finally:
+        import shutil
+        link.unlink(missing_ok = True)
+        shutil.rmtree(parent, ignore_errors = True)
+
+
+@pytest.mark.skipif(not LANDLOCK, reason = "Landlock not available on this kernel")
+def test_shared_temporary_base_under_a_granted_root_hides_other_accounts(tmp_path, monkeypatch):
+    """Every account's tmp_root sits under one shared base; a host temp directory
+    beneath a readable system root must not expose the other accounts' subtrees."""
+    import tempfile as _tempfile
+
+    from utils.paths import storage_roots
+
+    base = Path(os.path.realpath(sys.prefix)) / f"mu-shared-tmp-{os.getpid()}"
+    base.mkdir(parents = True, exist_ok = True)
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(base))
+    try:
+        alice_tmp = run_as(ALICE, storage_roots.tmp_root)
+        alice_tmp.mkdir(parents = True, exist_ok = True)
+        (alice_tmp / "dataset.jsonl").write_text("ALICE_PRIVATE", encoding = "utf-8")
+        bob_tmp = run_as(BOB, storage_roots.tmp_root)
+        out = run_as(
+            BOB,
+            tools._bash_exec,
+            f"cat {alice_tmp}/dataset.jsonl; echo rc=$?; "
+            f"echo mine > {bob_tmp}/own.txt; echo own_rc=$?",
+            session_id = "chat",
+        )
+        assert "ALICE_PRIVATE" not in out and "rc=0" not in out.replace("own_rc=0", ""), out
+        assert "own_rc=0" in out, out
+        assert (bob_tmp / "own.txt").read_text().strip() == "mine"
+    finally:
+        import shutil
+        shutil.rmtree(base, ignore_errors = True)

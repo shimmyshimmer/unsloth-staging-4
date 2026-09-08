@@ -159,13 +159,18 @@ def _writable_roots() -> list[str]:
 
 
 def _protected_roots() -> list[str]:
-    """The installation plus the shared sandbox and project bases: an ancestor read
-    grant (/opt, the interpreter prefix) would otherwise expose every account's tree."""
+    """The installation plus the shared sandbox, project and temp bases: an ancestor
+    read grant (/opt, /var/lib, the interpreter prefix) would expose every account."""
     from core.inference.tools import shared_sandbox_root
-    from utils.paths.storage_roots import shared_project_workspaces_root, studio_root
+    from utils.paths.storage_roots import (
+        shared_project_workspaces_root,
+        shared_tmp_root,
+        studio_root,
+    )
 
     return _with_shared_bases(
-        _existing((studio_root(),)), (shared_sandbox_root(), shared_project_workspaces_root())
+        _existing((studio_root(),)),
+        (shared_sandbox_root(), shared_project_workspaces_root(), shared_tmp_root()),
     )
 
 
@@ -203,8 +208,9 @@ def _grant_excluding(
     for name in children:
         child = os.path.join(path, name)
         if os.path.islink(child):
-            # A link is opened by its target, which must not be protected.
-            if any(_contains(p, os.path.realpath(child)) for p in protected):
+            # A link opens as its target: one under or above a protected root grants the tree.
+            target = os.path.realpath(child)
+            if any(_contains(p, target) or _contains(target, p) for p in protected):
                 continue
         _grant_excluding(child, access, protected, rules)
 
