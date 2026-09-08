@@ -75,3 +75,28 @@ def test_a_count_read_failure_keeps_a_bound_managed_account_isolated(auth_db, mo
     monkeypatch.setattr(storage, "account_counts", boom)
     policy.invalidate_account_cache()
     assert run_as(AccountContext("a" * 32, "alice"), policy.installation_is_multi_user) is True
+
+
+def test_deactivating_the_last_managed_account_keeps_a_bound_request_isolated(
+    auth_db, monkeypatch, tmp_path
+):
+    """A request that authenticated as alice can still be running when the owner
+    deactivates her. The active count drops back to one, but the bound request is a
+    managed one for its whole life and must not acquire the owner's model paths."""
+    from fastapi import HTTPException
+    from hub.services.models import account_access as access
+    from utils.account_context import AccountContext, run_as
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("HF_TOKEN", "installation-token")
+    account = storage.issue_account_setup_code(username = "alice")["account"]
+    alice = AccountContext(account["account_id"], "alice")
+    assert run_as(alice, access.managed_account) is True
+
+    storage.set_account_active(account["account_id"], False)
+    assert policy.installation_is_multi_user() is False
+    assert run_as(alice, access.managed_account) is True
+    assert run_as(alice, access.ambient_hf_token) is False
+    with pytest.raises(HTTPException) as raised:
+        run_as(alice, access.require_model_access, "/owner/private/checkpoint.gguf")
+    assert raised.value.status_code == 404

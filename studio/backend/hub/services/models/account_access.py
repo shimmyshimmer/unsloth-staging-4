@@ -83,13 +83,14 @@ def media_link_account(target: str | None, media_id: str) -> AccountContext | No
 
 def managed_account() -> bool:
     """Keep account policy off the owner's model and credential paths."""
-    if is_owner_context():
-        return False
-    return policy.installation_is_multi_user()
+    # Role, not live counts: deactivating the last managed account must not unwrap a bound request.
+    return not is_owner_context()
 
 
 def account_scope() -> str | None:
     """None preserves installation-wide legacy queries on one-account installs."""
+    if not is_owner_context():
+        return current_account_id()
     return current_account_id() if policy.installation_is_multi_user() else None
 
 
@@ -264,6 +265,8 @@ _PROBE_FANOUT = 8
 
 
 _UNKNOWN_TTL = 30.0
+# A persisted proof carries an outage, not a repository's whole life.
+_PROOF_TTL = 7 * 24 * 3600.0
 _DEFINITIVE_HUB_STATUSES = (401, 403, 404)
 
 
@@ -280,10 +283,11 @@ def _load_public_verdicts() -> dict[str, float]:
         return {}
     if not isinstance(data, dict):
         return {}
+    oldest = time.time() - _PROOF_TTL
     return {
         name: float(stamp)
         for name, stamp in data.items()
-        if isinstance(name, str) and isinstance(stamp, (int, float))
+        if isinstance(name, str) and isinstance(stamp, (int, float)) and float(stamp) > oldest
     }
 
 

@@ -506,3 +506,30 @@ def test_gated_metadata_alone_is_not_download_authorization(monkeypatch, authori
             run_as(ALICE, access.authorize_download, "org/gated", "model", "alice-token")
     assert calls == [("org/gated", {"repo_type": "model", "token": "alice-token"})]
     assert run_as(ALICE, access.model_grants) == set()
+
+
+def test_a_persisted_public_proof_expires_rather_than_outliving_a_privacy_change(monkeypatch):
+    """The proof carries an outage, not the repository's whole life: once it is older than
+    the bound, an unreachable Hub is unknown again instead of a standing public verdict."""
+    monkeypatch.setattr(
+        access, "HfApi", lambda: SimpleNamespace(repo_info = lambda *a, **k: SimpleNamespace(
+            private = False, gated = False
+        ))
+    )
+    assert run_as(ALICE, access.repo_visible, "Org/Public")
+    path = access._public_verdicts_path()
+    assert json.loads(path.read_text()).keys() == {"model:org/public"}
+
+    monkeypatch.setattr(
+        access, "HfApi", lambda: SimpleNamespace(repo_info = lambda *a, **k: (
+            _ for _ in ()
+        ).throw(OSError("Hub unavailable")))
+    )
+    access._public_repos.clear()
+    path.write_text(json.dumps({"model:org/public": time.time() - 3600}))
+    assert run_as(BOB, access.repo_visible, "org/public"), "a proof inside the bound still carries"
+
+    access._public_repos.clear()
+    path.write_text(json.dumps({"model:org/public": time.time() - 30 * 24 * 3600}))
+    assert not run_as(BOB, access.repo_visible, "org/public")
+    assert not run_as(ALICE, access.repo_visible, "org/public")
