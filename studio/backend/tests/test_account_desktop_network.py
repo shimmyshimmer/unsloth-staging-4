@@ -272,6 +272,23 @@ def test_bootstrap_html_single_bytes_and_multi_suppression(monkeypatch):
     assert main._inject_bootstrap(html, app) == (expected, "fixed-nonce")
 
 
+def test_bootstrap_html_stays_suppressed_while_a_deactivated_account_exists(monkeypatch):
+    """Deactivating the last account turns the login mode single while alice's identity and
+    files remain, so a loopback page load must not hand her browser the owner's password."""
+    import main
+    import secrets as secrets_module
+
+    monkeypatch.setattr(storage, "requires_password_change", lambda username: username == "unsloth")
+    monkeypatch.setattr(secrets_module, "token_urlsafe", lambda size: "fixed-nonce")
+    app = SimpleNamespace(state = SimpleNamespace(bootstrap_password = "owner-bootstrap"))
+    html = b"<html><head></head><body>Studio</body></html>"
+    account = add_managed()
+    storage.set_account_active(account.account_id, False)
+    policy.invalidate_account_cache()
+    assert policy.installation_is_multi_user() is False
+    assert main._inject_bootstrap(html, app) == (html, None)
+
+
 def test_secure_banner_bytes_and_shared_url_survive_account_creation(monkeypatch, capsys):
     import run
     import startup_banner
