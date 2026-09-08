@@ -59,10 +59,29 @@ function fixture(t: { after(fn: () => void): void }, tauri = true) {
     },
   };
   const apiBase = { isTauri: tauri, apiUrl: (path: string) => path };
+  const transitions: { account: unknown; route: string }[] = [];
+  const loginModes: unknown[] = [];
   const auth = loadWithStubs<AutoAuth>(new URL("../src/features/auth/tauri-auto-auth.ts", import.meta.url), {
     "@/lib/api-base": apiBase,
     "./session": session,
     "./api": session,
+    "./login-client": {
+      setLoginMode: (mode: string, fullAccess?: boolean) => {
+        loginModes.push([mode, fullAccess]);
+      },
+    },
+    "@/lib/account-transition": {
+      OWNER_BROWSER_ACCOUNT: "unsloth",
+      transitionBrowserAccount: async (
+        account: unknown,
+        route: string,
+        commitSession: () => void,
+      ) => {
+        transitions.push({ account, route });
+        commitSession();
+        return false;
+      },
+    },
     "@tauri-apps/api/core": {
       invoke: async (command: string) => {
         assert.equal(command, "desktop_auth");
@@ -73,7 +92,6 @@ function fixture(t: { after(fn: () => void): void }, tauri = true) {
     },
     "@/app/router": { router: { navigate: async (options: unknown) => { navigations.push(options); } } },
   });
-  const loginModes: unknown[] = [];
   const guards = loadWithStubs<Guards>(new URL("../src/app/auth-guards.ts", import.meta.url), {
     "@tanstack/react-router": { redirect: (options: unknown) => options },
     "@/lib/api-base": apiBase,
@@ -90,7 +108,7 @@ function fixture(t: { after(fn: () => void): void }, tauri = true) {
     return new Response(JSON.stringify(status), { status: 200 });
   };
   return {
-    auth, guards, session, events, navigations, loginModes,
+    auth, guards, session, events, navigations, loginModes, transitions,
     setResponse: (value: unknown) => { response = value; },
     setStatus: (value: typeof status) => { status = value; },
     setRefreshSucceeds: (value: boolean) => { refreshSucceeds = value; },
@@ -192,6 +210,17 @@ for (const passwordChange of [false, true]) {
     if (!passwordChange) await f.guards.requireAuth();
   });
 }
+
+test("owner tokens after the last managed account is deleted clear that account's browser data", async (t) => {
+  const f = fixture(t);
+  f.setResponse(multi);
+  await f.auth.tauriAutoAuth({ force: true });
+  f.setResponse({ access_token: "owner-access", refresh_token: "owner-refresh" });
+  assert.equal(await f.auth.tauriAutoAuth({ force: true }), true);
+  assert.deepEqual(f.transitions, [{ account: "unsloth", route: "/chat" }]);
+  assert.deepEqual(f.loginModes, [["single", undefined]]);
+  assert.equal(f.access, "owner-access");
+});
 
 test("a desktop probe with no usable refresh token still opens login", async (t) => {
   const f = fixture(t);

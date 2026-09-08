@@ -11,6 +11,11 @@ import {
   storeAuthTokens,
 } from "./session";
 import { refreshSession } from "./api";
+import { setLoginMode } from "./login-client";
+import {
+  OWNER_BROWSER_ACCOUNT,
+  transitionBrowserAccount,
+} from "@/lib/account-transition";
 
 type DesktopAuthResponse =
   | { access_token: string; refresh_token: string }
@@ -98,8 +103,12 @@ async function doTauriAutoAuth(options: TauriAutoAuthOptions): Promise<boolean> 
       return options.force === true;
     }
     tauriLoginRequired = false;
-    storeAuthTokens(tokens.access_token, tokens.refresh_token);
-    setMustChangePassword(false);
+    // Owner tokens after the last managed account is deleted must not inherit its browser data.
+    await transitionBrowserAccount(OWNER_BROWSER_ACCOUNT, "/chat", () => {
+      storeAuthTokens(tokens.access_token, tokens.refresh_token);
+      setMustChangePassword(false);
+      setLoginMode("single");
+    });
     clearTauriAuthFailure();
     return true;
   } catch (error) {

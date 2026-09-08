@@ -2,6 +2,8 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 export const BROWSER_ACCOUNT_KEY = "unsloth.browser-account.v1";
+/** Owner marker; also what an unmarked browser compares as. */
+export const OWNER_BROWSER_ACCOUNT = "unsloth";
 
 /** Browser chrome only. Never add credentials, content, model choices or profile data. */
 export const ACCOUNT_CHROME_KEYS = new Set([
@@ -127,7 +129,7 @@ export async function transitionBrowserAccount(
   const marker = browserAccountMarker(account);
   const storage = browser.localStorage;
   const changed = !isSameAccount(
-    parseAccountMarker(storage.getItem(BROWSER_ACCOUNT_KEY) ?? "unsloth"),
+    parseAccountMarker(storage.getItem(BROWSER_ACCOUNT_KEY) ?? OWNER_BROWSER_ACCOUNT),
     parseAccountMarker(marker),
   );
   if (changed) {
@@ -174,7 +176,7 @@ export function installAccountTransitionListener(
     )
       return;
     if (event.storageArea && event.storageArea !== browser.localStorage) return;
-    const previous = parseAccountMarker(event.oldValue ?? "unsloth");
+    const previous = parseAccountMarker(event.oldValue ?? OWNER_BROWSER_ACCOUNT);
     if (isSameAccount(previous, parseAccountMarker(event.newValue))) return;
     reloading = true;
     browser.location.reload();
