@@ -158,6 +158,15 @@ def validate_job_paths(values: dict, *, cached_resources: bool = False) -> None:
             visible_cached_path(value, repo_type)
             continue
         account_path(value, shared_cache = cached_resources)
+    for key, claimed, repo_type in (
+        ("model_name", "model_known_cached", "model"),
+        ("hf_dataset", "dataset_known_cached", "dataset"),
+    ):
+        reference = values.get(key)
+        # A cached claim pins the shared cache, so the caller's token never authorizes it.
+        if values.get(claimed) and reference:
+            from hub.services.models import account_access
+            account_access.require_model_access(str(reference), repo_type)
     for key in (
         "checkpoint_path",
         "resume_from_checkpoint",

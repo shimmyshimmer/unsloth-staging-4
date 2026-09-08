@@ -99,3 +99,43 @@ def test_the_dataset_picker_can_read_a_visible_cached_dataset(shared_cache):
     with pytest.raises(HTTPException) as exc:
         run_as(ALICE, local_options.local_dataset_options, hidden)
     assert exc.value.status_code == 403
+
+
+def test_a_cached_claim_on_an_invisible_repo_is_refused(shared_cache):
+    """``model_known_cached`` makes the preflight pin the shared cache copy locally, so the
+    caller's own Hub token never authorizes the repo: check it here or nothing does."""
+    with pytest.raises(HTTPException) as exc:
+        run_as(
+            ALICE,
+            jobs.validate_job_paths,
+            {
+                "model_name": "private/model",
+                "model_known_cached": True,
+                "hf_token": "alice-token",
+            },
+        )
+    assert exc.value.status_code == 404
+
+
+def test_a_cached_dataset_claim_on_an_invisible_repo_is_refused(shared_cache):
+    with pytest.raises(HTTPException) as exc:
+        run_as(
+            ALICE,
+            jobs.validate_job_paths,
+            {"hf_dataset": "private/set", "dataset_known_cached": True, "hf_token": "t"},
+        )
+    assert exc.value.status_code == 404
+
+
+def test_a_cached_claim_on_a_visible_repo_still_starts(shared_cache):
+    run_as(
+        ALICE,
+        jobs.validate_job_paths,
+        {
+            "model_name": "public/model",
+            "model_known_cached": True,
+            "hf_dataset": "public/set",
+            "dataset_known_cached": True,
+            "hf_token": "alice-token",
+        },
+    )
