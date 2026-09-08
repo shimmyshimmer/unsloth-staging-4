@@ -35702,6 +35702,12 @@ async def load_diffusion_model_gated(
             user_action = user_initiated,
         )
         account_access.note_resident_account("diffusion", request.model_path)
+        account_access.note_resident_components(
+            "diffusion",
+            request.model_path,
+            request.base_repo,
+            *account_access.media_adapter_references(request),
+        )
         reset_media_load_progress("image")
         return DiffusionStatusResponse(**annotate_status(status_dict))
     except (ValueError, FileNotFoundError) as exc:
@@ -35767,62 +35773,83 @@ async def generate_diffusion_image(
     from core.inference.diffusion_families import (
         DIFFUSION_CANCELLED_MSG,
         DIFFUSION_NOT_LOADED_MSG,
+        DiffusionModelReplacedError,
+        load_identity,
     )
 
     backend = get_active_diffusion_engine()
     if account_access.managed_account():
         await asyncio.to_thread(account_access.require_media_adapters, request)
-        await asyncio.to_thread(account_access.require_media_generation_access, backend.status())
-    # Ahead of the run, like the video route: milestones are keyed on the previous poll, so a
-    # run starting at or above where the last one stopped would read as it and log nothing.
-    reset_media_generation_progress("image")
-    try:
-        with account_access.media_generation("diffusion"):
-            result = await asyncio.to_thread(
-                backend.generate,
-                prompt = request.prompt,
-                negative_prompt = request.negative_prompt,
-                width = request.width,
-                height = request.height,
-                steps = request.steps,
-                guidance = request.guidance,
-                seed = request.seed,
-                batch_size = request.batch_size,
-                prompts = request.prompts,
-                seeds = request.seeds,
-                init_image = request.init_image,
-                mask_image = request.mask_image,
-                strength = request.strength,
-                upscale = request.upscale,
-                reference_images = request.reference_images,
-                loras = [(l.id, l.weight) for l in request.loras] if request.loras else None,
-                controlnet = (
-                    (
-                        request.controlnet.id,
-                        request.controlnet.image,
-                        request.controlnet.control_type,
-                        request.controlnet.strength,
-                        request.controlnet.guidance_start,
-                        request.controlnet.guidance_end,
-                    )
-                    if request.controlnet
-                    else None
-                ),
+    # As on the OpenAI image path: pin the authorized resident, re-authorize once if replaced.
+    result = None
+    for attempt in range(2):
+        expected_load = None
+        if account_access.managed_account():
+            status = backend.status()
+            await asyncio.to_thread(
+                account_access.require_media_generation_access, status, "diffusion"
             )
-    except ValueError as exc:
-        # Bad client input (undecodable image/mask, or an unsupported workflow): a 400 with the reason, not a generic 500.
-        raise HTTPException(status_code = 400, detail = str(exc))
-    except RuntimeError as exc:
-        # Only "no model loaded" / user-cancelled are client-state (409); both engines raise these two EXACT messages. The
-        # native engine also raises RuntimeError for failures whose text embeds the sd-cli tail, so match the sentinels exactly.
-        msg = str(exc)
-        if msg in (DIFFUSION_NOT_LOADED_MSG, DIFFUSION_CANCELLED_MSG):
-            raise HTTPException(status_code = 409, detail = msg)
-        logger.error("diffusion.generate_failed: %s", exc, exc_info = True)
-        raise HTTPException(status_code = 500, detail = _generate_failure_detail(msg))
-    except Exception as exc:
-        logger.error("diffusion.generate_failed: %s", exc, exc_info = True)
-        raise HTTPException(status_code = 500, detail = "Image generation failed.")
+            if status.get("loaded"):
+                expected_load = load_identity(
+                    status.get("repo_id"), status.get("base_repo"), status.get("family")
+                )
+        # Ahead of the run, like the video route: milestones are keyed on the previous poll, so a
+        # run starting at or above where the last one stopped would read as it and log nothing.
+        reset_media_generation_progress("image")
+        try:
+            with account_access.media_generation("diffusion"):
+                result = await asyncio.to_thread(
+                    backend.generate,
+                    expected_load = expected_load,
+                    prompt = request.prompt,
+                    negative_prompt = request.negative_prompt,
+                    width = request.width,
+                    height = request.height,
+                    steps = request.steps,
+                    guidance = request.guidance,
+                    seed = request.seed,
+                    batch_size = request.batch_size,
+                    prompts = request.prompts,
+                    seeds = request.seeds,
+                    init_image = request.init_image,
+                    mask_image = request.mask_image,
+                    strength = request.strength,
+                    upscale = request.upscale,
+                    reference_images = request.reference_images,
+                    loras = [(l.id, l.weight) for l in request.loras] if request.loras else None,
+                    controlnet = (
+                        (
+                            request.controlnet.id,
+                            request.controlnet.image,
+                            request.controlnet.control_type,
+                            request.controlnet.strength,
+                            request.controlnet.guidance_start,
+                            request.controlnet.guidance_end,
+                        )
+                        if request.controlnet
+                        else None
+                    ),
+                )
+            break
+        except ValueError as exc:
+            # Bad client input (undecodable image/mask, or an unsupported workflow): a 400 with the reason, not a generic 500.
+            raise HTTPException(status_code = 400, detail = str(exc))
+        except DiffusionModelReplacedError as exc:
+            # Before the RuntimeError arm below, which it inherits from.
+            if attempt > 0:
+                raise HTTPException(status_code = 409, detail = str(exc))
+            continue
+        except RuntimeError as exc:
+            # Only "no model loaded" / user-cancelled are client-state (409); both engines raise these two EXACT messages. The
+            # native engine also raises RuntimeError for failures whose text embeds the sd-cli tail, so match the sentinels exactly.
+            msg = str(exc)
+            if msg in (DIFFUSION_NOT_LOADED_MSG, DIFFUSION_CANCELLED_MSG):
+                raise HTTPException(status_code = 409, detail = msg)
+            logger.error("diffusion.generate_failed: %s", exc, exc_info = True)
+            raise HTTPException(status_code = 500, detail = _generate_failure_detail(msg))
+        except Exception as exc:
+            logger.error("diffusion.generate_failed: %s", exc, exc_info = True)
+            raise HTTPException(status_code = 500, detail = "Image generation failed.")
 
     # Persist each image with its full recipe. BOTH engines batch with a distinct seed per image, returned in ``seeds``, so each is individually reproducible.
     created_at = time.time()
@@ -35904,7 +35931,9 @@ async def generate_diffusion_image(
     global _diffusion_persist_active
     _diffusion_persist_active += 1
     try:
-        records = await asyncio.to_thread(_persist)
+        # The persist is still this account's work, so ownership has to outlast generate().
+        with account_access.media_generation("diffusion"):
+            records = await asyncio.to_thread(_persist)
     except Exception as exc:
         logger.error("diffusion.persist_failed: %s", exc)
         raise HTTPException(status_code = 500, detail = "Failed to save the generated image.")
@@ -36494,7 +36523,9 @@ async def _generate_openai_images(
             raise HTTPException(status_code = 503, detail = _NO_IMAGE_MODEL_MSG)
 
         if account_access.managed_account():
-            await asyncio.to_thread(account_access.require_media_generation_access, status)
+            await asyncio.to_thread(
+                account_access.require_media_generation_access, status, "diffusion"
+            )
 
         # An edit-only model needs an input image this API cannot supply; refuse with a 400 rather than a backend 500.
         workflows = status.get("workflows") or []
@@ -36611,7 +36642,9 @@ async def _generate_openai_images(
     global _diffusion_persist_active
     _diffusion_persist_active += 1
     try:
-        data = await asyncio.to_thread(_persist)
+        # Same ownership window as /images/generate: the persist belongs to this account too.
+        with account_access.media_generation("diffusion"):
+            data = await asyncio.to_thread(_persist)
     except Exception as exc:  # noqa: BLE001
         logger.error("openai_images.persist_failed: %s", exc)
         raise HTTPException(status_code = 500, detail = "Failed to save the generated image.")

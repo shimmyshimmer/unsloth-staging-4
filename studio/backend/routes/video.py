@@ -387,6 +387,12 @@ async def load_video_model_gated(
             user_action = user_initiated,
         )
         account_access.note_resident_account("video", request.model_path)
+        account_access.note_resident_components(
+            "video",
+            request.model_path,
+            request.base_repo,
+            *account_access.media_adapter_references(request),
+        )
         reset_media_load_progress("video")
         return VideoStatusResponse(**status_dict)
     except (ValueError, FileNotFoundError) as exc:
@@ -532,7 +538,9 @@ async def generate_video(
 
     backend = get_video_backend()
     if account_access.managed_account():
-        await asyncio.to_thread(account_access.require_media_generation_access, backend.status())
+        await asyncio.to_thread(
+            account_access.require_media_generation_access, backend.status(), "video"
+        )
     # The real rule is the LOADED family's, applied by begin_generate under the same lock that reserves the state, so a
     # concurrent load cannot leave the shape judged against one family and denoised by another.
     # Unloaded still falls through to the not-loaded 409, and a family with no declared presets keeps the old SIZE

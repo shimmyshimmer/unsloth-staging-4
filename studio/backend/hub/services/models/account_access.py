@@ -201,6 +201,19 @@ def note_resident_account(modality: str, *references: str) -> None:
         _resident_accounts[modality] = (current_account_id(), frozenset(references))
 
 
+# Components the load route authorized, keyed on the resident they were loaded with.
+_resident_components: dict[str, tuple[str, frozenset[str]]] = {}
+
+
+def note_resident_components(modality: str, primary: str, *references: str) -> None:
+    """A generation on a shared resident must clear its base repo and baked adapters too."""
+    if policy.installation_is_multi_user():
+        _resident_components[modality] = (
+            str(primary or ""),
+            frozenset(r for r in references if isinstance(r, str) and r),
+        )
+
+
 def resident_hidden(modality: str | None = None, reference: str | None = None) -> bool:
     if not managed_account():
         return False
@@ -648,10 +661,22 @@ def require_media_references(request) -> None:
             require_model_access(str(Path(request.model_path) / path))
 
 
-def require_media_generation_access(status: dict) -> None:
+def resident_components(status: dict, modality: str | None = None) -> list[str]:
+    """Every private component of an assembled resident, not just its primary repository."""
+    repo_id = status.get("repo_id")
+    references = [repo_id, status.get("base_repo")]
+    primary, components = _resident_components.get(modality, ("", frozenset()))
+    # Baked adapters are not in status(), so the load's authorized list stands in.
+    if primary and repo_id and primary == repo_id:
+        references.extend(sorted(components))
+    return [ref for ref in references if isinstance(ref, str) and ref]
+
+
+def require_media_generation_access(status: dict, modality: str | None = None) -> None:
     """Recheck the actual resident before a cache-only generation can reuse it."""
     if managed_account() and status.get("loaded"):
-        require_model_access(status.get("repo_id"))
+        for reference in resident_components(status, modality):
+            require_model_access(reference)
 
 
 def foreign_work_active() -> bool:
@@ -680,6 +705,13 @@ def require_media_adapters(request) -> None:
     """Apply model grants to catalog aliases as well as raw adapter repo ids."""
     if not managed_account():
         return
+    for reference in media_adapter_references(request):
+        require_model_access(reference)
+
+
+def media_adapter_references(request) -> list[str]:
+    """Resolve catalog aliases to the repo or path each adapter actually loads."""
+    references: list[str] = []
     loras = getattr(request, "loras", None)
     controlnet = getattr(request, "controlnet", None)
     groups = []
@@ -693,5 +725,7 @@ def require_media_adapters(request) -> None:
         by_id = {entry.id: entry for entry in entries}
         for selection in selections:
             entry = by_id.get(selection.id)
-            reference = (entry.local_path or entry.repo_id) if entry is not None else selection.id
-            require_model_access(reference)
+            references.append(
+                (entry.local_path or entry.repo_id) if entry is not None else selection.id
+            )
+    return references
