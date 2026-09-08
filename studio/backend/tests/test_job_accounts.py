@@ -332,7 +332,8 @@ def test_deactivating_the_last_managed_account_keeps_its_job_private(training, m
     backend.step_history = [1]
     backend._output_dir = "/private/alice"
     monkeypatch.setattr(route, "get_training_backend", lambda: backend)
-    monkeypatch.setattr(policy, "installation_is_multi_user", lambda: False)  # Alice is deactivated.
+    # Alice is deactivated.
+    monkeypatch.setattr(policy, "installation_is_multi_user", lambda: False)
     monkeypatch.setattr(policy, "installation_has_managed_accounts", lambda: True)
 
     status = asyncio.run(arun_as(OWNER, route.get_training_status("unsloth")))
