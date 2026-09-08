@@ -307,6 +307,21 @@ def _load_processed_hf_preview_slice(
     return preview_slice, total_rows
 
 
+def _cached_preview_visible(request: CheckFormatRequest) -> bool:
+    # A cache hit is not authorization: the shared cache holds other accounts' private repos.
+    from hub.services.models import account_access
+
+    if not account_access.managed_account():
+        return True
+    if account_access.model_visible(request.dataset_name, repo_type = "dataset"):
+        return True
+    local_path = getattr(request, "local_path", None)
+    return bool(local_path) and account_access.model_visible(
+        str(local_path),
+        repo_type = "dataset",
+    )
+
+
 def _load_any_cached_hf_preview_slice(
     request: CheckFormatRequest,
     preview_size: int,
@@ -316,6 +331,8 @@ def _load_any_cached_hf_preview_slice(
     # snapshot, the processed one loads with local_files_only=True and drops the falsy
     # sentinel. Refuse the whole disk route here; the handler then answers 404.
     if is_anonymous(hf_token):
+        return None
+    if not _cached_preview_visible(request):
         return None
     cached_preview = _load_cached_hf_preview_slice(request, preview_size)
     if cached_preview is not None:
