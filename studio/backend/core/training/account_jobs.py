@@ -15,7 +15,12 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from utils.account_context import AccountContext, OWNER, current_account, run_as
-from utils.paths.storage_roots import project_workspaces_root, tmp_root, workspace_root
+from utils.paths.storage_roots import (
+    project_workspaces_root,
+    resolve_export_write_dir,
+    tmp_root,
+    workspace_root,
+)
 
 _services = weakref.WeakSet()
 _services_lock = threading.RLock()
@@ -76,6 +81,19 @@ def account_path(
         roots += (Path(active_hf_hub_cache()),)
     if not any(resolved.is_relative_to(root.resolve()) for root in roots):
         raise HTTPException(status_code = 403, detail = "Path is outside this account's workspace")
+    return value
+
+
+def export_write_path(value):
+    if not value or not managed_account():
+        return value
+    if Path(str(value)).expanduser().is_absolute():
+        return account_path(value)
+    # Relative destinations are rebased by the writer under this account's exports root.
+    try:
+        resolve_export_write_dir(str(value))
+    except ValueError as exc:
+        raise HTTPException(status_code = 403, detail = str(exc))
     return value
 
 
@@ -144,7 +162,6 @@ def validate_job_paths(values: dict, *, cached_resources: bool = False) -> None:
         "checkpoint_path",
         "resume_from_checkpoint",
         "output_dir",
-        "save_directory",
         "tensorboard_dir",
         "imatrix_path",
         "data_dir",
@@ -155,6 +172,7 @@ def validate_job_paths(values: dict, *, cached_resources: bool = False) -> None:
         "dataset_path",
     ):
         account_path(values.get(key))
+    export_write_path(values.get("save_directory"))
     if isinstance(values.get("imatrix_file"), (str, Path)):
         account_path(values["imatrix_file"])
     for key in ("local_datasets", "local_eval_datasets"):

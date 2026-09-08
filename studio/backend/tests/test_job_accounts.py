@@ -375,6 +375,18 @@ def test_managed_request_paths_cannot_cross_account_roots(field):
     run_as(OWNER, jobs.validate_job_paths, {field: value})
 
 
+def test_managed_relative_export_destinations_resolve_under_the_account_exports_root():
+    for name in ("llama-3-merged", "my-run/checkpoint-100", "model-GGUF"):
+        run_as(ALICE, jobs.validate_job_paths, {"save_directory": name})
+    for bad in (str(run_as(BOB, exports_root) / "stolen"), "../../escape"):
+        with pytest.raises(HTTPException) as exc:
+            run_as(ALICE, jobs.validate_job_paths, {"save_directory": bad})
+        assert exc.value.status_code == 403
+    own = str(run_as(ALICE, exports_root) / "mine")
+    run_as(ALICE, jobs.validate_job_paths, {"save_directory": own})
+    run_as(OWNER, jobs.validate_job_paths, {"save_directory": "llama-3-merged"})
+
+
 def test_managed_paths_resolve_symlinks_and_accept_private_outputs(tmp_path):
     own = run_as(ALICE, workspace_root)
     own.mkdir(parents = True)
