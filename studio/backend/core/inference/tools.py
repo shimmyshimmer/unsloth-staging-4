@@ -8151,6 +8151,18 @@ def _legacy_sandbox_root() -> str:
     return os.path.join(os.path.expanduser("~"), "studio_sandbox")
 
 
+def shared_sandbox_root() -> str:
+    """The base every account's ``sandbox_root`` lives under; confinement hides it first."""
+    override = (os.environ.get("UNSLOTH_STUDIO_SANDBOX_HOME") or "").strip()
+    if override:
+        return os.path.expanduser(override)
+    try:
+        from utils.paths.storage_roots import studio_root
+        return str(studio_root())
+    except Exception:
+        return _legacy_sandbox_root()
+
+
 def sandbox_root() -> str:
     """Root of the per-session tool sandboxes.
 

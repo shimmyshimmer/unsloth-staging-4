@@ -221,9 +221,15 @@ def documents_root() -> Path:
     )
 
 
+def shared_project_workspaces_root() -> Path:
+    """The base every account's ``project_workspaces_root`` lives under; confinement hides it first."""
+    override = (os.environ.get("UNSLOTH_STUDIO_PROJECTS_HOME") or "").strip()
+    return Path(override).expanduser() if override else documents_root() / "Unsloth Studio"
+
+
 def project_workspaces_root() -> Path:
     override = (os.environ.get("UNSLOTH_STUDIO_PROJECTS_HOME") or "").strip()
-    base = Path(override).expanduser() if override else documents_root() / "Unsloth Studio"
+    base = shared_project_workspaces_root()
     if is_owner_context():
         return base if override else base / "Projects"
     # A separate Documents tree, keyed on the account like the rest.

@@ -159,14 +159,27 @@ def _writable_roots() -> list[str]:
 
 
 def _protected_roots() -> list[str]:
-    """The installation itself, which a Studio home under /opt or the interpreter
-    prefix would otherwise expose through the read grant for that ancestor."""
-    from utils.paths.storage_roots import studio_root
-    return _existing((studio_root(),))
+    """The installation plus the shared sandbox and project bases: an ancestor read
+    grant (/opt, the interpreter prefix) would otherwise expose every account's tree."""
+    from core.inference.tools import shared_sandbox_root
+    from utils.paths.storage_roots import shared_project_workspaces_root, studio_root
+
+    return _with_shared_bases(
+        _existing((studio_root(),)), (shared_sandbox_root(), shared_project_workspaces_root())
+    )
 
 
 def _contains(ancestor: str, path: str) -> bool:
     return path == ancestor or path.startswith(ancestor.rstrip(os.sep) + os.sep)
+
+
+def _with_shared_bases(roots: list[str], bases) -> list[str]:
+    """Append shared bases no listed root covers; a default layout is unchanged."""
+    out = list(roots)
+    for base in _existing(bases):
+        if not any(_contains(root, base) for root in out):
+            out.append(base)
+    return out
 
 
 def _grant_excluding(
@@ -264,6 +277,8 @@ def _landlock_rules(abi: int, sandbox_site_dir: str) -> list[tuple[str, int]]:
     read = _FS_READ_FILE | _FS_READ_DIR | _FS_EXECUTE
     device = _FS_READ_FILE | _FS_WRITE_FILE | (_FS_IOCTL_DEV if abi >= 5 else 0)
     rules: list[tuple[str, int]] = []
+    # Creates the account's own roots, and with them the shared bases protected below.
+    writable_roots = _writable_roots()
     protected = _protected_roots()
     for path in _existing(_SYSTEM_READ_ROOTS):
         _grant_excluding(path, read, protected, rules)
@@ -278,7 +293,7 @@ def _landlock_rules(abi: int, sandbox_site_dir: str) -> list[tuple[str, int]]:
     # Everything but creating links: the server follows links for the owner, so a
     # tool must not be able to plant one pointing outside the account's tree.
     writable = handled & ~_FS_MAKE_SYM
-    for path in _writable_roots():
+    for path in writable_roots:
         rules.append((path, writable))
     return rules
 
@@ -395,7 +410,12 @@ def _macos_confinement(sandbox_site_dir: str) -> Optional[Confinement]:
     sandbox_exec = shutil.which("sandbox-exec")
     if not sandbox_exec:
         return None
-    from utils.paths.storage_roots import shared_tmp_root, studio_root
+    from core.inference.tools import shared_sandbox_root
+    from utils.paths.storage_roots import (
+        shared_project_workspaces_root,
+        shared_tmp_root,
+        studio_root,
+    )
 
     read_roots = _existing(
         (
@@ -414,8 +434,11 @@ def _macos_confinement(sandbox_site_dir: str) -> Optional[Confinement]:
     )
     # Creates the account tmp root, and with it the shared base denied below.
     writable_roots = _writable_roots()
-    # Every account's tmp_root sits under one per-user temp base: deny it, re-allow only ours.
-    hidden_roots = _existing((str(studio_root()), str(shared_tmp_root()), os.path.expanduser("~")))
+    # Each account's tmp, sandbox and projects share one base: deny it, re-allow only ours.
+    hidden_roots = _with_shared_bases(
+        _existing((str(studio_root()), str(shared_tmp_root()), os.path.expanduser("~"))),
+        (shared_sandbox_root(), str(shared_project_workspaces_root())),
+    )
     profile = macos_profile(
         read_roots = read_roots,
         hidden_roots = hidden_roots,

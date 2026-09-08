@@ -405,3 +405,128 @@ def test_sandbox_home_override_is_writable(tmp_path, monkeypatch):
 def test_landlock_below_abi_3_is_refused(monkeypatch):
     monkeypatch.setattr(tool_confinement, "landlock_abi", lambda: 2)
     assert tool_confinement._linux_confinement(tools._SANDBOX_SITE_DIR) is None
+
+
+@pytest.mark.skipif(not LANDLOCK, reason = "Landlock not available on this kernel")
+def test_sandbox_home_under_a_granted_root_hides_other_accounts(tmp_path, monkeypatch):
+    """A sandbox base under /opt or the interpreter prefix must not become readable
+    through the grant for that ancestor: only the caller's own subtree comes back."""
+    base = Path(sys.prefix) / f"mu-shared-sandboxes-{os.getpid()}"
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(base))
+    try:
+        alice_dir = Path(run_as(ALICE, tools._get_workdir, "chat"))
+        (alice_dir / "alice-secret.txt").write_text("ALICE_PRIVATE")
+        out = run_as(
+            BOB,
+            tools._bash_exec,
+            f"cat {alice_dir}/alice-secret.txt; echo rc=$?; "
+            "echo mine > own.txt; cat own.txt; echo own_rc=$?",
+            session_id = "chat",
+        )
+        assert "ALICE_PRIVATE" not in out and "rc=0" not in out.replace("own_rc=0", ""), out
+        assert "own_rc=0" in out and "mine" in out, out
+        rules = run_as(BOB, tool_confinement._landlock_rules, 3, tools._SANDBOX_SITE_DIR)
+        assert all(not tool_confinement._contains(p, str(alice_dir)) for p, _ in rules)
+    finally:
+        import shutil
+        shutil.rmtree(base, ignore_errors = True)
+
+
+@pytest.mark.skipif(not LANDLOCK, reason = "Landlock not available on this kernel")
+def test_projects_home_under_a_granted_root_hides_other_accounts(tmp_path, monkeypatch):
+    """The same for the projects base, whose accounts sit side by side under it."""
+    from utils.paths.storage_roots import project_workspaces_root
+
+    base = Path(sys.prefix) / f"mu-shared-projects-{os.getpid()}"
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(base))
+    try:
+        alice_projects = run_as(ALICE, project_workspaces_root)
+        alice_projects.mkdir(parents = True, exist_ok = True)
+        (alice_projects / "plan.md").write_text("ALICE_PRIVATE")
+        bob_projects = run_as(BOB, project_workspaces_root)
+        out = run_as(
+            BOB,
+            tools._bash_exec,
+            f"cat {alice_projects}/plan.md; echo rc=$?; "
+            f"echo mine > {bob_projects}/own.md; echo own_rc=$?",
+            session_id = "chat",
+        )
+        assert "ALICE_PRIVATE" not in out and "rc=0" not in out.replace("own_rc=0", ""), out
+        assert "own_rc=0" in out, out
+        assert (bob_projects / "own.md").read_text().strip() == "mine"
+    finally:
+        import shutil
+        shutil.rmtree(base, ignore_errors = True)
+
+
+def test_macos_profile_hides_shared_sandbox_and_project_bases(tmp_path, monkeypatch):
+    """Both bases sit under a read root here, so the profile has to deny them before
+    allowing the acting account's own roots back."""
+    prefix = tmp_path / "prefix"
+    sandboxes = prefix / "sandboxes"
+    projects = prefix / "projects"
+    sandboxes.mkdir(parents = True)
+    projects.mkdir(parents = True)
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(sandboxes))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(projects))
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(tool_confinement.shutil, "which", lambda name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(tool_confinement, "_interpreter_roots", lambda: [str(prefix)])
+    run_as(ALICE, tools._get_workdir, "chat")
+
+    profile = run_as(BOB, tools._account_confinement).wrap(["bash"])[2]
+    bob_sandbox = str(Path(run_as(BOB, tools.sandbox_root)).resolve())
+    alice_sandbox = str(Path(run_as(ALICE, tools.sandbox_root)).resolve())
+    for base in (sandboxes, projects):
+        deny = profile.index(f'(deny file-read* file-write* (subpath "{base.resolve()}"))')
+        assert profile.index(f'(allow file-read* (subpath "{prefix.resolve()}"))') < deny
+    allow_own = profile.index(f'(allow file-read* file-write* (subpath "{bob_sandbox}"))')
+    assert (
+        profile.rindex(f'(deny file-read* file-write* (subpath "{sandboxes.resolve()}"))')
+        < allow_own
+    )
+    assert f'(subpath "{alice_sandbox}")' not in profile
+
+
+def test_bases_outside_a_granted_root_leave_the_landlock_rules_unchanged(tmp_path):
+    """Protecting the shared bases costs nothing where no read grant reaches them: the
+    rules are the ones the install root alone produced."""
+    if sys.platform != "linux":
+        pytest.skip("Linux rule builder")
+    from utils.paths.storage_roots import studio_root
+
+    run_as(ALICE, tools._get_workdir, "chat")
+    rules = run_as(ALICE, tool_confinement._landlock_rules, 3, tools._SANDBOX_SITE_DIR)
+    install_only = tool_confinement._existing((run_as(ALICE, studio_root),))
+    original = tool_confinement._protected_roots
+    tool_confinement._protected_roots = lambda: install_only
+    try:
+        baseline = run_as(ALICE, tool_confinement._landlock_rules, 3, tools._SANDBOX_SITE_DIR)
+    finally:
+        tool_confinement._protected_roots = original
+    assert rules == baseline
+
+
+def test_default_layout_denies_exactly_the_previous_macos_roots(tmp_path, monkeypatch):
+    """A default install keeps both bases inside roots the profile already denies, so the
+    profile is byte for byte the one it was."""
+    import tempfile as _tempfile
+
+    home = tmp_path / "home"
+    (home / "Documents").mkdir(parents = True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(home / "Documents" / "Unsloth Studio"))
+    shared_tmp = tmp_path / "tmp"
+    shared_tmp.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(shared_tmp))
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(tool_confinement.shutil, "which", lambda name: "/usr/bin/sandbox-exec")
+    profile = run_as(ALICE, tools._account_confinement).wrap(["bash"])[2]
+    denied = {
+        line.split('"')[1] for line in profile.splitlines() if line.startswith("(deny file-read*")
+    }
+    assert denied == {
+        str((tmp_path / "studio").resolve()),
+        str((shared_tmp / "unsloth-studio").resolve()),
+        str(home.resolve()),
+    }
