@@ -25,7 +25,7 @@ from huggingface_hub import HfApi
 
 from auth import policy
 from core.inference.gpu_arbiter import GpuBusyForAnotherAccountError
-from utils.paths.storage_roots import studio_db_path, workspace_root
+from utils.paths.storage_roots import project_workspaces_root, studio_db_path, workspace_root
 
 from utils.account_context import (
     OWNER,
@@ -552,7 +552,9 @@ def model_visible(
     if path.is_absolute() or reference.startswith(("./", "../", "~")) or path.exists():
         try:
             resolved = path.resolve()
-            if resolved.is_relative_to(workspace_root().resolve()):
+            # Both private roots: training writes checkpoints into either one.
+            own_roots = (workspace_root(), project_workspaces_root())
+            if any(resolved.is_relative_to(root.resolve()) for root in own_roots):
                 return True
             from utils.hf_cache_settings import known_hf_hub_caches
 

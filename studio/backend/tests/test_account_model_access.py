@@ -537,3 +537,23 @@ def test_a_persisted_public_proof_expires_rather_than_outliving_a_privacy_change
     path.write_text(json.dumps({"model:org/public": time.time() - 30 * 24 * 3600}))
     assert not run_as(BOB, access.repo_visible, "org/public")
     assert not run_as(ALICE, access.repo_visible, "org/public")
+
+
+def test_a_checkpoint_in_the_accounts_projects_tree_is_loadable_by_that_account(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "projects"))
+    from core.training.account_jobs import validate_job_paths
+    from utils.paths.storage_roots import project_workspaces_root
+
+    checkpoint = run_as(ALICE, project_workspaces_root) / "demo" / "outputs" / "checkpoint-10"
+    checkpoint.mkdir(parents = True)
+    # Training already accepts this destination, so loading it back must agree.
+    run_as(ALICE, validate_job_paths, {"output_dir": str(checkpoint)})
+    assert run_as(ALICE, access.model_visible, str(checkpoint))
+    assert run_as(ALICE, access.require_model_access, str(checkpoint)) is None
+    assert not run_as(BOB, access.model_visible, str(checkpoint))
+    with pytest.raises(HTTPException) as refused:
+        run_as(BOB, access.require_model_access, str(checkpoint))
+    assert refused.value.status_code == 404
+    assert run_as(OWNER, project_workspaces_root) != run_as(ALICE, project_workspaces_root)
