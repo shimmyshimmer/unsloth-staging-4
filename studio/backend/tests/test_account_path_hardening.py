@@ -224,6 +224,20 @@ def test_a_recreated_username_cannot_read_the_previous_accounts_monitor_rows():
     assert run_as(old_alice, monitor.get, request_id, subject = "alice") is not None  # still running
 
 
+def test_unload_rows_without_a_subject_stay_inside_the_account_that_recorded_them():
+    """Manual and idle unloads carry no subject but still name the unloaded model."""
+    monitor = api_monitor.ApiMonitor()
+    run_as(
+        ALICE, monitor.record_lifecycle, event = "unload", model = "acme/private", reason = "manual"
+    )
+    run_as(
+        ALICE, monitor.record_lifecycle, event = "unload", model = "alice-run-merged", reason = "idle"
+    )
+    assert run_as(BOB, monitor.snapshot, subject = "bob") == []
+    assert len(run_as(ALICE, monitor.snapshot, subject = "alice")) == 2
+    assert len(run_as(OWNER, monitor.snapshot, subject = "unsloth")) == 2
+
+
 def test_one_account_installs_keep_every_monitor_row(monkeypatch):
     """The owner's id is constant, so a single-account install compares as before."""
     monkeypatch.setattr(policy, "installation_is_multi_user", lambda: False)

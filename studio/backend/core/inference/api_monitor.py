@@ -1045,9 +1045,10 @@ api_monitor = ApiMonitor(enabled = not _api_monitor_disabled())
 def _lifecycle_row_visible_to_caller(entry: "ApiMonitorEntry", subject: str) -> bool:
     """Lifecycle rows name a model path that may sit inside the loading account's
     workspace, so only the owner and that account see them."""
-    if entry.kind != "lifecycle" or entry.subject is None:
+    if entry.kind != "lifecycle":
         return True
-    if entry.subject == subject and entry.account_id == current_account_id():
+    # Subjectless rows (manual/idle unloads) still name a model: the recording account decides.
+    if entry.account_id == current_account_id() and entry.subject in (None, subject):
         return True
     from utils.account_context import is_owner_context
 
