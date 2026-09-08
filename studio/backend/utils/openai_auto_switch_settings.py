@@ -45,7 +45,7 @@ import threading
 import time
 from typing import Any, Mapping, Optional
 
-from utils.account_context import current_account_id
+from utils.account_context import OWNER, run_as
 
 OPENAI_AUTO_SWITCH_SETTING_KEY = "openai_api_auto_switch_model"
 OPENAI_AUTO_DOWNLOAD_SETTING_KEY = "openai_api_auto_download_model"
@@ -97,7 +97,7 @@ def _apply_idle_floor(seconds: int) -> int:
 
 def _cached_setting(key: str, default: Any) -> Any:
     """Read an app setting, memoized for _CACHE_TTL_S to spare the hot path."""
-    cache_key = (current_account_id(), key)
+    cache_key = (OWNER.account_id, key)
     now = time.monotonic()
     with _cache_lock:
         hit = _cache.get(cache_key)
@@ -105,7 +105,8 @@ def _cached_setting(key: str, default: Any) -> Any:
             return hit[1]
     try:
         from storage.studio_db import get_app_setting
-        stored = get_app_setting(key, None)
+        # Owner-only, install-wide setting: read from the owner's database.
+        stored = run_as(OWNER, get_app_setting, key, None)
     except Exception:
         stored = None
     value = default if stored is None else stored
@@ -115,7 +116,7 @@ def _cached_setting(key: str, default: Any) -> Any:
 
 
 def _invalidate(key: str) -> None:
-    cache_key = (current_account_id(), key)
+    cache_key = (OWNER.account_id, key)
     with _cache_lock:
         _cache.pop(cache_key, None)
 

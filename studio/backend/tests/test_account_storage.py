@@ -209,30 +209,11 @@ def test_profile_cache_and_invalidation_are_private(account_home):
     assert run_as(ALICE, profile_stats_db.compute_profile_stats) is not values[ALICE]
 
 
+# Model memory, VRAM budget and auto-switch describe the one shared llama-server, so they are
+# install-wide and covered by test_account_shared_load_settings.py instead.
 @pytest.mark.parametrize(
     "module_name,setter,getter,first,second",
     [
-        (
-            "model_memory_settings",
-            "set_model_memory_settings",
-            "get_keep_resident",
-            (True, False),
-            (False, False),
-        ),
-        (
-            "vram_budget_settings",
-            "set_vram_budget_fraction",
-            "get_vram_budget_fraction",
-            (0.8,),
-            (0.9,),
-        ),
-        (
-            "openai_auto_switch_settings",
-            "set_openai_auto_switch",
-            "get_openai_auto_switch_enabled",
-            (True, 0),
-            (False, 0),
-        ),
         (
             "embedding_model_settings",
             "set_rag_embedding_model",

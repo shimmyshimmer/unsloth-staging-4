@@ -19,7 +19,7 @@ import threading
 import time
 from typing import Any, Optional
 
-from utils.account_context import current_account_id
+from utils.account_context import OWNER, run_as
 
 KEEP_RESIDENT_SETTING_KEY = "model_memory_keep_resident"
 NO_RAM_RESERVE_SETTING_KEY = "model_memory_no_ram_reserve"
@@ -55,7 +55,7 @@ _MAX_REREADS = 3
 
 
 def _cached_setting(key: str) -> Any:
-    cache_key = (current_account_id(), key)
+    cache_key = (OWNER.account_id, key)
     for _attempt in range(_MAX_REREADS):
         with _cache_lock:
             hit = _cache.get(cache_key)
@@ -64,7 +64,8 @@ def _cached_setting(key: str) -> Any:
             generation = _generation.get(cache_key, 0)
         try:
             from storage.studio_db import get_app_setting
-            stored = get_app_setting(key, None)
+            # Owner-only, install-wide setting: read from the owner's database.
+            stored = run_as(OWNER, get_app_setting, key, None)
         except Exception:
             # An unreadable DB must not fail a load; fall back to the default.
             return None
@@ -83,7 +84,7 @@ def _invalidate(*keys: str) -> None:
     transaction, so invalidating them separately would let a load in between read
     a new keep_resident against a cached old no_ram_reserve and emit --mlock for
     a combination that was never stored."""
-    account_id = current_account_id()
+    account_id = OWNER.account_id
     with _cache_lock:
         for key in keys:
             cache_key = (account_id, key)
@@ -116,8 +117,8 @@ def should_mlock() -> bool:
 def _pair_generations() -> tuple[int, int]:
     with _cache_lock:
         return (
-            _generation.get((current_account_id(), KEEP_RESIDENT_SETTING_KEY), 0),
-            _generation.get((current_account_id(), NO_RAM_RESERVE_SETTING_KEY), 0),
+            _generation.get((OWNER.account_id, KEEP_RESIDENT_SETTING_KEY), 0),
+            _generation.get((OWNER.account_id, NO_RAM_RESERVE_SETTING_KEY), 0),
         )
 
 

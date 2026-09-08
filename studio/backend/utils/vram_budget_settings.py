@@ -26,7 +26,7 @@ import threading
 import time
 from typing import Any, Optional
 
-from utils.account_context import current_account_id
+from utils.account_context import OWNER, run_as
 
 VRAM_BUDGET_SETTING_KEY = "vram_budget_fraction"
 
@@ -56,7 +56,7 @@ _MAX_REREADS = 3
 
 
 def _cached_setting(key: str) -> Any:
-    cache_key = (current_account_id(), key)
+    cache_key = (OWNER.account_id, key)
     for _attempt in range(_MAX_REREADS):
         with _cache_lock:
             hit = _cache.get(cache_key)
@@ -65,7 +65,8 @@ def _cached_setting(key: str) -> Any:
             generation = _generation.get(cache_key, 0)
         try:
             from storage.studio_db import get_app_setting
-            stored = get_app_setting(key, None)
+            # Owner-only, install-wide setting: read from the owner's database.
+            stored = run_as(OWNER, get_app_setting, key, None)
         except Exception:
             # An unreadable DB must not fail a load; fall back to the default.
             return None
@@ -78,7 +79,7 @@ def _cached_setting(key: str) -> Any:
 
 
 def _invalidate(key: str) -> None:
-    cache_key = (current_account_id(), key)
+    cache_key = (OWNER.account_id, key)
     with _cache_lock:
         _cache.pop(cache_key, None)
         _generation[cache_key] = _generation.get(cache_key, 0) + 1
