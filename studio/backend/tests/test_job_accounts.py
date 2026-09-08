@@ -1097,3 +1097,45 @@ def test_a_second_account_cannot_start_the_same_dataset_download(monkeypatch):
     bob = start(BOB)
     assert not bob["accepted"] and not bob["attached"]
     assert launched == ["org/data"]
+
+
+def test_startup_reconciliation_settles_a_deactivated_accounts_interrupted_runs(
+    tmp_path, monkeypatch
+):
+    """Deactivation does not settle rows, so a restart must reach that account before it returns."""
+    from auth import storage
+    from storage import studio_db
+
+    home = tmp_path / "install"
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(home))
+    monkeypatch.setattr(storage, "DB_PATH", home / "auth" / "auth.db")
+    monkeypatch.setattr(storage, "_BOOTSTRAP_PW_PATH", home / "auth" / ".bootstrap_password")
+    monkeypatch.setattr(storage, "_credential_encryption_key_cache", None)
+    monkeypatch.setattr(studio_db, "_schema_ready", set())
+    policy.invalidate_account_cache()
+    try:
+        storage.create_initial_user("unsloth", "account-password", "unsloth-jwt-secret")
+        storage.create_initial_user("alice", "account-password", "alice-jwt-secret")
+        alice = storage.get_account("alice")
+        run_as(
+            alice,
+            studio_db.create_run,
+            id = "interrupted",
+            model_name = "m",
+            dataset_name = "d",
+            config_json = "{}",
+            started_at = "2026-01-01T00:00:00Z",
+            total_steps = 10,
+        )
+        assert run_as(alice, studio_db.get_run, "interrupted")["status"] == "running"
+
+        storage.set_account_active(alice.account_id, False)
+        policy.invalidate_account_cache()
+
+        reconciled = jobs.startup_reconciliation_accounts()
+        assert alice.account_id in {account.account_id for account in reconciled}
+        for account in reconciled:
+            run_as(account, studio_db.cleanup_orphaned_runs)
+        assert run_as(alice, studio_db.get_run, "interrupted")["status"] == "error"
+    finally:
+        policy.invalidate_account_cache()

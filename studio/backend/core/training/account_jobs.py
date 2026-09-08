@@ -436,12 +436,32 @@ def job_accounts() -> list[AccountContext]:
         conn.close()
 
 
+def _inactive_job_accounts() -> list[AccountContext]:
+    """Deactivated accounts: supervisors skip them, but a restart still settles their rows."""
+    if not _has_managed_accounts():
+        return []
+    from auth import storage
+
+    conn = storage.get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT account_id, username, role FROM auth_user WHERE is_active = 0"
+        ).fetchall()
+        return [AccountContext(*row) for row in rows if row[0] not in _retired]
+    finally:
+        conn.close()
+
+
 def startup_reconciliation_accounts() -> list[AccountContext]:
     """Accounts a boot-time reconciliation must visit; a managed account with no database yet is skipped, since opening one would create it."""
     from utils.paths.storage_roots import studio_db_path
 
     accounts: list[AccountContext] = []
-    for account in job_accounts():
+    seen: set[str] = set()
+    for account in (*job_accounts(), *_inactive_job_accounts()):
+        if account.account_id in seen:
+            continue
+        seen.add(account.account_id)
         if account.is_owner:
             accounts.append(account)
             continue
