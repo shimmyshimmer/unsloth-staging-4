@@ -18794,6 +18794,11 @@ async def _transcribe_audio_result(
         await asyncio.to_thread(
             functools.partial(load_stt, model, serving_engine, cancel_event, device = device)
         )
+        # Same claim as stt_load: an implicit load with no provenance reads as owner-resident,
+        # so the caller would see yours: false and could not unload its own model.
+        loaded = getattr(sidecar, "loaded_model", None)
+        if loaded is not None and loaded == _stt_resolved_model_id(model, serving_engine):
+            account_access.note_resident_account(f"stt:{serving_engine}", loaded)
         if cancel_event is None:
             result = await asyncio.to_thread(sidecar.transcribe, raw, model, language, fast)
         else:

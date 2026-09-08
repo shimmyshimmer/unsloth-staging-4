@@ -620,6 +620,40 @@ def test_stt_load_does_not_claim_a_model_another_account_switched_to(monkeypatch
     assert access._resident_accounts["stt:transformers"][0] == BOB.account_id
 
 
+def test_implicit_transcribe_load_records_the_caller_as_resident(monkeypatch):
+    """A transcribe call loads the model on demand; without provenance it reads as
+    owner-resident and the caller can neither see it as theirs nor unload it."""
+    sidecar = SimpleNamespace(loaded_model = None, device = None)
+    monkeypatch.setattr(access, "_resident_accounts", {})
+    monkeypatch.setattr(access, "require_model_access", lambda *a, **k: None)
+    monkeypatch.setattr(inference, "_resolve_serving_stt_engine", lambda engine: "transformers")
+    monkeypatch.setattr(inference, "_stt_sidecar_for", lambda engine: sidecar)
+    monkeypatch.setattr(inference, "_stt_resolved_model_id", lambda model, engine: model)
+    monkeypatch.setattr(inference, "_prepare_runtime_fallback_checkpoint", lambda *a, **k: None)
+
+    def _load(
+        model,
+        engine,
+        cancel_event,
+        device = None,
+    ):
+        sidecar.loaded_model = model
+
+    sidecar.transcribe = lambda *a, **k: {"text": "hi"}
+    monkeypatch.setattr(inference, "_stt_lifecycle", lambda: (_load, lambda *a, **k: []))
+
+    result = asyncio.run(
+        arun_as(
+            ALICE,
+            inference._transcribe_audio_result(
+                b"audio", "alice/model", None, False, "transformers"
+            ),
+        )
+    )
+    assert result == {"text": "hi"}
+    assert access._resident_accounts["stt:transformers"][0] == ALICE.account_id
+
+
 def test_legacy_generate_stream_refuses_another_accounts_resident_model(monkeypatch):
     """The body names no model, so the route must authorize the resident one, not a request field."""
     monkeypatch.setattr(gpu_arbiter, "_owner", "chat")
