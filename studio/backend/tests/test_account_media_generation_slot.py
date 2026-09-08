@@ -105,9 +105,7 @@ def engine(monkeypatch):
 def _post_generate(account, engine, results, key):
     def run():
         with client_for(account) as client:
-            results[key] = client.post(
-                "/api/inference/images/generate", json = {"prompt": "a sloth"}
-            )
+            results[key] = client.post("/api/inference/images/generate", json = {"prompt": "a sloth"})
 
     thread = threading.Thread(target = run, daemon = True)
     thread.start()

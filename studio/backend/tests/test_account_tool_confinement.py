@@ -102,9 +102,9 @@ def test_macos_profile_hides_install_root_then_allows_own_roots(tmp_path, monkey
     deny = profile.index(f'(deny file-read* file-write* (subpath "{studio}"))')
     allow = profile.index(f'(allow file-read* (subpath "{alice_root}"))')
     writable = profile.index(f'(allow file-read* file-write* (subpath "{alice_root}/sandbox"))')
-    assert (
-        deny < allow < writable
-    ), "the account roots must be allowed after the install root is denied"
+    assert deny < allow < writable, (
+        "the account roots must be allowed after the install root is denied"
+    )
     assert argv[3:] == ["bash", "-c", "true"]
 
 

@@ -72,7 +72,6 @@ class ReservingVideoBackend:
 
     def cancel_generate(self, *args, **kwargs):
         from utils.account_context import current_account
-
         self.cancelled.append(current_account().username)
         return True
 
@@ -181,7 +180,6 @@ def test_the_real_backend_records_the_account_inside_the_locked_reservation():
     video_module.validate_video_request_shape = lambda *a, **k: None
     try:
         from utils.account_context import run_as
-
         run_as(BOB, functools.partial(backend.begin_generate, prompt = "p", steps = 5))
     finally:
         video_module.validate_video_request_shape = original

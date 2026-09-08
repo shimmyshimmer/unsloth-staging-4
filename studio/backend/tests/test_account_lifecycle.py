@@ -385,7 +385,7 @@ def test_regeneration_invalidates_old_setup_and_its_session(auth_env):
     first = create(client, "alice").json()
     session = login(client, "alice", first["setup_code"]).json()
     second = client.post(
-        f'/api/accounts/{first["account"]["account_id"]}/setup-code', headers = headers()
+        f"/api/accounts/{first['account']['account_id']}/setup-code", headers = headers()
     ).json()
     assert first["setup_code"] != second["setup_code"]
     assert login(client, "alice", first["setup_code"]).status_code == 401
@@ -406,7 +406,7 @@ def test_regeneration_invalidates_old_setup_and_its_session(auth_env):
 def test_activity_updates_policy_and_deactivated_login_stays_refused_in_single_mode(auth_env):
     client, _, _ = auth_env
     body = create(client, "alice").json()
-    url = f'/api/accounts/{body["account"]["account_id"]}'
+    url = f"/api/accounts/{body['account']['account_id']}"
     assert policy.login_mode() == "multi"
     assert client.patch(url, headers = headers(), json = {"is_active": False}).status_code == 200
     assert policy.login_mode() == "single"
@@ -696,7 +696,7 @@ def test_recreated_account_rejects_late_tokens_from_the_deleted_identity(matrix)
     client, _, _ = matrix
     old = storage.get_user_record("alice")
     old_access = authentication.create_access_token("alice")
-    assert client.delete(f'/api/accounts/{old["account_id"]}', headers = headers()).status_code == 204
+    assert client.delete(f"/api/accounts/{old['account_id']}", headers = headers()).status_code == 204
     fresh = create(client, "alice").json()
     # A request which verified before deletion may still insert its refresh row.
     late_refresh = authentication.create_refresh_token("alice", secret = old["jwt_secret"])

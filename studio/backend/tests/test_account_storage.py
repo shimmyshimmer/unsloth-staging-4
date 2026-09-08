@@ -279,8 +279,9 @@ def test_hf_validation_cache_and_budget_are_private(monkeypatch):
     monkeypatch.setattr(
         validation,
         "_check_remote",
-        lambda token: calls.append(current_account_id())
-        or validation.TokenValidationResult(status = "valid"),
+        lambda token: (
+            calls.append(current_account_id()) or validation.TokenValidationResult(status = "valid")
+        ),
     )
     monkeypatch.setattr(validation, "_MAX_ATTEMPTS", 1)
     try:
@@ -496,9 +497,9 @@ def test_warm_owner_connections_do_not_resolve_database_again(
     original = Path.resolve
 
     def resolve(candidate, *args, **kwargs):
-        assert (
-            candidate != path
-        ), "Warm owner connections must not repeat database realpath resolution"
+        assert candidate != path, (
+            "Warm owner connections must not repeat database realpath resolution"
+        )
         return original(candidate, *args, **kwargs)
 
     monkeypatch.setattr(Path, "resolve", resolve)
