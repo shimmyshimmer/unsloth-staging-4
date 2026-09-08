@@ -13,6 +13,7 @@ import pytest
 
 from auth import policy
 from utils import (
+    hf_cache_settings,
     llama_cpp_path_settings,
     model_memory_settings,
     openai_auto_switch_settings,
@@ -29,6 +30,7 @@ ALICE = AccountContext("a" * 32, "alice")
 def studio_home(monkeypatch, tmp_path):
     monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
     monkeypatch.setattr(policy, "installation_is_multi_user", lambda: True)
+    monkeypatch.setattr(hf_cache_settings, "_EXPLICIT_CACHE_ENV", {})
     for module in (model_memory_settings, vram_budget_settings, openai_auto_switch_settings):
         monkeypatch.setattr(module, "_cache", {})
         if hasattr(module, "_generation"):
@@ -73,3 +75,16 @@ def test_a_managed_load_reads_the_owners_llama_cpp_path(tmp_path, monkeypatch):
     run_as(OWNER, llama_cpp_path_settings.set_custom_llama_cpp_path, str(binary.parent))
     assert run_as(ALICE, llama_cpp_path_settings.get_stored_custom_llama_cpp_path) is not None
     assert run_as(ALICE, llama_cpp_path_settings.custom_llama_cpp_path_source) == "studio"
+
+
+def test_a_managed_scan_keys_on_the_owners_cache_home(tmp_path):
+    custom = tmp_path / "external" / "huggingface"
+    custom.parent.mkdir(parents = True, exist_ok = True)
+    run_as(OWNER, hf_cache_settings.set_hf_cache_home, str(custom))
+    # The key exists to separate in-flight scans per cache volume, so it must name the
+    # home the managed account actually scans.
+    assert run_as(ALICE, hf_cache_settings.get_hf_cache_paths).cache_home == custom
+    assert run_as(ALICE, hf_cache_settings.configured_cache_key) == run_as(
+        OWNER, hf_cache_settings.configured_cache_key
+    )
+    assert run_as(ALICE, hf_cache_settings.configured_cache_key) == "studio:" + str(custom)

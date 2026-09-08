@@ -140,7 +140,10 @@ def configured_cache_key() -> str:
         return "env:" + explicit
     try:
         from storage.studio_db import get_app_setting
-        value = get_app_setting(CACHE_HOME_SETTING_KEY, None)
+        from utils.account_context import OWNER, run_as
+
+        # The key must name the home _stored_cache_home returns: the owner's.
+        value = run_as(OWNER, get_app_setting, CACHE_HOME_SETTING_KEY, None)
     except Exception:
         return "default"
     if isinstance(value, str) and value.strip():
