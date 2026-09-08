@@ -320,6 +320,66 @@ def test_owner_start_while_the_last_managed_account_is_deactivated_keeps_its_own
     assert exc.value.status_code == 404
 
 
+def test_deactivating_the_last_managed_account_keeps_its_job_private(training, monkeypatch):
+    """Deactivating Alice turns the login mode single while her tag, status, logs and
+    cancellation are still on the service; the owner must not inherit any of them."""
+    from routes import training as route
+
+    backend, proc, _ = training
+    assert start_training(backend)
+    backend._progress = TrainingProgress(is_training = True, status_message = "Secret model", loss = 9.5)
+    backend.loss_history = [9.5]
+    backend.step_history = [1]
+    backend._output_dir = "/private/alice"
+    monkeypatch.setattr(route, "get_training_backend", lambda: backend)
+    monkeypatch.setattr(policy, "installation_is_multi_user", lambda: False)  # Alice is deactivated.
+    monkeypatch.setattr(policy, "installation_has_managed_accounts", lambda: True)
+
+    status = asyncio.run(arun_as(OWNER, route.get_training_status("unsloth")))
+    assert status.message == "Busy"
+    assert status.job_id == "" and status.details is None and status.metric_history is None
+    metrics = asyncio.run(arun_as(OWNER, route.get_training_metrics(current_subject = "unsloth")))
+    assert metrics.loss_history == [] and metrics.current_loss is None
+    with pytest.raises(HTTPException) as exc:
+        run_as(OWNER, backend.stop_training, expected_job_id = "job-a")
+    assert exc.value.status_code == 404
+    assert proc.is_alive()
+
+
+def test_reactivation_clears_the_retirement_left_by_a_failed_delete(monkeypatch):
+    """A delete that fails after retiring the jobs leaves the row disabled and the id
+    tombstoned in this process. Reactivating has to lift it, or the account can log in
+    while every job, download and supervisor keeps refusing it until a restart."""
+    from core import research_runs
+    from core.export.orchestrator import ExportOrchestrator
+    from core.rag import folder_sync, ingestion
+    from hub.services.datasets import downloads
+
+    def fail():
+        raise RuntimeError("a worker is still alive")
+
+    broken = ExportOrchestrator()
+    broken._result_account = ALICE
+    monkeypatch.setattr(broken, "_account_cancel", fail)
+    monkeypatch.setattr(jobs, "_services", [broken])
+    monkeypatch.setattr(downloads, "retire_account_downloads", lambda: None)
+    monkeypatch.setattr(ingestion, "retire_account_ingestions", lambda: None)
+    monkeypatch.setattr(folder_sync, "retire_account_sync", lambda: None)
+    monkeypatch.setattr(research_runs, "retire_account_research", lambda account: None)
+    monkeypatch.setattr(policy, "installation_has_managed_accounts", lambda: True)
+    with pytest.raises(RuntimeError):
+        jobs.retire_account_jobs(ALICE)
+
+    service = _OwnedJobService()
+    with pytest.raises(HTTPException) as exc:
+        run_as(ALICE, service.start)
+    assert exc.value.status_code == 403
+
+    jobs.restore_account_jobs(ALICE.account_id)
+    assert run_as(ALICE, jobs.account_is_retired) is False
+    assert run_as(ALICE, service.start) == "started"
+
+
 def test_an_install_that_never_had_a_managed_account_does_no_job_bookkeeping(monkeypatch):
     monkeypatch.setattr(policy, "installation_is_multi_user", lambda: False)
     monkeypatch.setattr(policy, "installation_has_managed_accounts", lambda: False)

@@ -208,11 +208,12 @@ def init_job_owner(
 
 
 def job_is_foreign(service) -> bool:
+    # A deactivated account's tag survives on the service, so gate as owned_job does.
     owner = getattr(service, "_result_account", OWNER)
     return (
         isinstance(owner, AccountContext)
         and owner.account_id != current_account().account_id
-        and _multi_user()
+        and _has_managed_accounts()
     )
 
 
@@ -271,7 +272,7 @@ def job_control(fn):
     @wraps(fn)
     def wrapped(self, *args, **kwargs):
         lock = getattr(self, "_account_job_lock", None)
-        if lock is None or not _multi_user():
+        if lock is None or not _has_managed_accounts():
             return fn(self, *args, **kwargs)
         with lock:
             require_job_owner(self)
@@ -291,7 +292,7 @@ def job_read(neutral):
         @wraps(fn)
         def wrapped(self, *args, **kwargs):
             lock = getattr(self, "_account_job_lock", None)
-            if lock is None or not _multi_user():
+            if lock is None or not _has_managed_accounts():
                 return fn(self, *args, **kwargs)
             with lock:
                 if self.job_account is not None:
@@ -407,6 +408,12 @@ def retire_account_jobs(account: AccountContext) -> None:
         raise RuntimeError(
             "Could not retire every account job; keep its directories in place"
         ) from errors[0]
+
+
+def restore_account_jobs(account_id: str) -> None:
+    """Reactivation lifts the process-local retirement a failed delete left behind."""
+    with _services_lock:
+        _retired.discard(account_id)
 
 
 def account_is_retired() -> bool:
