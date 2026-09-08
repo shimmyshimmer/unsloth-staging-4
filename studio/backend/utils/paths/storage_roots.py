@@ -512,7 +512,8 @@ def within_account(path: Path) -> bool:
     """Whether ``path`` really lives in the acting account's own roots.
 
     Always true for the owner. For a managed account the symlink-resolved path must sit under
-    its workspace or tmp root, so a planted link cannot read outside the account.
+    its workspace, project workspace or tmp root, so a planted link cannot read outside the
+    account.
     """
     if is_owner_context():
         return True
@@ -520,7 +521,8 @@ def within_account(path: Path) -> bool:
         real = Path(os.path.realpath(path))
     except OSError:
         return False
-    for root in (workspace_root(), tmp_root()):
+    # The same owned roots as account_jobs.account_path, so preflight and the worker agree.
+    for root in (workspace_root(), project_workspaces_root(), tmp_root()):
         try:
             real.relative_to(Path(os.path.realpath(root)))
             return True

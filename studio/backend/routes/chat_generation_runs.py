@@ -234,7 +234,9 @@ def cancel_account_run(request: Request, run_id: str, *, supervisor_name: str) -
     """
     if policy.installation_is_multi_user():
         active_generations.cancel_run(run_id, account_id = current_account_id())
-        return
+        if supervisor_name == "chat_generation_supervisor":
+            return
+        # The research supervisor is not registered there: signal its account-keyed event.
     supervisor = getattr(request.app.state, supervisor_name, None)
     if supervisor is not None:
         supervisor.cancel(run_id)

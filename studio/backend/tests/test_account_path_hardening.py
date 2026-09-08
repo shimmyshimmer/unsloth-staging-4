@@ -382,3 +382,24 @@ def test_export_size_cache_is_keyed_per_managed_account(monkeypatch):
         500,
         "ALICE-SOURCE",
     )
+
+
+def test_a_managed_account_may_export_into_its_own_project_workspace(tmp_path, monkeypatch):
+    """account_jobs treats project_workspaces_root as an owned root, so the same absolute
+    destination must survive the export worker and scan-folder registration too."""
+    from core.training import account_jobs
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "documents"))
+    own = run_as(BOB, storage_roots.project_workspaces_root) / "demo" / "exports"
+    own.mkdir(parents = True)
+    # Preflight accepts it.
+    run_as(BOB, account_jobs.validate_job_paths, {"save_directory": str(own)})
+    assert run_as(BOB, storage_roots.resolve_export_write_dir, str(own)) == own
+    assert run_as(BOB, scan_folders.add_scan_folder_with_status, str(own))[1]
+    # Another account's project workspace stays refused.
+    foreign = run_as(ALICE, storage_roots.project_workspaces_root) / "alice-demo"
+    foreign.mkdir(parents = True)
+    with pytest.raises(ValueError, match = "escapes the account workspace"):
+        run_as(BOB, storage_roots.resolve_export_write_dir, str(foreign))
+    with pytest.raises(ValueError, match = "outside this account"):
+        run_as(BOB, scan_folders.add_scan_folder_with_status, str(foreign))

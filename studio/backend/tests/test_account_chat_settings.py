@@ -239,7 +239,8 @@ def test_cancellation_never_uses_an_unscoped_supervisor(supervisor_name):
             supervisor_name = supervisor_name,
         )
     assert alice_event.is_set() and not bob_event.is_set()
-    assert calls == []
+    # The research supervisor keys its events by account, so it is signalled directly.
+    assert calls == ([] if supervisor_name == "chat_generation_supervisor" else ["same"])
 
 
 @pytest.mark.parametrize(
@@ -269,7 +270,8 @@ def test_thread_cleanup_scopes_run_ids(cleanup, supervisor_present):
     ):
         run_as(ALICE, cleanup, request, ["same"])
     assert alice_event.is_set() and not bob_event.is_set()
-    assert calls == []
+    research = supervisor_present and cleanup is not chat_history._cancel_chat_generation_runs
+    assert calls == (["same"] if research else [])
 
 
 def test_cancel_route_scopes_same_id_in_two_accounts(client):
@@ -638,3 +640,21 @@ def test_deep_research_foreign_run_is_not_visible_or_cancellable(client):
     assert client.get("/research/research").status_code == 404
     assert client.post("/research/research/cancel").status_code == 404
     assert run_as(BOB, research_runs_db.get_run, "research")["status"] == "planning"
+
+
+def test_research_cleanup_reaches_the_account_keyed_supervisor():
+    """Deleting a thread must set the real supervisor's account-qualified cancel event
+    for the acting account only, the way it did before installs became multi-account."""
+    from core import research_runs as research_runs_core
+
+    supervisor = research_runs_core.ResearchSupervisor.__new__(
+        research_runs_core.ResearchSupervisor
+    )
+    supervisor._cancel_events = {}
+    request = SimpleNamespace(
+        app = SimpleNamespace(state = SimpleNamespace(research_supervisor = supervisor))
+    )
+    alice_event = run_as(ALICE, supervisor._cancel_event, "same")
+    bob_event = run_as(BOB, supervisor._cancel_event, "same")
+    run_as(ALICE, chat_history._cancel_research_runs, request, ["same"])
+    assert alice_event.is_set() and not bob_event.is_set()
