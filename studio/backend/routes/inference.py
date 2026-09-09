@@ -15921,6 +15921,21 @@ async def check_transformers_upgrade_route(
     """
     from utils.transformers_version import latest_tier_active_for
 
+    if account_access.managed_account():
+        # Same boundary as /models/remote-code-scan: the preflight opens config.json at
+        # whatever these resolve to, and the answer describes what it found there.
+        for ref in (
+            request.model_name,
+            request.model_local_path,
+            request.model_snapshot_path,
+            request.model_snapshot_repo_id,
+        ):
+            if isinstance(ref, str) and ref:
+                await asyncio.to_thread(account_access.require_model_access, ref)
+        # None reads as ambient-authorized downstream and keeps the hub-cache fallback open.
+        request = request.model_copy(
+            update = {"hf_token": account_access.account_hf_token(request.hf_token)}
+        )
     model_name = request.model_name
     # Inspect what the load will open, not what the identifier resolves to today.
     load_target = await asyncio.to_thread(_upgrade_check_config_target, request)
@@ -30551,6 +30566,12 @@ async def chat_count_tokens(
     Unlike the /v1 count endpoints this never auto-switches: ``model`` is informational. The
     caller is a background recount with no abort signal, so switching could drag the backend back
     to the model loaded when the count started, a reload the client's guards cannot undo."""
+    # The body names no model, so authorize the resident one as /generate/stream does, or a
+    # managed caller counts against another account's tokenizer and reads its checkpoint id.
+    if account_access.managed_account() and await asyncio.to_thread(
+        lambda: account_access.resident_hidden("chat", _loaded_slot_ident())
+    ):
+        raise HTTPException(status_code = 404, detail = "Model not found")
     # Admitted only while nothing generates, and stood down at the next checkpoint if that changes:
     # admission is not atomic with the work, and true mutual exclusion would put a lock in front of
     # generation startup, which is the cost this avoids. Refusing here also covers the second tab or

@@ -155,9 +155,19 @@ def _writable_roots() -> list[str]:
     return _ensure_dirs((sandbox_root(), tmp_root(), project_workspaces_root()))
 
 
+def _hf_cache_roots() -> tuple[str, ...]:
+    """One install-wide Hugging Face cache serves every account, so an ancestor read
+    grant would hand a tool another account's cached private repos and the owner token."""
+    try:
+        from utils.hf_cache_settings import known_hf_cache_homes, known_hf_hub_caches
+        return tuple(str(p) for p in (*known_hf_cache_homes(), *known_hf_hub_caches()))
+    except Exception:
+        return ()
+
+
 def _protected_roots() -> list[str]:
-    """The installation plus the shared sandbox, project and temp bases: an ancestor
-    read grant (/opt, /var/lib, the interpreter prefix) would expose every account."""
+    """The installation plus the shared sandbox, project, temp and HF cache bases: an
+    ancestor read grant (/opt, /var/lib, the interpreter prefix) would expose every account."""
     from core.inference.tools import shared_sandbox_root
     from utils.paths.storage_roots import (
         shared_project_workspaces_root,
@@ -167,7 +177,12 @@ def _protected_roots() -> list[str]:
 
     return _with_shared_bases(
         _existing((studio_root(),)),
-        (shared_sandbox_root(), shared_project_workspaces_root(), shared_tmp_root()),
+        (
+            shared_sandbox_root(),
+            shared_project_workspaces_root(),
+            shared_tmp_root(),
+            *_hf_cache_roots(),
+        ),
     )
 
 
@@ -439,7 +454,7 @@ def _macos_confinement(sandbox_site_dir: str) -> Optional[Confinement]:
     # Each account's tmp, sandbox and projects share one base: deny it, re-allow only ours.
     hidden_roots = _with_shared_bases(
         _existing((str(studio_root()), str(shared_tmp_root()), os.path.expanduser("~"))),
-        (shared_sandbox_root(), str(shared_project_workspaces_root())),
+        (shared_sandbox_root(), str(shared_project_workspaces_root()), *_hf_cache_roots()),
     )
     profile = macos_profile(
         read_roots = read_roots,

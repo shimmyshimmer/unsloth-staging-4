@@ -233,6 +233,17 @@ def test_private_model_object_routes_refuse_unguarded_cache_reads(path):
     assert response.status_code == 404, response.text
 
 
+@pytest.mark.parametrize(
+    "field", ["model_name", "model_local_path", "model_snapshot_path", "model_snapshot_repo_id"]
+)
+def test_transformers_preflight_refuses_foreign_targets(field):
+    """The preflight reads config.json wherever the pin points and reports what it found."""
+    body = {"model_name": "org/public", field: "org/private"}
+    with client_for(BOB) as client:
+        response = client.post("/api/inference/transformers-upgrade-check", json = body)
+    assert response.status_code == 404, response.text
+
+
 def test_preview_load_refuses_private_foreign_target_before_gpu_work():
     with pytest.raises(HTTPException) as exc:
         asyncio.run(
@@ -652,6 +663,18 @@ def test_implicit_transcribe_load_records_the_caller_as_resident(monkeypatch):
     )
     assert result == {"text": "hi"}
     assert access._resident_accounts["stt:transformers"][0] == ALICE.account_id
+
+
+def test_count_tokens_refuses_another_accounts_resident_model(monkeypatch):
+    """``model`` is informational here, so the resident is what needs authorizing."""
+    monkeypatch.setattr(gpu_arbiter, "_owner", "chat")
+    monkeypatch.setattr(gpu_arbiter, "_owner_account", ALICE.account_id)
+    with client_for(BOB) as client:
+        response = client.post(
+            "/api/inference/chat/count_tokens",
+            json = {"model": "org/A-GGUF", "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert response.status_code == 404, response.text
 
 
 def test_legacy_generate_stream_refuses_another_accounts_resident_model(monkeypatch):

@@ -488,6 +488,44 @@ def test_macos_profile_hides_shared_sandbox_and_project_bases(tmp_path, monkeypa
     assert f'(subpath "{alice_sandbox}")' not in profile
 
 
+@pytest.mark.skipif(not LANDLOCK, reason = "Landlock not available on this kernel")
+def test_hf_cache_under_a_granted_root_is_hidden(monkeypatch):
+    """The install-wide Hugging Face cache holds every account's private repos, so a
+    cache configured under /opt or the interpreter prefix must not ride the ancestor grant."""
+    from utils import hf_cache_settings
+
+    cache = Path(sys.prefix) / f"mu-shared-hf-{os.getpid()}"
+    secret = cache / "models--acme--private" / "snapshots" / "x" / "config.json"
+    secret.parent.mkdir(parents = True)
+    secret.write_text("ACME_PRIVATE")
+    monkeypatch.setattr(hf_cache_settings, "_EXPLICIT_CACHE_ENV", {"HF_HUB_CACHE": str(cache)})
+    try:
+        run_as(BOB, tools._get_workdir, "chat")
+        rules = run_as(BOB, tool_confinement._landlock_rules, 3, tools._SANDBOX_SITE_DIR)
+        assert all(not tool_confinement._contains(p, str(secret)) for p, _ in rules)
+        out = run_as(BOB, tools._bash_exec, f"cat {secret}; echo rc=$?", session_id = "chat")
+        assert "ACME_PRIVATE" not in out and "rc=0" not in out, out
+    finally:
+        import shutil
+        shutil.rmtree(cache, ignore_errors = True)
+
+
+def test_macos_profile_hides_the_hf_cache(tmp_path, monkeypatch):
+    from utils import hf_cache_settings
+
+    prefix = tmp_path / "prefix"
+    cache = prefix / "hf" / "hub"
+    cache.mkdir(parents = True)
+    monkeypatch.setattr(hf_cache_settings, "_EXPLICIT_CACHE_ENV", {"HF_HUB_CACHE": str(cache)})
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(tool_confinement.shutil, "which", lambda name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(tool_confinement, "_interpreter_roots", lambda: [str(prefix)])
+
+    profile = run_as(BOB, tools._account_confinement).wrap(["bash"])[2]
+    deny = profile.index(f'(deny file-read* file-write* (subpath "{cache.resolve()}"))')
+    assert profile.index(f'(allow file-read* (subpath "{prefix.resolve()}"))') < deny
+
+
 def test_bases_outside_a_granted_root_leave_the_landlock_rules_unchanged(tmp_path):
     """Protecting the shared bases costs nothing where no read grant reaches them: the
     rules are the ones the install root alone produced."""
@@ -519,6 +557,13 @@ def test_default_layout_denies_exactly_the_previous_macos_roots(tmp_path, monkey
     shared_tmp = tmp_path / "tmp"
     shared_tmp.mkdir()
     monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(shared_tmp))
+    # The default cache lives under the home this test moved, not wherever the host keeps it.
+    from utils import hf_cache_settings
+
+    monkeypatch.delenv("XDG_CACHE_HOME", raising = False)
+    monkeypatch.setattr(hf_cache_settings, "_EXPLICIT_CACHE_ENV", {})
+    monkeypatch.setattr(hf_cache_settings, "_stored_cache_home", lambda: None)
+    monkeypatch.setattr(hf_cache_settings, "_stored_history", lambda: [])
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(tool_confinement.shutil, "which", lambda name: "/usr/bin/sandbox-exec")
     profile = run_as(ALICE, tools._account_confinement).wrap(["bash"])[2]
