@@ -88,6 +88,7 @@ from core.inference.sd_cpp_engine import (
 )
 from core.inference.sd_cpp_server import SdCppServer
 from loggers import get_logger
+from utils.account_context import account_thread, current_account_id
 from utils.subprocess_compat import windows_hidden_subprocess_kwargs
 
 logger = get_logger(__name__)
@@ -1069,6 +1070,7 @@ class SdCppDiffusionBackend:
         # Replaced (never cleared) per load, so a cancelled asset pull stays cancelled.
         self._cancel_event = threading.Event()
         self._active_generate_cancel: Optional[threading.Event] = None
+        self._active_generate_account: Optional[str] = None
         # sd-server started for an in-flight load, before it commits to _state; tracked so an unload can stop it
         # mid-startup.
         self._pending_server: Optional[SdCppServer] = None
@@ -1311,7 +1313,7 @@ class SdCppDiffusionBackend:
                 ),
             )
 
-        threading.Thread(
+        account_thread(
             target = self._run_load,
             kwargs = dict(
                 repo_id = repo_id,
@@ -1714,6 +1716,14 @@ class SdCppDiffusionBackend:
             if self._load_token != _load_token:
                 return
             logger.error("sd_cpp.load_failed: %s", exc)
+            if self._state is not None:
+                # The previous pipeline stays resident: hand GPU residency back to the account this
+                # load displaced (no-op on the CPU path) and drop the records it published.
+                from .gpu_arbiter import DIFFUSION, restore_owner_account
+                from hub.services.models.account_access import restore_resident_metadata
+
+                restore_owner_account(DIFFUSION)
+                restore_resident_metadata("diffusion")
             # Redact filesystem paths before this reaches /images/load-progress (as diffusers does).
             from utils.native_path_leases import redact_native_paths
 
@@ -2186,7 +2196,9 @@ class SdCppDiffusionBackend:
             )
 
         cancel = threading.Event()
-        with self._generate_lock:
+        from hub.services.models.account_access import media_generation_slot
+
+        with self._generate_lock, media_generation_slot("diffusion"):
             with self._lock:
                 state = self._state
                 if state is None:
@@ -2205,6 +2217,7 @@ class SdCppDiffusionBackend:
                 if expected_load is not None and expected_load != loaded_id:
                     raise DiffusionModelReplacedError(expected_load, loaded_id)
                 self._active_generate_cancel = cancel
+                self._active_generate_account = current_account_id()
                 # Publish an active (step 0) state before the slow pre-generate setup so a reload probe does not read
                 # idle while this holds _generate_lock.
                 self._gen = _SdGen(total_steps = int(steps))
@@ -2275,6 +2288,7 @@ class SdCppDiffusionBackend:
                         raise RuntimeError(DIFFUSION_CANCELLED_MSG)
                     if self._active_generate_cancel is cancel:
                         self._active_generate_cancel = None
+                        self._active_generate_account = None
                 return {
                     "images": images,
                     "seed": int(seed),
@@ -2304,6 +2318,7 @@ class SdCppDiffusionBackend:
                 with self._lock:
                     if self._active_generate_cancel is cancel:
                         self._active_generate_cancel = None
+                        self._active_generate_account = None
 
     def _generate_server(
         self,
@@ -2624,7 +2639,7 @@ class SdCppDiffusionBackend:
             "eta_seconds": gen.eta_seconds,
         }
 
-    def cancel_generate(self) -> bool:
+    def cancel_generate(self, expected_account: Optional[str] = None) -> bool:
         """Signal the in-flight generation to stop, matching DiffusionBackend.cancel_generate.
 
         The native engine is stricter than best-effort: the runner polls this event and kills
@@ -2633,6 +2648,12 @@ class SdCppDiffusionBackend:
         with self._lock:
             cancel = self._active_generate_cancel
             if cancel is None:
+                return False
+            # Rechecked under the lock that bound it: the slot may have changed hands.
+            if expected_account is not None and self._active_generate_account not in (
+                None,
+                expected_account,
+            ):
                 return False
             cancel.set()
             return True
