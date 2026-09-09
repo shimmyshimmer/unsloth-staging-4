@@ -149,6 +149,13 @@ def media_generation_slot(modality: str):
                 _generation_holders.pop(modality, None)
 
 
+def tracked_generation_account() -> Optional[str]:
+    """The account a cancel is authorized for, or None on a one-account install."""
+    if not policy.installation_is_multi_user():
+        return None
+    return current_account_id()
+
+
 def generation_is_mine(modality: str) -> bool:
     if not policy.installation_is_multi_user():
         return False

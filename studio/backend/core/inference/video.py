@@ -6216,10 +6216,20 @@ class VideoBackend:
             self._gen = {"active": False}
             return True
 
-    def cancel_generate(self, expected_video_id: Optional[str] = None) -> bool:
-        """Signal the in-flight generation to stop at its next step callback."""
+    def cancel_generate(
+        self,
+        expected_video_id: Optional[str] = None,
+        expected_account: Optional[str] = None,
+    ) -> bool:
+        """Signal the in-flight generation to stop at its next step callback.
+
+        The expected_* arguments name the reservation the caller authorized; rechecked
+        under the lock begin_generate reserves under, so a cancel authorized against a job
+        that has since finished cannot set a successor's event."""
         with self._lock:
             if expected_video_id is not None and self._gen_video_id != expected_video_id:
+                return False
+            if expected_account is not None and self._generate_job_account != expected_account:
                 return False
             cancel = self._active_generate_cancel
             if cancel is None:

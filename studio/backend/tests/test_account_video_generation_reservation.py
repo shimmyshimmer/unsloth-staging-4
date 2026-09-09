@@ -185,3 +185,20 @@ def test_the_real_backend_records_the_account_inside_the_locked_reservation():
         video_module.validate_video_request_shape = original
     assert seen["at_start"] == BOB.account_id
     assert backend.generate_job_account() == BOB.account_id
+
+
+def test_cancel_rechecks_the_authorized_reservation_under_the_lock():
+    """The route authorizes on the loop and cancels in a thread; a job that finished and a
+    successor that reserved in between must not receive the stale cancel."""
+    import threading
+
+    from core.inference.video import VideoBackend
+
+    backend = VideoBackend()
+    event = threading.Event()
+    backend._active_generate_cancel = event
+    backend._generate_job_account = BOB.account_id
+    assert backend.cancel_generate(expected_account = ALICE.account_id) is False
+    assert not event.is_set()
+    assert backend.cancel_generate(expected_account = BOB.account_id) is True
+    assert event.is_set()

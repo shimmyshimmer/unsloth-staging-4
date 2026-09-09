@@ -80,7 +80,7 @@ def shared_resident(monkeypatch):
         },
         generate = generate,
         generate_progress = lambda: {"active": True, "step": 3, "total": 10},
-        cancel_generate = lambda: (cancelled.set(), True)[1],
+        cancel_generate = lambda **kwargs: (cancelled.set(), True)[1],
     )
     monkeypatch.setattr(diffusion_engine_router, "get_active_diffusion_engine", lambda: backend)
     monkeypatch.setattr(gpu_arbiter, "_owner", "diffusion")
@@ -142,7 +142,7 @@ def test_residency_still_governs_progress_and_cancel_with_no_generation_in_fligh
     backend = SimpleNamespace(
         status = lambda: {"loaded": True, "repo_id": "org/public-model"},
         generate_progress = lambda: {"active": False},
-        cancel_generate = lambda: False,
+        cancel_generate = lambda **kwargs: False,
     )
     monkeypatch.setattr(diffusion_engine_router, "get_active_diffusion_engine", lambda: backend)
     monkeypatch.setattr(gpu_arbiter, "_owner", "diffusion")

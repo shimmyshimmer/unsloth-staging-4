@@ -89,7 +89,7 @@ class SharedEngine:
     def generate_progress(self):
         return {"active": True, "step": 3, "total_steps": 10, "fraction": 0.3, "eta_seconds": 1.0}
 
-    def cancel_generate(self):
+    def cancel_generate(self, expected_account = None):
         return self.slots.cancel_generate()
 
 
@@ -140,3 +140,26 @@ def test_a_queued_request_does_not_take_progress_and_cancel_from_the_active_gene
         alice.join(20)
         bob.join(20)
     assert results["alice"].status_code == 409
+
+
+@pytest.mark.parametrize("engine", ["diffusers", "sd_cpp"])
+def test_cancel_rechecks_the_authorized_account_under_the_lock(engine):
+    """The route authorizes on the loop and cancels on an executor; a generation that finished
+    and a successor that took the slot in between must not receive the stale cancel."""
+    if engine == "diffusers":
+        from core.inference.diffusion import DiffusionBackend
+
+        backend = object.__new__(DiffusionBackend)
+        backend._generation_cancel_lock = threading.Lock()
+        backend._generation_owns_slot = True
+    else:
+        from core.inference.sd_cpp_backend import SdCppDiffusionBackend
+        backend = object.__new__(SdCppDiffusionBackend)
+        backend._lock = threading.RLock()
+    event = threading.Event()
+    backend._active_generate_cancel = event
+    backend._active_generate_account = BOB.account_id
+    assert backend.cancel_generate(expected_account = ALICE.account_id) is False
+    assert not event.is_set()
+    assert backend.cancel_generate(expected_account = BOB.account_id) is True
+    assert event.is_set()

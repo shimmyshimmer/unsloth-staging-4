@@ -1208,16 +1208,23 @@ def _release_session(session: _McpSession, defer_close: bool = False) -> None:
         # only trims idle sessions, so it can overshoot while every cached session
         # is busy; reclaim that overshoot here instead of waiting for the idle
         # reaper. Never evict the session we just used (its last_used is newest).
-        while len(_mcp_sessions) > _MAX_SESSIONS:
+        # The cap is per account, as in _evict_lru_locked: finishing a call must not
+        # close a cached session of an account that is under its own limit.
+        account_id = getattr(session, "account_id", None) or current_account_id()
+        mine = {
+            k: s
+            for k, s in _mcp_sessions.items()
+            if (k[3] if len(k) > 3 else OWNER_ACCOUNT_ID) == account_id
+        }
+        while len(mine) > _MAX_SESSIONS:
             idle = [
-                (s.last_used, k)
-                for k, s in _mcp_sessions.items()
-                if s.in_flight == 0 and s is not session
+                (s.last_used, k) for k, s in mine.items() if s.in_flight == 0 and s is not session
             ]
             if not idle:
                 break
             _, oldest = min(idle, key = lambda item: item[0])
             victims.append(_mcp_sessions.pop(oldest))
+            mine.pop(oldest)
             _discard_key_lock(oldest)
     if close_now and defer_close:
         # This borrower was the last one on a session that has been discarded,

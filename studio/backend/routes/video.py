@@ -608,7 +608,14 @@ async def cancel_video_generation(current_subject: str = Depends(get_current_sub
         return {"cancelled": False}
     if _generation_started_by(backend) is None and account_access.foreign_work_active():
         return {"cancelled": False}
-    cancelled = await asyncio.to_thread(backend.cancel_generate)
+    # The job can finish and another account reserve between the check above and the
+    # worker thread below, so the backend rechecks the authorized reservation under its lock.
+    reserved = getattr(backend, "generate_job_account", None)
+    reserved = reserved() if callable(reserved) else None
+    if reserved is None:
+        cancelled = await asyncio.to_thread(backend.cancel_generate)
+    else:
+        cancelled = await asyncio.to_thread(backend.cancel_generate, expected_account = reserved)
     return {"cancelled": cancelled}
 
 

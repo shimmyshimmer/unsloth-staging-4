@@ -84,7 +84,7 @@ def _install_backend(monkeypatch, status, generate):
             "fraction": 0.0,
             "eta_seconds": None,
         },
-        cancel_generate = lambda: False,
+        cancel_generate = lambda **kwargs: False,
     )
     monkeypatch.setattr(diffusion_engine_router, "get_active_diffusion_engine", lambda: backend)
     return backend

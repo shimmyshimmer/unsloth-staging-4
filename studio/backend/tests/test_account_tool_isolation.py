@@ -495,6 +495,24 @@ def test_mcp_lru_never_evicts_another_accounts_session(monkeypatch):
     assert mcp_client._mcp_sessions[key] is session
 
 
+def test_mcp_release_overshoot_never_evicts_another_accounts_session(monkeypatch):
+    bob_key = run_as(BOB, mcp_client._session_key, "https://public.example/mcp", None, "chat")
+    bob = SimpleNamespace(last_used = 0, in_flight = 0)
+    alice_old_key = run_as(ALICE, mcp_client._session_key, "https://a.example/mcp", None, "chat")
+    alice_old = SimpleNamespace(last_used = 1, in_flight = 0, defunct = False)
+    alice_new_key = run_as(ALICE, mcp_client._session_key, "https://b.example/mcp", None, "chat")
+    alice_new = SimpleNamespace(
+        last_used = 2, in_flight = 1, defunct = False, account_id = ALICE.account_id
+    )
+    sessions = {bob_key: bob, alice_old_key: alice_old, alice_new_key: alice_new}
+    monkeypatch.setattr(mcp_client, "_mcp_sessions", sessions)
+    monkeypatch.setattr(mcp_client, "_MAX_SESSIONS", 1)
+    monkeypatch.setattr(mcp_client, "_close_detached", lambda victims: None)
+    run_as(ALICE, mcp_client._release_session, alice_new, True)
+    assert sessions[bob_key] is bob
+    assert alice_old_key not in sessions
+
+
 def test_mcp_public_transport_pins_dns_and_checks_redirects(monkeypatch):
     seen = []
 

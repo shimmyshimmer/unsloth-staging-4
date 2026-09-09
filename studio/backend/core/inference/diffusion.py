@@ -36,7 +36,7 @@ from core._torchao_stub import (
     install_xformers_windows_rocm_stub,
 )
 from loggers import get_logger
-from utils.account_context import account_thread
+from utils.account_context import account_thread, current_account_id
 from utils.hardware import clear_gpu_cache
 
 from .diffusion_families import (
@@ -1196,6 +1196,9 @@ class DiffusionBackend:
         self._generation_cancel_lock = threading.Lock()
         # Cancel Event of the in-flight generation; per-generation so a cancel can't be lost or leak
         self._active_generate_cancel: Optional[threading.Event] = None
+        # Bound with the event under the same lock, so a cancel authorized for one account
+        # cannot land on the generation that took the slot after the route's check.
+        self._active_generate_account: Optional[str] = None
         # Queued requests; cancel_generate() decides which Stop may signal.
         self._queued_generate_cancels: set[threading.Event] = set()
         self._generation_owns_slot = False
@@ -1296,6 +1299,7 @@ class DiffusionBackend:
                             if not cancelled:
                                 self._queued_generate_cancels.discard(cancel)
                                 self._active_generate_cancel = cancel
+                                self._active_generate_account = current_account_id()
                                 self._generation_owns_slot = True
                                 admitted = True
                     else:
@@ -1319,6 +1323,7 @@ class DiffusionBackend:
                 with self._generation_cancel_lock:
                     if self._active_generate_cancel is cancel:
                         self._active_generate_cancel = None
+                        self._active_generate_account = None
                     self._generation_owns_slot = False
                     self._generate_lock.release()
         finally:
@@ -6225,6 +6230,7 @@ class DiffusionBackend:
                         raise RuntimeError(DIFFUSION_CANCELLED_MSG)
                     if self._active_generate_cancel is cancel:
                         self._active_generate_cancel = None
+                        self._active_generate_account = None
 
                 # Components are offloaded and transfer copies dropped; return the pages now.
                 reclaim_offload_host_memory(state.offload_policy, logger = logger)
@@ -6258,6 +6264,7 @@ class DiffusionBackend:
                 with self._generation_cancel_lock:
                     if self._active_generate_cancel is cancel:
                         self._active_generate_cancel = None
+                        self._active_generate_account = None
                 with self._lock:
                     # Sole clear of the published progress state, on every exit, so a crashed generation never leaves
                     # the UI stuck.
@@ -6282,7 +6289,7 @@ class DiffusionBackend:
             "eta_seconds": gen.eta_seconds,
         }
 
-    def cancel_generate(self) -> bool:
+    def cancel_generate(self, expected_account: Optional[str] = None) -> bool:
         """Signal the in-flight generation to stop at its next step boundary.
 
         The denoise loop already watches this event (``_on_step`` sets diffusers'
@@ -6292,11 +6299,18 @@ class DiffusionBackend:
 
         Best effort by construction: the sampler stops at the NEXT step callback, so a cancel
         during the VAE decode or the encode that precedes step 0 lands when that finishes.
-        Same contract as the video backend."""
+        Same contract as the video backend. ``expected_account`` names the generation the
+        caller authorized; the slot can change hands before this runs, so it is rechecked
+        here under the lock that binds it."""
         with self._generation_cancel_lock:
             # Stop targets the denoising generation, not a serialized waiter.
             active = self._active_generate_cancel
             if active is not None:
+                if expected_account is not None and self._active_generate_account not in (
+                    None,
+                    expected_account,
+                ):
+                    return False
                 active.set()
                 return True
             if self._generation_owns_slot:

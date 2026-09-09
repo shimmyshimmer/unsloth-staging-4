@@ -36350,9 +36350,13 @@ async def cancel_diffusion_generation(current_subject: str = Depends(get_current
     ):
         return {"cancelled": False}
 
-    cancelled = await asyncio.get_running_loop().run_in_executor(
-        _CANCEL_EXECUTOR, get_active_diffusion_engine().cancel_generate
-    )
+    # The slot can change hands between the checks above and the executor callback, so the
+    # engine rechecks the authorized account under the lock that binds the cancel event.
+    expected = account_access.tracked_generation_account()
+    cancel = get_active_diffusion_engine().cancel_generate
+    if expected is not None:
+        cancel = functools.partial(cancel, expected_account = expected)
+    cancelled = await asyncio.get_running_loop().run_in_executor(_CANCEL_EXECUTOR, cancel)
     return {"cancelled": cancelled}
 
 
