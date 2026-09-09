@@ -122,10 +122,11 @@ def set_account_active(account_id: str, payload: AccountActiveRequest):
 
 @router.delete("/{account_id}", status_code = status.HTTP_204_NO_CONTENT)
 def delete_account(account_id: str):
+    from core.training.account_jobs import AccountRetirementError
     with _account_errors():
         try:
             storage.delete_account(account_id, retire_account_roots)
-        except OSError:
+        except (OSError, AccountRetirementError):
             raise HTTPException(
                 status_code = 409,
                 detail = "Could not retire account files. The account is disabled; retry deletion.",

@@ -148,6 +148,12 @@ def test_macos_profile_hides_other_accounts_temporary_roots(tmp_path, monkeypatc
 
     deny = profile.index(f'(deny file-read* file-write* (subpath "{base}"))')
     allow = profile.index(f'(allow file-read* file-write* (subpath "{alice_tmp}"))')
+    # The whole per-user darwin tree is denied too: the server's own bare tempfile output
+    # (exports, dataset slices) sits beside the Studio subtree, outside every account root.
+    assert '(allow file-read* (subpath "/var/folders"))' not in profile
+    assert '(subpath "/private/var/folders") (subpath "/var/folders"))' in profile
+    folders = profile.index('(deny file-read* file-write* (subpath "/private/var/folders")')
+    assert folders < allow
     assert deny < allow, "the account's own temporary root must be allowed after the deny"
     assert f'(subpath "{bob_tmp}")' not in profile
 
@@ -571,6 +577,7 @@ def test_default_layout_denies_exactly_the_previous_macos_roots(tmp_path, monkey
         line.split('"')[1] for line in profile.splitlines() if line.startswith("(deny file-read*")
     }
     assert denied == {
+        "/private/var/folders",
         str((tmp_path / "studio").resolve()),
         str((shared_tmp / "unsloth-studio").resolve()),
         str(home.resolve()),
@@ -637,3 +644,18 @@ def test_shared_temporary_base_under_a_granted_root_hides_other_accounts(tmp_pat
     finally:
         import shutil
         shutil.rmtree(base, ignore_errors = True)
+
+
+def test_macos_profile_keeps_the_user_cache_dir_readable(tmp_path, monkeypatch):
+    """dyld reads its closure cache under the per-user cache dir, so that one subtree is
+    allowed back after the /var/folders deny; nothing else beneath it is."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(tool_confinement.shutil, "which", lambda name: "/usr/bin/sandbox-exec")
+    cache = "/var/folders/ab/cd/C"
+    monkeypatch.setattr(
+        tool_confinement, "_darwin_user_cache_dirs", lambda: (cache, "/private" + cache)
+    )
+    profile = run_as(ALICE, tools._account_confinement).wrap(["bash"])[2]
+    deny = profile.index('(deny file-read* file-write* (subpath "/private/var/folders")')
+    assert deny < profile.index(f'(allow file-read* (subpath "{cache}"))')
+    assert deny < profile.index(f'(allow file-read* (subpath "/private{cache}"))')

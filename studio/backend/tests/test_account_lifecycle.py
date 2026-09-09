@@ -513,6 +513,22 @@ def test_a_partly_failed_retirement_puts_the_moved_roots_back(matrix, monkeypatc
         assert not [p for p in root.parent.iterdir() if "-deleted-" in p.name]
 
 
+def test_an_unstoppable_worker_leaves_a_disabled_retryable_account(matrix, monkeypatch):
+    """retire_account_jobs raises its own error, not OSError; the answer is the same 409."""
+    from core.training.account_jobs import AccountRetirementError
+
+    client, _, accounts = matrix
+    account = storage.get_account("alice")
+
+    def fail(_):
+        raise AccountRetirementError("Retired account worker has not stopped")
+
+    monkeypatch.setattr(accounts, "retire_account_roots", fail)
+    response = client.delete(f"/api/accounts/{account.account_id}", headers = headers())
+    assert response.status_code == 409
+    assert storage.get_user_record("alice")["is_active"] == 0
+
+
 def test_reactivating_after_a_failed_delete_lifts_the_job_retirement(matrix, monkeypatch):
     client, _, accounts = matrix
     from core.training import account_jobs as jobs

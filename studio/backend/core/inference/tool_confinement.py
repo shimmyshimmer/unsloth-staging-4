@@ -379,6 +379,19 @@ def _sbpl(path: str) -> str:
     return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _darwin_user_cache_dirs() -> tuple[str, ...]:
+    """The per-user cache dir under /var/folders (dyld closures live there), with and
+    without the /private prefix; empty where the platform has none."""
+    try:
+        cache = (os.confstr("CS_DARWIN_USER_CACHE_DIR") or "").rstrip(os.sep)
+    except (AttributeError, ValueError, OSError):
+        return ()
+    if not cache:
+        return ()
+    bare = cache[len("/private") :] if cache.startswith("/private/") else cache
+    return (bare, "/private" + bare)
+
+
 def macos_profile(
     *,
     read_roots: list[str],
@@ -400,8 +413,12 @@ def macos_profile(
         "(allow network*)",
         "(allow file-read-metadata)",
         '(allow file-read* file-write* (subpath "/dev"))',
-        '(allow file-read* (subpath "/private/tmp") (subpath "/private/var/db") '
-        '(subpath "/private/var/folders") (subpath "/var/folders"))',
+        '(allow file-read* (subpath "/private/tmp") (subpath "/private/var/db"))',
+        # The per-user darwin tree holds every account's tmp root and the server's own
+        # bare tempfile output (exports, dataset slices, media): deny it, keep the user
+        # cache dir dyld needs, and let the writable roots re-allow the account's own tmp.
+        '(deny file-read* file-write* (subpath "/private/var/folders") (subpath "/var/folders"))',
+        *(f"(allow file-read* (subpath {_sbpl(path)}))" for path in _darwin_user_cache_dirs()),
     ]
     for path in read_roots:
         lines.append(f"(allow file-read* (subpath {_sbpl(path)}))")

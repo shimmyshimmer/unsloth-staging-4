@@ -364,6 +364,10 @@ def run_account_child(*, account: AccountContext, job_module: str, job_target: s
     return run_as(account, execute)
 
 
+class AccountRetirementError(RuntimeError):
+    """A worker or job of the account could not be stopped; its files stay in place."""
+
+
 def retire_account_jobs(account: AccountContext) -> None:
     """Revoke new starts and cancel only this account's work; call before renaming its directories.
 
@@ -406,7 +410,7 @@ def retire_account_jobs(account: AccountContext) -> None:
         except Exception as exc:
             errors.append(exc)
     if errors:
-        raise RuntimeError(
+        raise AccountRetirementError(
             "Could not retire every account job; keep its directories in place"
         ) from errors[0]
 

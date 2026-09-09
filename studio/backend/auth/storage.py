@@ -873,9 +873,9 @@ def delete_account(account_id: str, retire) -> None:
             _revoke_account_credentials(conn, row)
             retire(AccountContext(row["account_id"], row["username"], row["role"]))
             conn.execute("DELETE FROM auth_user WHERE account_id = ?", (account_id,))
-    except OSError:
+    except (OSError, RuntimeError):
         # An owner request can reactivate between the revocation and this write lock;
-        # a failed rename must still leave login disabled.
+        # a failed rename or an unstoppable worker must still leave login disabled.
         set_account_active(account_id, False)
         raise
     finally:
