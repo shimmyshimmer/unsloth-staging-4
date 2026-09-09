@@ -716,6 +716,14 @@ def _detect_local_gguf(path: Path) -> Optional[str]:
     return None
 
 
+def _authorize_cache_fallback(model_name: str) -> None:
+    """A snapshot picked out of the shared cache for a bare repo id: the caller's token never
+    authorized it (the remote probe was refused or skipped), so its grants have to."""
+    if managed_account():
+        from hub.services.models import account_access
+        account_access.require_model_access(canonical_model_repo_id(model_name))
+
+
 def _reject_untrainable_model_request(
     request: TrainingStartRequest, actual_model_repo_id: Optional[str] = None
 ) -> _ModelPreflightResult:
@@ -777,6 +785,8 @@ def _reject_untrainable_model_request(
                 request.model_name,
                 model_local_path,
             )
+            if snapshot and not model_local_path:
+                _authorize_cache_fallback(request.model_name)
         if snapshot:
             path = Path(snapshot)
             if offline_mode and not request.resume_from_checkpoint:
@@ -822,6 +832,7 @@ def _reject_untrainable_model_request(
             )
             if snapshot is None:
                 raise
+            _authorize_cache_fallback(request.model_name)
             path = Path(snapshot)
             cached_model_pin = (
                 canonical_model_repo_id(request.model_name),

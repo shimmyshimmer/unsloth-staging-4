@@ -139,3 +139,42 @@ def test_a_cached_claim_on_a_visible_repo_still_starts(shared_cache):
             "hf_token": "alice-token",
         },
     )
+
+
+@pytest.mark.parametrize("repo,expected", [("private/model", 404), ("public/model", None)])
+def test_a_cache_fallback_after_a_refused_remote_probe_needs_a_grant(
+    shared_cache, monkeypatch, repo, expected
+):
+    """The remote probe refused the caller's token, so the shared cache copy another account
+    left behind is not a grant; a bare repo id must clear require_model_access."""
+    from routes import training
+    from models.training import TrainingStartRequest
+
+    def refused(model_name, hf_token):
+        raise HTTPException(status_code = 422, detail = {"code": "hf_model_access_denied"})
+
+    monkeypatch.setattr(training, "_remote_untrainable_model_format", refused)
+    from core.training import training as core_training
+
+    monkeypatch.setattr(
+        core_training,
+        "_resolve_model_snapshot",
+        lambda model_name, local_path: _snapshot(shared_cache, "models", model_name),
+    )
+    monkeypatch.setattr(
+        training, "_has_trainable_local_weights", lambda *a, **k: True, raising = False
+    )
+    request = TrainingStartRequest(
+        model_name = repo,
+        dataset_name = "public/set",
+        hf_token = "x",
+        training_type = "LoRA/QLoRA",
+        format_type = "alpaca",
+    )
+    if expected is None:
+        result = run_as(ALICE, training._reject_untrainable_model_request, request)
+        assert result.cached_model_pin[0] == repo
+    else:
+        with pytest.raises(HTTPException) as exc:
+            run_as(ALICE, training._reject_untrainable_model_request, request)
+        assert exc.value.status_code == expected

@@ -66,16 +66,28 @@ def retire_account_roots(account: AccountContext) -> None:
         )
     }
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    for root in sorted(roots, key = lambda path: len(path.parts), reverse = True):
-        # Rename a symlink itself; never resolve it into another account's data.
-        if not root.exists() and not root.is_symlink():
-            continue
-        destination = root.with_name(f"{root.name}-deleted-{stamp}")
-        suffix = 0
-        while destination.exists() or destination.is_symlink():
-            suffix += 1
-            destination = root.with_name(f"{root.name}-deleted-{stamp}-{suffix}")
-        Path.rename(root, destination)
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for root in sorted(roots, key = lambda path: len(path.parts), reverse = True):
+            # Rename a symlink itself; never resolve it into another account's data.
+            if not root.exists() and not root.is_symlink():
+                continue
+            destination = root.with_name(f"{root.name}-deleted-{stamp}")
+            suffix = 0
+            while destination.exists() or destination.is_symlink():
+                suffix += 1
+                destination = root.with_name(f"{root.name}-deleted-{stamp}-{suffix}")
+            Path.rename(root, destination)
+            moved.append((root, destination))
+    except OSError:
+        # All or nothing: reactivation restores no roots, so a half-retired account
+        # would come back with an empty workspace and its data stranded.
+        for root, destination in reversed(moved):
+            try:
+                Path.rename(destination, root)
+            except OSError:
+                pass
+        raise
 
 
 @router.get("", response_model = AccountListResponse)

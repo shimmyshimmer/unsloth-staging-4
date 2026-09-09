@@ -477,6 +477,42 @@ def test_failed_retirement_leaves_disabled_retryable_account(matrix, monkeypatch
     )
 
 
+def test_a_partly_failed_retirement_puts_the_moved_roots_back(matrix, monkeypatch):
+    """The roots sit under different parents, so one rename can fail after another
+    succeeded; reactivation restores nothing, so the retirement must undo itself."""
+    import os
+
+    client, _, accounts = matrix
+    account = storage.get_account("alice")
+    roots = [
+        run_as(account, root)
+        for root in (
+            storage_roots.workspace_root,
+            storage_roots.project_workspaces_root,
+            storage_roots.tmp_root,
+        )
+    ]
+    for root in roots:
+        root.mkdir(parents = True, exist_ok = True)
+        (root / "private.txt").write_text("keep")
+    calls = []
+
+    class RenameFailsSecond(type(roots[0])):
+        @staticmethod
+        def rename(source, destination):
+            calls.append(1)
+            if len(calls) == 2:
+                raise PermissionError("locked directory")
+            os.rename(source, destination)
+
+    monkeypatch.setattr(accounts, "Path", RenameFailsSecond)
+    url = f"/api/accounts/{account.account_id}"
+    assert client.delete(url, headers = headers()).status_code == 409
+    for root in roots:
+        assert (root / "private.txt").read_text() == "keep"
+        assert not [p for p in root.parent.iterdir() if "-deleted-" in p.name]
+
+
 def test_reactivating_after_a_failed_delete_lifts_the_job_retirement(matrix, monkeypatch):
     client, _, accounts = matrix
     from core.training import account_jobs as jobs
