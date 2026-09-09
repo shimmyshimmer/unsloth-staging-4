@@ -232,6 +232,27 @@ def _legacy_variant_aliases(variants) -> tuple[tuple[str, str], ...]:
                 continue
             # None = ambiguous: a second file claimed it, so it names neither.
             seen[key] = None if key in seen else str(quant)
+        # A lone tagged build is now advertised under its qualified key, and
+        # ``_qualified_variant_name`` returns that same key, so the loop above records no legacy
+        # spelling for it. The download and loader paths both still accept the bare quant for an
+        # unambiguous build, so a persisted ``repo:q4_0`` has to reach the index too.
+        from hub.utils.gguf import accepts_bare_quant_alias, bare_quant_alias, resolve_variant_alias
+
+        # Owners per bare spelling, then the SHARED resolution: a tagged root beside
+        # ``distilled/model-Q4_K_M`` is two owners, and calling that ambiguous here 404'd a
+        # persisted ``repo:Q4_K_M`` in the local index that the remote resolver had just
+        # downloaded through, because the root build owns that spelling everywhere else.
+        owners: dict[str, list[str]] = {}
+        for variant in variants:
+            quant = getattr(variant, "quant", None)
+            if not quant or not accepts_bare_quant_alias(str(quant)):
+                continue
+            key = bare_quant_alias(str(quant)).lower()
+            if not key or key in current or key in seen:
+                continue
+            owners.setdefault(key, []).append(str(quant))
+        for key, candidates in owners.items():
+            seen[key] = resolve_variant_alias(candidates, key)
         return tuple((legacy, quant) for legacy, quant in seen.items() if quant is not None)
     except Exception:
         return ()
@@ -328,8 +349,15 @@ def _local_gguf_entry(
         # hand a bare id an equally-good ``distilled/...`` row that sorts earlier -- the same id serving different
         # weights depending on which resolver answered it. The qualified rows stay advertised; they are not what a bare
         # id means.
-        unqualified = tuple(q for q in quants if "/" not in q)
-        best = preferred_quant(unqualified or quants)
+        from hub.utils.gguf import _keys_at_repo_root
+
+        unqualified = tuple(q for q in quants if _keys_at_repo_root(q))
+        # Same collapse the remote resolver applies, for the same reason: several root builds at
+        # one quant tie in preferred_quant, and the two resolvers see them in different orders.
+        from hub.utils.gguf import collapse_same_quant_root_builds
+
+        ranked = tuple(collapse_same_quant_root_builds(list(unqualified)))
+        best = preferred_quant(ranked or unqualified or quants)
         if best and quants[0] != best:
             quants = (best, *(q for q in quants if q != best))
         return _LocalGgufEntry(

@@ -91,10 +91,15 @@ class _Sibling:
             "distilled-1.1/ltx-2.3-22b-distilled-1.1-Q6_K.gguf",
             "distilled-1.1/ltx-2.3-22b-distilled-1.1-Q6_K",
         ),
-        # A quant-named directory never overrides the basename, and a suffix after the
-        # quant does not qualify it: both are established spellings.
+        # A quant-named directory never overrides the basename.
         ("Q8_0/model-Q4_K_M.gguf", "Q4_K_M"),
-        ("BF16/gemma-4-12b-it-Q8_0-MTP-001-of-002.gguf", "Q8_0"),
+        # A build tag past the quant is a SECOND build of it, so it qualifies the key. Repos
+        # publish the tagged file beside the plain one and the bare token names both, which
+        # hid one of them and pointed the surviving row at whichever sorted first.
+        (
+            "BF16/gemma-4-12b-it-Q8_0-MTP-001-of-002.gguf",
+            "BF16/gemma-4-12b-it-Q8_0-MTP",
+        ),
         # No quant anywhere: unchanged fallback.
         ("weights/model.gguf", "weights/model"),
     ],
@@ -1063,14 +1068,29 @@ def test_the_remote_default_variant_prefers_the_root_checkpoint():
     """pick_best_gguf keeps whichever filename it met first among equals, so a repo with
     model-Q6_K.gguf beside distilled/model-Q6_K.gguf could hand the picker the distilled
     checkpoint as its automatic default -- while a bare repo id means the ROOT checkpoint to
-    _match_variant(None, ...) and to local_model_resolver."""
-    import inspect
+    _match_variant(None, ...) and to local_model_resolver.
 
-    from hub.services.models import gguf_variants as service
+    Asserted on the behaviour rather than on the source text: the candidate helper also has to
+    collapse same-quant ROOT builds now, so a literal source match pinned the old spelling of a
+    rule that has since grown a second half.
+    """
+    from hub.services.models.gguf_variants import _default_variant_candidates
+    from hub.utils.gguf import pick_best_gguf
 
-    source = inspect.getsource(service)
-    assert 'root_rows = [v.filename for v in variants if "/" not in v.quant]' in source
-    assert "pick_best_gguf(_default_variant_candidates(variants))" in source
+    class _Row:
+        def __init__(self, filename):
+            self.filename = filename
+            self.quant = gguf_variant_key(filename)
+
+    for order in (
+        ["model-Q6_K.gguf", "distilled/model-Q6_K.gguf"],
+        ["distilled/model-Q6_K.gguf", "model-Q6_K.gguf"],
+    ):
+        rows = [_Row(f) for f in order]
+        assert pick_best_gguf(_default_variant_candidates(rows)) == "model-Q6_K.gguf"
+    # Nothing at the root falls back to the whole set rather than refusing.
+    only_qualified = [_Row("distilled/model-Q6_K.gguf")]
+    assert _default_variant_candidates(only_qualified) == ["distilled/model-Q6_K.gguf"]
 
 
 def test_the_load_guard_sees_the_alias_the_delete_accepts():
@@ -1149,7 +1169,6 @@ def test_the_remote_load_path_auto_selects_the_root_checkpoint():
     from utils.models import model_config as mc
 
     source = inspect.getsource(mc.ModelConfig.from_identifier)
-    assert "root_rows = [" in source
-    assert "variant_filenames = root_rows or [v.filename for v in variants]" in source
-    # The filter reads the ADVERTISED identity, the same one the lister assigns each row.
-    assert '"/" not in _qualified_variant_name(v.filename, v.quant)' in source
+    # The selection lives in one helper so the rule can be tested on its own; the load path
+    # only has to call it. ``test_gguf_same_quant_sibling_rows`` drives the helper directly.
+    assert "best = _default_root_gguf_filename(variants)" in source

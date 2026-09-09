@@ -158,7 +158,7 @@ def looks_like_gguf_hub_repo_id(repo_id: str) -> bool:
     return text.lower().startswith("unsloth/")
 
 
-def looks_like_quant(variant: Optional[str]) -> bool:
+def looks_like_quant(variant: Optional[str], *, allow_root_stem: bool = True) -> bool:
     """Whether a ``:suffix`` names a GGUF quant rather than a foreign tag.
 
     Neither a namespace nor a colon proves a request was meant for this server
@@ -167,18 +167,35 @@ def looks_like_quant(variant: Optional[str]) -> bool:
     """
     import re
 
-    from hub.utils.gguf import is_h3_denoiser_variant_key
+    from hub.utils.gguf import (
+        extract_quant_token,
+        gguf_variant_key,
+        is_h3_denoiser_variant_key,
+    )
     from utils.models.model_config import _GGUF_KNOWN_QUANT_RE
 
     if not variant:
         return False
     # _extract_quant_label can append a bpw modifier (IQ4_XS-3.53bpw); still a quant.
     label = re.sub(r"-[0-9]+(?:\.[0-9]+)?bpw$", "", variant.strip(), flags = re.IGNORECASE)
-    # A qualified key is one of OUR advertised rows: a path (``distilled/model-Q6_K``) or an H3 root stem
-    # (``minimax_h3_ref2va_pruned-Q6_K``). Explicit, so it must MISS when absent; falling through served the caller a
-    # different checkpoint under the requested id.
+    # A qualified key is one of OUR advertised rows: a path (``distilled/model-Q6_K``) or a root stem
+    # (``minimax_h3_ref2va_pruned-Q6_K``, ``model-Q4_K_M-mtp``). Explicit, so it must MISS when absent; falling
+    # through served the caller a different checkpoint under the requested id. A root stem has to be a key
+    # the lister would MINT, not merely a string holding a quant token: an Ollama tag (``8b-instruct-q4_0``)
+    # holds one too and belongs to another server.
     normalized = label.replace("\\", "/")
     if "/" in normalized or is_h3_denoiser_variant_key(normalized):
+        return True
+    # Off only on the paths where the Hub gave us NO listing. The shape alone cannot tell a lone
+    # tagged build's key from a foreign provider's tag -- an Ollama reference like
+    # ``8b-instruct-q4_0-fp16`` mints identically -- so admitting it there turns a 404 that should
+    # fall through to that provider into a refusal. Every caller that holds the listing, or the
+    # loaded model's own identity, still needs the root stem recognised as a real quant.
+    if (
+        allow_root_stem
+        and extract_quant_token(normalized) is not None
+        and gguf_variant_key(f"{normalized}.gguf") == normalized
+    ):
         return True
     return _GGUF_KNOWN_QUANT_RE.fullmatch(label) is not None
 
@@ -542,7 +559,9 @@ async def maybe_auto_download(
     repo_id, wanted_variant = split_model_ref(requested_model)
     if not is_downloadable_ref(requested_model):
         return None
-    if _is_not_servable(repo_id, hf_token) and not looks_like_quant(wanted_variant):
+    if _is_not_servable(repo_id, hf_token) and not looks_like_quant(
+        wanted_variant, allow_root_stem = False
+    ):
         return None
 
     # settle the single-flight slot before the network, so retries during a download stay cheap
@@ -661,7 +680,7 @@ async def _admit_and_start(
             return _gated_refusal(repo_id)
         if status == 404:
             _mark_not_servable(repo_id, hf_token)
-            if not looks_like_quant(wanted_variant):
+            if not looks_like_quant(wanted_variant, allow_root_stem = False):
                 return None
             return AutoDownloadRefusal(
                 status = 404,
@@ -690,7 +709,7 @@ async def _admit_and_start(
     if not variants:
         _release(active)
         _mark_not_servable(repo_id, hf_token)
-        if not looks_like_quant(wanted_variant):
+        if not looks_like_quant(wanted_variant, allow_root_stem = False):
             return None
         return AutoDownloadRefusal(
             status = 400,
@@ -868,23 +887,18 @@ def _bare_quant_alias(wanted: str, lowered: dict[str, str]) -> Optional[str]:
     """The one qualified variant whose quant token is *wanted*, or None when it names 0 or 2+.
 
     A key is a pure function of the path, so a repo that files every quant under one shared
-    container qualifies all of them even though the directory disambiguates nothing, and the bare
-    spelling every stored id uses then matches no key at all.
-    """
-    from hub.utils.gguf import bare_quant_alias
+    container, or tags every build past its quant, qualifies all of them even though nothing there
+    disambiguates, and the bare spelling every stored id uses then matches no key at all.
 
-    target = (wanted or "").strip().lower()
-    if not target:
-        return None
-    # PATH-qualified keys only: an H3 root stem's bare quant names both partitions
-    # PATH-qualified keys only, not is_qualified_gguf_variant_key: an H3 root stem's bare quant names both partitions,
-    # so it must miss rather than serve one of them.
-    matches = [
-        name
-        for key, name in lowered.items()
-        if "/" in key and bare_quant_alias(key).lower() == target
-    ]
-    return matches[0] if len(matches) == 1 else None
+    Delegated to ``resolve_variant_alias`` rather than deciding it here, so this agrees with the
+    plan lookup and the loader on the root-precedence rule too. Requiring a single alias match of
+    its own rejected a legacy pin the root build still owns exactly, and the download it gates
+    never ran.
+    """
+    from hub.utils.gguf import resolve_variant_alias
+
+    resolved = resolve_variant_alias(lowered.keys(), wanted)
+    return lowered.get(resolved) if resolved is not None else None
 
 
 def _match_variant(wanted: Optional[str], variants: dict[str, int]) -> Optional[str]:
@@ -914,8 +928,21 @@ def _match_variant(wanted: Optional[str], variants: dict[str, int]) -> Optional[
     # model-Q6_K could serve the sibling for a bare id -- the same id that resolves to the root locally. Same filter
     # local_model_resolver._local_gguf_entry applies, so both resolvers answer one id one way. A repo with nothing at
     # the root falls back to the whole set rather than refusing.
-    unqualified = {name: size for name, size in variants.items() if "/" not in name}
-    return preferred_quant(unqualified or variants)
+    from hub.utils.gguf import _keys_at_repo_root
+
+    # Root-level by the lister's rule, not the absence of a slash: two builds under a quant-only
+    # directory are AT the root, and dropping them here emptied the ranking so the fallback took
+    # the whole map in Hub order while the local resolver took its rows by size.
+    unqualified = {name: size for name, size in variants.items() if _keys_at_repo_root(name)}
+    # Collapse a repo's several root builds at ONE quant to a single candidate first: they tie in
+    # preferred_quant, so otherwise the winner comes out of listing order and this resolver and
+    # the local one can disagree about what a bare org/repo means.
+    from hub.utils.gguf import collapse_same_quant_root_builds
+
+    ranked = {
+        name: unqualified[name] for name in collapse_same_quant_root_builds(list(unqualified))
+    }
+    return preferred_quant(ranked or unqualified or variants)
 
 
 async def _dispatch(

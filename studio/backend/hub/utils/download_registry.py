@@ -60,6 +60,7 @@ from loggers import get_logger
 from utils.process_lifetime import is_signalable_pid
 
 from hub.utils import state_dir
+from hub.utils.gguf import variant_spellings_may_name_one_build
 from hub.utils.state_dir import RepoType
 
 logger = get_logger(__name__)
@@ -1607,8 +1608,17 @@ class DownloadRegistry:
             if admission_check is not None and not admission_check():
                 return False, "admission_blocked"
             deleting_scopes = self._deleting.get(repo)
+            # The reservation is recorded under the spelling the DELETE was requested with, while
+            # this claim carries the spelling the download was started with. Deletion resolves the
+            # legacy bare quant onto the qualified key, so the two name one build and literal
+            # membership let a claim through the window the reservation exists to close.
             if deleting_scopes is not None and (
-                None in deleting_scopes or variant_from_key(key) in deleting_scopes
+                None in deleting_scopes
+                or any(
+                    variant_spellings_may_name_one_build(variant_from_key(key), scope)
+                    for scope in deleting_scopes
+                    if scope is not None
+                )
             ):
                 return False, "deleting"
             active = self._repo_active.get(repo, set())
@@ -1625,6 +1635,9 @@ class DownloadRegistry:
                 # Same-transport variants of one model run concurrently, since each worker purges only its own
                 # re-resolved main blobs and the shared companion is guarded by its marker; cross-transport stays
                 # serialized so an HTTP resume and an XET rewrite never write one blob at once.
+                # DIFFERENT variants, though: two spellings of ONE build re-resolve to the same main
+                # blobs, so admitting the second launches a worker that rewrites what the first is
+                # writing. They are a conflict, not a sibling quant.
                 concurrent_gguf_variants = (
                     repo_type == "model"
                     and bool(variant)
@@ -1632,6 +1645,7 @@ class DownloadRegistry:
                     and other_metadata.repo_type == "model"
                     and bool(other_metadata.variant)
                     and other_metadata.transport == transport
+                    and not variant_spellings_may_name_one_build(variant, other_metadata.variant)
                 )
                 if concurrent_gguf_variants:
                     continue
@@ -1738,7 +1752,13 @@ class DownloadRegistry:
         A whole-repo delete (``variant is None``) conflicts with any active
         download. A variant delete conflicts only with that same variant or a
         whole-repo download writing the shared snapshot; other quantizations
-        download concurrently and never block it."""
+        download concurrently and never block it.
+
+        Spellings are compared through :func:`variant_spellings_may_name_one_build`, not
+        literally. ``_variant_keys_to_delete`` resolves a legacy bare quant onto the one
+        qualified key that answers to it, so a delete spelled ``Q4_K_M`` unlinks the files of
+        ``model-Q4_K_M-mtp``; a job started under either spelling has to block it. A false match
+        only delays a delete, while a false miss unlinks blobs under a live writer."""
         active_keys = self._repo_active.get(repo_id, set())
         for key in active_keys:
             job = self._jobs.get(key)
@@ -1747,7 +1767,9 @@ class DownloadRegistry:
             if variant is None:
                 return True
             other_variant = self._active_job_variant_locked(key)
-            if other_variant is None or other_variant == variant:
+            if other_variant is None or variant_spellings_may_name_one_build(
+                other_variant, variant
+            ):
                 return True
         for key, job in self._jobs.items():
             if key in active_keys or _repo_of_key(key) != repo_id:
@@ -1757,7 +1779,9 @@ class DownloadRegistry:
             if variant is None:
                 return True
             other_variant = self._active_job_variant_locked(key)
-            if other_variant is None or other_variant == variant:
+            if other_variant is None or variant_spellings_may_name_one_build(
+                other_variant, variant
+            ):
                 return True
         return False
 
@@ -1830,11 +1854,17 @@ class DownloadRegistry:
             return refs
 
     def has_active_variant(self, repo_id: str, variant: Optional[str]) -> bool:
-        """Whether an active model job targets this exact GGUF variant.
+        """Whether an active model job targets this GGUF variant, under either spelling.
 
         Scans the job table rather than only ``_repo_active`` so an XET-to-HTTP
         retry handoff remains visible while it has temporarily released its
         active slot.
+
+        A job registered under the legacy bare quant and a load asking for the qualified key
+        (or the reverse) are the same build, so the spellings are compared through
+        :func:`variant_spellings_may_name_one_build`. The one caller, ``_hub_download_blocks_
+        gguf_load``, uses the answer to hold a load off a snapshot a worker may still rewrite,
+        so a false match only defers the load while a false miss opens the file underneath it.
         """
         repo_key = normalize_repo_key(repo_id)
         target = (variant or "").strip().lower() or None
@@ -1842,7 +1872,13 @@ class DownloadRegistry:
             for key, job in self._jobs.items():
                 if _repo_of_key(key) != repo_key or job.state not in _ACTIVE_STATES:
                     continue
-                if self._active_job_variant_locked(key) == target:
+                other = self._active_job_variant_locked(key)
+                if other is None or target is None:
+                    # A whole-snapshot job (or a whole-snapshot request): no variant to compare.
+                    if other == target:
+                        return True
+                    continue
+                if variant_spellings_may_name_one_build(other, target):
                     return True
         return False
 

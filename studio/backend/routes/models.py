@@ -3888,6 +3888,7 @@ def _resolve_quant_gguf(repo_id: str, quant: str, is_local: bool) -> tuple[Optio
         want = (quant or "").strip()
         best_total = 0
         best_first: Optional[str] = None
+        per_root: list[tuple[Path, dict[int, list[tuple[str, Path, int]]]]] = []
         for root in roots:
             ranked: dict[int, list[tuple[str, Path, int]]] = {0: [], 1: []}
             for f in _iter_gguf_paths(root):
@@ -3903,6 +3904,41 @@ def _resolve_quant_gguf(repo_id: str, quant: str, is_local: bool) -> tuple[Optio
                 except OSError:
                     continue
                 ranked[rank].append((rel, f, size))
+            per_root.append((root, ranked))
+        # The legacy bare spelling is judged across EVERY cached revision before any one is
+        # chosen: two tagged builds of one quant in two revisions each looked unambiguous alone,
+        # and the larger one was priced and revealed for a spelling the loader refuses. Exact
+        # keys anywhere still win outright.
+        if any(ranked[0] for _root, ranked in per_root):
+            # An exact key in ANY revision is used alone across ALL of them: leaving another
+            # revision's label rows in play let a larger tagged build outbid the plain one that
+            # owns the spelling exactly, and the estimate priced weights the loader will not open.
+            for _root, ranked in per_root:
+                ranked[1] = []
+        else:
+            from utils.models.model_config import _gguf_variant_key
+
+            from hub.utils.gguf import resolve_variant_alias
+
+            label_keys = {
+                _gguf_variant_key(rel).lower()
+                for _root, ranked in per_root
+                for rel, _f, _size in ranked[1]
+            }
+            # The shared rule, root precedence included -- not "any two keys refuse": a tagged
+            # root beside ``distilled/model-Q4_K_M.gguf`` is what a legacy pin resolves to and
+            # what the loaders open, and refusing it here returned a null estimate for a model
+            # that loads. Two root builds still resolve to nothing, and still refuse.
+            selected = resolve_variant_alias(sorted(label_keys), want) if label_keys else None
+            if label_keys and selected is None:
+                return None, 0
+            if selected is not None:
+                for _root, ranked in per_root:
+                    ranked[1] = [
+                        entry for entry in ranked[1]
+                        if _gguf_variant_key(entry[0]).lower() == selected.lower()
+                    ]
+        for root, ranked in per_root:
             # Exact keys alone when any exist: summing them with the label matches counts other
             # checkpoints' bytes into this row's estimate and can reveal one of their files.
             # ... and within those, ONE shard family, the same rule group_gguf_variant_files
@@ -3910,7 +3946,7 @@ def _resolve_quant_gguf(repo_id: str, quant: str, is_local: bool) -> tuple[Optio
             # would otherwise report double the weights the loader opens, which /kv-cache-estimate
             # turns into a false exceeds-memory warning and which can make a snapshot look
             # "more complete" purely for holding a redundant copy.
-            chosen = _one_shard_family_of(ranked[0] or ranked[1])
+            chosen = _one_shard_family_of(ranked[0] or _unambiguous_label_matches(ranked[1]))
             matches = [(rel, f) for rel, f, _size in chosen]
             total = sum(size for _rel, _f, size in chosen)
             # Prefer the most complete snapshot so a partial older revision can't underestimate bytes.
@@ -4915,18 +4951,34 @@ def _one_shard_family_of(entries: list) -> list:
     return min(families.values(), key = lambda group: min(e[0] for e in group))
 
 
+def _unambiguous_label_matches(labelled: list) -> list:
+    """Rank-1 entries, but only when they are ONE build's.
+
+    Rank 1 is the legacy bare spelling of a qualified key. It stands in for exactly one build;
+    across two builds of a single quant (``-mtp`` beside ``-fp16``) it names neither, and taking
+    the lexicographically first would price and reveal a checkpoint nobody asked for.
+    ``plan_for_variant`` refuses the same request, so this agrees with it. Shards of one build
+    share a key and are unaffected.
+    """
+    from utils.models.model_config import _gguf_variant_key
+
+    if len({_gguf_variant_key(entry[0]).lower() for entry in labelled}) > 1:
+        return []
+    return labelled
+
+
 def _main_variant_rank(rel_path: str, want: str) -> Optional[int]:
     """How well *want* names this file's variant: 0 for its own key, 1 for the legacy
     quant-label spelling, None for neither.
 
     *want* is the request VERBATIM: the bare-quant folding is applied per comparison, because
     doing it once up front strips a qualified key's own path punctuation and folds ``exp-a/`` into
-    ``expa/``. Directory-qualified keys keep their legacy bare spelling, since stored pins predate
-    them. Root-level H3 stems do not: a bare quant names both FL2VA and Ref2VA, and picking the
+    ``expa/``. Qualified keys keep their legacy bare spelling, since stored pins predate them. H3's
+    denoiser stems do not: a bare quant names both FL2VA and Ref2VA, and picking the
     first file would load a different task. Exact keys are used alone whenever any exist, and the
     label is the fallback for rows with no root-stem identity.
     """
-    from hub.utils.gguf import is_qualified_gguf_variant_key
+    from hub.utils.gguf import is_h3_denoiser_variant_key
     from utils.models.model_config import _gguf_variant_key
 
     label = _main_variant_gguf_label(rel_path)
@@ -4935,7 +4987,7 @@ def _main_variant_rank(rel_path: str, want: str) -> Optional[int]:
     key = _gguf_variant_key(rel_path)
     if _variant_keys_match(key, want):
         return 0
-    if is_qualified_gguf_variant_key(key) and "/" not in key.replace("\\", "/"):
+    if is_h3_denoiser_variant_key(key):
         return None
     return 1 if _normalized_quant_label(label) == _normalized_quant_label(want) else None
 
@@ -5567,6 +5619,7 @@ def _resolve_cached_model_path(repo_id: str, variant: Optional[str]) -> Path:
             key = lambda rev: getattr(rev, "last_modified", 0) or 0,
             reverse = True,
         )
+        per_rev: list[dict[int, list[tuple[str, Path]]]] = []
         for rev in candidate_revisions:
             snapshot = getattr(rev, "snapshot_path", None)
             ranked: dict[int, list[tuple[str, Path]]] = {0: [], 1: []}
@@ -5586,7 +5639,26 @@ def _resolve_cached_model_path(repo_id: str, variant: Optional[str]) -> Path:
                     continue
                 if p.exists() or p.is_symlink():
                     ranked[rank].append((rel, p))
-            # Exact keys alone when any exist, else the legacy label spelling.
+            per_rev.append(ranked)
+        # Decided across EVERY revision before any one is returned: the newest revision holding
+        # only the tagged build was locally unambiguous and was revealed for a spelling the plain
+        # build in an older revision owns exactly -- while the loaders open the plain one. Exact
+        # keys anywhere are used alone; otherwise the label rows resolve through the shared rule.
+        if any(ranked[0] for ranked in per_rev):
+            for ranked in per_rev:
+                ranked[1] = []
+        else:
+            from hub.utils.gguf import resolve_variant_alias
+            from utils.models.model_config import _gguf_variant_key
+
+            label_keys = {_gguf_variant_key(rel).lower() for ranked in per_rev for rel, _p in ranked[1]}
+            selected = resolve_variant_alias(sorted(label_keys), want) if label_keys else None
+            for ranked in per_rev:
+                ranked[1] = [
+                    entry for entry in ranked[1]
+                    if selected is not None and _gguf_variant_key(entry[0]).lower() == selected.lower()
+                ]
+        for ranked in per_rev:
             matches = ranked[0] or ranked[1]
             if matches:
                 # Path-sorted so a sharded quant deterministically yields its first split.

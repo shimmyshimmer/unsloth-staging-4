@@ -8060,6 +8060,44 @@ def _resident_id_is_namespaced() -> bool:
     return any("/" in (public_model_id(c) or "") for c in candidates if c)
 
 
+def _resident_variant_matches(base: str, requested_variant: str, loaded_variant: str) -> bool:
+    """Whether the resident *loaded_variant* is what *requested_variant* names for *base*.
+
+    Exact first. Otherwise the request may be the legacy bare spelling of the resident build's
+    qualified key, which the download and loader paths both still accept -- so resolve it the way
+    they do, against what is actually on disk. Inventory-aware rather than a loose string
+    compare: where a plain row owns the bare quant beside a tagged one they are different
+    checkpoints, and calling them equal here reports the wrong model as already serving.
+    """
+    left = (loaded_variant or "").strip().lower()
+    right = (requested_variant or "").strip().lower()
+    if not right or left == right:
+        return True
+    # Both sides through the inventory: a lone tagged build loaded through its legacy bare
+    # spelling keeps that bare value in ``hf_variant``, and a request through its advertised
+    # qualified row resolved to the qualified key and compared unequal -- a needless full reload
+    # of the weights already serving. Where a plain sibling owns the bare key the two resolve to
+    # different rows and stay apart.
+    try:
+        from core.inference.local_model_resolver import resolve_local_gguf
+
+        def canon(spelling: str) -> str:
+            hit = resolve_local_gguf(f"{base}:{spelling}", allow_scan = False)
+            resolved = hit[1] if hit and len(hit) > 1 and hit[1] else None
+            return (resolved or spelling).strip().lower()
+
+        # Canonicalise the two together only when they COULD name one build: an inventory that
+        # answers the same entry for any spelling would otherwise fold two different quants into
+        # "already serving" and suppress a switch the request actually asked for.
+        from hub.utils.gguf import variant_spellings_may_name_one_build
+
+        if not variant_spellings_may_name_one_build(requested_variant, loaded_variant):
+            return canon(requested_variant) == left
+        return canon(requested_variant) == canon(loaded_variant)
+    except Exception:
+        return False
+
+
 def _loaded_satisfies(requested: str) -> bool:
     """Whether what is serving right now actually answers to *requested*.
 
@@ -8085,7 +8123,9 @@ def _loaded_satisfies(requested: str) -> bool:
         if not looks_like_quant(variant):
             # An Ollama-style tag (":latest", ":8b") names no file, so the repo is enough.
             return True
-        return (getattr(llama_backend, "hf_variant", None) or "").lower() == variant.lower()
+        return _resident_variant_matches(
+            base, variant, getattr(llama_backend, "hf_variant", None) or ""
+        )
     backend = get_inference_backend()
     active = getattr(backend, "active_model_name", None)
     if not active:
@@ -8777,6 +8817,12 @@ async def _maybe_auto_switch_model(
             if bare:
                 return True
             if variant:
+                # EXACT, deliberately. ``variant`` is the resolver's selected identity (see the
+                # ``target_id, variant, override_id = resolved`` unpack above), not the request's
+                # spelling, so it is already the on-disk key -- as is the loaded ``hf_variant``.
+                # An alias-tolerant compare here would call a resident ``model-Q4_K_M-mtp`` a
+                # match for a request the resolver pointed at the plain ``Q4_K_M`` row, and skip
+                # the switch: the reply would come from a checkpoint nobody asked for.
                 loaded_variant = (getattr(backend, "hf_variant", None) or "").lower()
                 return loaded_variant == variant.lower()
             return True
@@ -10564,7 +10610,12 @@ def _estimate_gguf_required_gb(
             from utils.models.model_config import list_gguf_variants
 
             variants, has_vision = list_gguf_variants(repo, hf_token = hf_token)
-            selected = next((v for v in variants if v.quant.lower() == variant.lower()), None)
+            from hub.utils.gguf import resolve_variant_alias
+
+            # The stored pin may be the legacy bare spelling of a qualified row; exact equality
+            # left the estimate with no size at all for a lone tagged build.
+            wanted = resolve_variant_alias([v.quant for v in variants], variant)
+            selected = next((v for v in variants if v.quant == wanted), None)
             main_bytes = selected.size_bytes if selected is not None else None
             if main_bytes is None:
                 return None

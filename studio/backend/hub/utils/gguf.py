@@ -852,6 +852,153 @@ def is_h3_denoiser_variant_key(key: str) -> bool:
     )
 
 
+def accepts_bare_quant_alias(key: str) -> bool:
+    """Whether *key* may also answer to the bare quant token it qualifies. Eligibility only --
+    callers still require the match to be unique among the keys they hold."""
+    return is_qualified_gguf_variant_key(key) and not is_h3_denoiser_variant_key(key)
+
+
+def _forward_slashed(text: Optional[str]) -> str:
+    """A variant spelling with Windows separators folded to the ``/`` a key is minted with."""
+    return (text or "").replace("\\", "/")
+
+
+def resolve_variant_alias(keys: Iterable[str], wanted: str) -> Optional[str]:
+    """The key among *keys* that *wanted* names, or None when it names zero or several.
+
+    *wanted* itself when it is one of them, else the ONE qualified key whose bare quant alias it
+    is. Every caller that accepts the legacy bare spelling for a qualified key has to agree on
+    this, or a variant downloads under one identity and is looked up, resumed or guarded under
+    another. Ambiguity resolves to None so each caller fails closed.
+
+    A ROOT build outranks a SUBORDINATE one, because the bare quant is the spelling the root
+    build USED to key under exactly: a tagged root beside ``distilled/model-Q4_K_M.gguf`` put two
+    keys in the alias list, and a pin that resolved before this change stopped resolving at all.
+    A subordinate key never owned the bare spelling, so it only answers when nothing at the root
+    does. Two ROOT builds still tie, and still refuse.
+
+    Root-level is the lister's own rule, not the presence of a slash: a quant-named parent adds
+    no identity (``Q4_K_M/model-Q4_K_M-fp16.gguf`` is a second build at the root, not a distilled
+    checkpoint), so the slash test alone let a root build win a contest it should have lost and
+    served an existing pin one of two checkpoints instead of refusing.
+
+    Separators are normalised on both sides, as ``collapse_same_quant_root_builds`` and
+    ``_main_variant_rank`` already do: a key is always minted with forward slashes, but a request
+    carrying a Windows path did not match its own key.
+    """
+    target = _forward_slashed(wanted).strip().lower()
+    if not target:
+        return None
+    by_lower: dict[str, str] = {}
+    for key in keys:
+        by_lower.setdefault(_forward_slashed(key).strip().lower(), key)
+    if target in by_lower:
+        return by_lower[target]
+    matches = [
+        original
+        for original in by_lower.values()
+        if accepts_bare_quant_alias(original) and bare_quant_alias(original).lower() == target
+    ]
+    if len(matches) > 1:
+        matches = [key for key in matches if _keys_at_repo_root(key)] or matches
+    return matches[0] if len(matches) == 1 else None
+
+
+def _keys_at_repo_root(key: str) -> bool:
+    """Whether *key* names a build the repo root offers, by ``gguf_variant_key``'s own rule.
+
+    A quant-named parent says only how the file was quantized, which its name already says, so
+    it leaves the build at the root; any other directory is a different checkpoint.
+    """
+    parents = _forward_slashed(key).rpartition("/")[0]
+    return all(_is_quant_directory(segment) for segment in parents.split("/") if segment)
+
+
+def variant_spellings_may_name_one_build(a: Optional[str], b: Optional[str]) -> bool:
+    """Whether two variant spellings can name the SAME build, for a fail-closed load guard.
+
+    Symmetric, because either side may hold either spelling: a build can be LOADED through the
+    legacy bare quant and deleted through its advertised qualified row, or loaded through the
+    qualified row and deleted through the bare pin. Deliberately loose -- and looser than
+    :func:`accepts_bare_quant_alias`, so an H3 stem counts too -- since a false match only
+    refuses a delete while a false miss unlinks a model that is resident.
+    """
+    left = _forward_slashed(a).strip().lower()
+    right = _forward_slashed(b).strip().lower()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    for key, bare in ((left, right), (right, left)):
+        if (
+            is_qualified_gguf_variant_key(key)
+            and not is_qualified_gguf_variant_key(bare)
+            and bare_quant_alias(key).lower() == bare
+        ):
+            return True
+    return False
+
+
+def _quant_group_identity(key: str) -> Optional[str]:
+    """The precision two builds have to share before one may stand in for the other.
+
+    The quant token plus its bit-width modifier when the key carries one: ``IQ4_XS-3.53bpw`` and
+    ``IQ4_XS-4.05bpw`` are different precisions the listers publish as separate rows, so they are
+    never two builds of one quant.
+    """
+    # ``quant_token_with_bpw`` is what decides elsewhere whether a modifier belongs to the token,
+    # and it reads only an ADJACENT one: it keeps ``m-IQ4_XS-3.53bpw-mtp`` at IQ4_XS-3.53bpw while
+    # rejecting the far ``08.577bpw`` in ``flux1-dev-Q8_0-fp32-08.577bpw``. Searching the whole key
+    # instead read that unrelated size annotation as Q8_0's bit width, so the build never grouped
+    # with the plain Q8_0 it is a second copy of.
+    return (quant_token_with_bpw(key) or extract_quant_token(key) or "").lower() or None
+
+
+def collapse_same_quant_root_builds(keys: Iterable[str]) -> list[str]:
+    """One key per quant token among ROOT-level builds, for DEFAULT selection only.
+
+    Giving a repo's second build at one quant its own row puts both keys into the default
+    ranking, and ``preferred_quant`` ranks on the quant TEXT: the pair ties, so the winner falls
+    out of input order. The remote map is in Hub listing order while the local and picker
+    listings are size-sorted, so a bare ``org/repo`` could mean the plain build from one resolver
+    and the tagged build from the other -- and change weights once the repo was downloaded.
+
+    Every build stays advertised and individually selectable; this only decides what the
+    UNqualified id means, and it means the plain build wherever the repo publishes one. Ties
+    among tagged-only builds fall to the lexicographically first key, which is deterministic and
+    is the family the grouped row used to pick.
+
+    Grouped on the bpw-PRESERVING identity, because two bit widths are two precisions, not two
+    builds of one. ``extract_quant_token`` drops the modifier, so ``IQ4_XS-3.53bpw`` and
+    ``IQ4_XS-4.05bpw`` grouped together and the lexicographically first won -- and the listers
+    sort larger first, so a bare repo id that meant 4.05bpw silently dropped to 3.53bpw.
+    """
+    # Materialised once: the input is read twice, and an Iterable may be a one-shot generator.
+    ordered = list(keys)
+    groups: dict[str, list[str]] = {}
+    passthrough: set[str] = set()
+    for key in ordered:
+        token = _quant_group_identity(key)
+        # Root-level by the lister's own rule, not by the absence of a slash: two builds filed
+        # under a quant-only directory are both AT the root and have to collapse like root files,
+        # or the remote resolver ranks them in Hub order and the local one by size.
+        if token is None or not _keys_at_repo_root(key):
+            passthrough.add(key)
+            continue
+        groups.setdefault(token, []).append(key)
+    winners = []
+    for token, members in groups.items():
+        if len(members) == 1:
+            winners.append(members[0])
+            continue
+        bare = [k for k in members if not is_qualified_gguf_variant_key(k)]
+        winners.append(sorted(bare)[0] if bare else sorted(members)[0])
+    # Input order is preserved for everything that was not collapsed, so callers that care about
+    # listing order see no other change.
+    keep = set(winners)
+    return [k for k in ordered if k in keep or k in passthrough]
+
+
 def _is_quant_directory(segment: str) -> bool:
     """Whether a path segment names a quant (``Q6_K/``, ``Llama-3.3-70B-Instruct-Q6_K/``).
 
@@ -863,16 +1010,38 @@ def _is_quant_directory(segment: str) -> bool:
     return _select_quant_match(segment) is not None
 
 
+# Only the extension itself, never a dotted build tag: ``model-Q4_K_M.fp16.gguf`` is a second
+# build of Q4_K_M exactly as ``model-Q4_K_M-fp16.gguf`` is, and stripping ``.fp16`` as though it
+# were an extension collapsed the pair back into one row. Repeated because a non-canonical split
+# leaves ``.gguf`` twice (``...Q6_K.gguf-00001-of-00006.gguf``, shard suffix already removed).
+_GGUF_EXTENSION_SUFFIX_RE = re.compile(r"(?:\.gguf)+$", re.IGNORECASE)
+
+
+def _quant_token_closes_name(filename: str) -> bool:
+    """Whether the basename ends at its quant token. Anything trailing it is a second build of
+    that quant (``-mtp``, ``-fp16``, ``.fp16``), not the same one."""
+    match, text = _locate_quant_match(filename)
+    stem = _quant_search_stem(filename)
+    if match is None or text != stem:
+        return True
+    tail = stem[match.end() :]
+    bpw = _GGUF_BPW_SUFFIX_RE.match(tail)
+    if bpw:
+        tail = tail[bpw.end() :]
+    return not _GGUF_EXTENSION_SUFFIX_RE.sub("", tail)
+
+
 def gguf_variant_key(filename: str) -> str:
     """The persisted identity of a selectable GGUF variant.
 
     The bare quant token when that token names the file within its path -- the shape
     almost every repo uses, so this is byte-identical to the historical key there and
     every stored pin, manifest and marker keeps resolving. When the token does NOT
-    single the file out, because a sibling directory holds another checkpoint at the
-    same quant (``distilled/`` and ``distilled-1.1/`` beside the repo root), the key
-    is the file's :func:`gguf_variant_family` instead, which is unique within the
-    repo and which the loader already accepts as a spelling
+    single the file out -- because a sibling directory holds another checkpoint at the
+    same quant (``distilled/`` and ``distilled-1.1/`` beside the repo root), or because
+    the name carries a build tag past the token (``model-Q4_K_M-mtp.gguf`` beside
+    ``model-Q4_K_M.gguf``) -- the key is the file's :func:`gguf_variant_family` instead,
+    which is unique within the repo and which the loader already accepts as a spelling
     (``model_config._find_local_gguf_by_variant`` matches its shard-stripped relative
     path, as does ``llama_cpp._gguf_files_for_variant``).
 
@@ -890,6 +1059,8 @@ def gguf_variant_key(filename: str) -> str:
         return _unknown_gguf_variant_key(path)
     parents = path.rpartition("/")[0]
     if any(segment and not _is_quant_directory(segment) for segment in parents.split("/")):
+        return _unknown_gguf_variant_key(path)
+    if not _quant_token_closes_name(path):
         return _unknown_gguf_variant_key(path)
     return quant
 
@@ -930,6 +1101,11 @@ def _apply_gguf_display_labels(variants: list[GgufVariantInfo]) -> None:
     for variant in qualified:
         scope = _variant_scope_label(variant.filename).lower()
         scopes[scope] = scopes.get(scope, 0) + 1
+    # The key cannot read the listing, so a build tag qualifies it even with no plain sibling.
+    tokens: dict[str, int] = {}
+    for variant in variants:
+        if (token := extract_quant_token(variant.filename)) is not None:
+            tokens[token.lower()] = tokens.get(token.lower(), 0) + 1
     for variant in variants:
         token = extract_quant_token(variant.filename)
         h3_name = Path(variant.filename).name.lower()
@@ -945,6 +1121,10 @@ def _apply_gguf_display_labels(variants: list[GgufVariantInfo]) -> None:
         if token is None:
             variant.display_label = f"GGUF · {variant.filename}" if ambiguous else "GGUF"
         elif variant.quant.lower() != (_plain_key(variant) or "").lower():
+            # A lone root stem has no namesake to be told apart from, so it shows the quant alone.
+            if "/" not in variant.quant.replace("\\", "/") and tokens[token.lower()] < 2:
+                variant.display_label = token
+                continue
             # A key qualified by path: show the quant, plus what distinguishes it.
             collides = scopes.get(_variant_scope_label(variant.filename).lower(), 0) > 1
             variant.display_label = (
@@ -1318,7 +1498,11 @@ def iter_snapshots_preferring_whole(
     whole, torn = [], []
     for snapshot in ordered:
         try:
-            is_whole = gguf_variant in complete_snapshot_variants(str(snapshot))
+            complete = complete_snapshot_variants(str(snapshot))
+            # The alias has to be reconciled HERE, not only when the file is picked: a lone tagged
+            # build is stored under its qualified key, so a legacy bare pin matched no snapshot's
+            # complete set, every revision sorted as torn, and the newest half download won.
+            is_whole = resolve_variant_alias(complete, gguf_variant) is not None
         except Exception:
             is_whole = True
         (whole if is_whole else torn).append(snapshot)
@@ -1329,10 +1513,26 @@ def resolve_local_gguf_path(repo_id: str, gguf_variant: Optional[str]) -> Option
     """Absolute path to the (shard-1) GGUF file for ``repo_id`` + ``gguf_variant``
     if it is already downloaded in the HF cache, else ``None``. Read-only — never
     triggers a download. Lets callers read header metadata before a load."""
-    for snapshot in iter_snapshots_preferring_whole(repo_id, gguf_variant):
-        variants, _ = list_local_gguf_variants(str(snapshot))
-        for variant in variants:
-            if gguf_variant is None or variant.quant == gguf_variant:
+    snapshots = list(iter_snapshots_preferring_whole(repo_id, gguf_variant))
+    listed = {snapshot: list_local_gguf_variants(str(snapshot))[0] for snapshot in snapshots}
+    # A lone tagged build is listed under its qualified key, and the download path accepts the
+    # legacy bare quant for it; exact equality here returned None for a model that IS cached, so
+    # callers reported it not_downloaded and skipped every header-derived fact. Resolved against
+    # the UNION of every cached revision, not each on its own: two tagged builds of one quant in
+    # two revisions each looked unambiguous alone, and whichever revision was visited first won
+    # while every other resolver refused the spelling.
+    wanted = (
+        None
+        if gguf_variant is None
+        else resolve_variant_alias(
+            [variant.quant for variants in listed.values() for variant in variants], gguf_variant
+        )
+    )
+    if gguf_variant is not None and wanted is None:
+        return None
+    for snapshot in snapshots:
+        for variant in listed[snapshot]:
+            if gguf_variant is None or variant.quant == wanted:
                 candidate = snapshot / variant.filename
                 if candidate.is_file():
                     return str(candidate)

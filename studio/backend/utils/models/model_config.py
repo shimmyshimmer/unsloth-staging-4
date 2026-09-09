@@ -2824,6 +2824,25 @@ def _quant_token_with_bpw(filename: str) -> Optional[str]:
     return token
 
 
+# MIRROR of ``hub.utils.gguf._GGUF_EXTENSION_SUFFIX_RE``: the extension only, so a dotted build
+# tag (``model-Q4_K_M.fp16.gguf``) stays part of the identity.
+_GGUF_EXTENSION_SUFFIX_RE = re.compile(r"(?:\.gguf)+$", re.IGNORECASE)
+
+
+def _quant_token_closes_name(filename: str) -> bool:
+    """MIRROR of ``hub.utils.gguf._quant_token_closes_name``: whether the basename ends at its
+    quant token, so anything trailing it is a second build of that quant (``-mtp``, ``-fp16``)."""
+    match, text = _locate_quant_match(filename)
+    stem = _quant_search_stem(filename)
+    if match is None or text != stem:
+        return True
+    tail = stem[match.end() :]
+    bpw = _GGUF_BPW_SUFFIX_RE.match(tail)
+    if bpw:
+        tail = tail[bpw.end() :]
+    return not _GGUF_EXTENSION_SUFFIX_RE.sub("", tail)
+
+
 def _gguf_variant_key(filename: str) -> str:
     """MIRROR of ``hub.utils.gguf.gguf_variant_key``; utils cannot import hub.
 
@@ -2844,6 +2863,9 @@ def _gguf_variant_key(filename: str) -> str:
         # directory naming something else is a different checkpoint and qualifies.
         if segment and _select_known_quant_match(segment) is None:
             return _gguf_variant_family(path)
+    # A build tag past the token is a second build of that quant, not the same one.
+    if not _quant_token_closes_name(path):
+        return _gguf_variant_family(path)
     return quant
 
 
@@ -3283,9 +3305,54 @@ def _find_local_gguf_by_variant(
     owned.sort()
     if owned:
         return str(_local_gguf_load_path(owned[0]))
+    # No file OWNS the request, so this is the legacy bare spelling of a qualified key. It may
+    # stand in for exactly one build; when two builds of one quant are cached (``-mtp`` beside
+    # ``-fp16``) it names neither, and returning the first by name loads a checkpoint the user
+    # did not ask for. ``plan_for_variant`` already refuses the same request.
+    # MIRROR of ``hub.utils.gguf.resolve_variant_alias``'s root precedence (utils cannot import
+    # hub): among several keys the bare spelling names, the ONE at the repo root -- every parent
+    # a quant-only directory -- owns it, because that build keyed as the bare quant exactly
+    # before the split. Two root builds still name neither.
+    keyed = {f: _gguf_variant_key(f.relative_to(p).as_posix()) for f in matches}
+    distinct = {k.lower() for k in keyed.values()}
+    if len(distinct) > 1:
+        root_keys = {k.lower() for k in distinct if _key_at_repo_root(k)}
+        if len(root_keys) != 1:
+            return None
+        matches = [f for f in matches if keyed[f].lower() in root_keys]
     if matches:
         return str(_local_gguf_load_path(matches[0]))
     return None
+
+
+def _default_root_gguf_filename(variants) -> Optional[str]:
+    """The file a bare repo id LOADS, decided the way every other default resolver decides it.
+
+    ROOT rows when there are any, root-level by the lister's rule (every parent a quant-only
+    directory) rather than by the absence of a slash -- two builds filed under ``Q4_K_M/`` are at
+    the root, and dropping them emptied the set so the fallback took every row in listing order.
+    Same-quant root builds are collapsed by the shared rule before ``_pick_best_gguf`` sees
+    them, because a plain build and its tagged sibling tie in that ranking and the winner then
+    fell out of listing order: this is the LOAD path, and it was the one default resolver that
+    still ranked the pair uncollapsed. ``hub`` is imported lazily, as the load path already does
+    for ``core.inference.llama_cpp`` a few lines on; the module-level ban is on import-time cycles.
+    """
+    from hub.utils.gguf import _keys_at_repo_root, collapse_same_quant_root_builds
+
+    advertised = {
+        v.filename: _qualified_variant_name(v.filename, v.quant) for v in variants
+    }
+    root_rows = [f for f, key in advertised.items() if _keys_at_repo_root(key)]
+    pool = root_rows or list(advertised)
+    keep = set(collapse_same_quant_root_builds([advertised[f] for f in pool]))
+    ranked = [f for f in pool if advertised[f] in keep] or pool
+    return _pick_best_gguf(ranked)
+
+
+def _key_at_repo_root(key: str) -> bool:
+    """MIRROR of ``hub.utils.gguf._keys_at_repo_root``: every parent segment names a quant."""
+    parents = key.replace("\\", "/").rpartition("/")[0]
+    return all(_select_known_quant_match(seg) is not None for seg in parents.split("/") if seg)
 
 
 def _detect_gguf_from_hf_cache(repo_id: str) -> Optional[str]:
@@ -4283,13 +4350,7 @@ class ModelConfig:
                     # before the root ...-Q6_K made a bare repo id load the distilled checkpoint --
                     # while local_model_resolver, the auto-download map and /gguf-variants all
                     # define a bare id as the root. This is the LOAD path, so it has to agree.
-                    root_rows = [
-                        v.filename
-                        for v in variants
-                        if "/" not in _qualified_variant_name(v.filename, v.quant)
-                    ]
-                    variant_filenames = root_rows or [v.filename for v in variants]
-                    best = _pick_best_gguf(variant_filenames)
+                    best = _default_root_gguf_filename(variants)
                     if best:
                         # The SAME identity the lister advertised for that file. Converting the
                         # winner back to a bare label handed the load a name several checkpoints
