@@ -95,7 +95,10 @@ def get_stored_custom_llama_cpp_path() -> Optional[Path]:
     """The Unsloth-selected directory, or ``None`` when automatic discovery is active."""
     try:
         from storage.studio_db import get_app_setting
-        value = get_app_setting(CUSTOM_LLAMA_CPP_PATH_SETTING_KEY, None)
+        from utils.account_context import OWNER, run_as
+
+        # Owner-only, install-wide binary pin: read from the owner's database.
+        value = run_as(OWNER, get_app_setting, CUSTOM_LLAMA_CPP_PATH_SETTING_KEY, None)
     except Exception:
         # A settings DB problem must not take the bundled runtime down with it.
         return None
