@@ -25,6 +25,7 @@ Stdlib only.
 
 from __future__ import annotations
 
+import contextvars
 import os
 import signal
 import sys
@@ -42,6 +43,10 @@ _JobObjectExtendedLimitInformation = 9
 # never reject it because init's start time never changes. Guarded at both ends: nothing below this is recorded, and
 # nothing below this is signalled.
 _LOWEST_SIGNALABLE_PID = 2
+
+# Distinguishes "no record for this pid" from "a record whose identity is None", which
+# is a real state: a pid whose start time could not be read is tracked without one.
+_NO_RECORD = object()
 
 
 def is_signalable_pid(pid: object) -> bool:
@@ -358,14 +363,32 @@ def _reset_after_fork() -> None:
     """A fork child inherits both locks in whatever state they were in and a
     _spawner whose thread does not exist here. Start clean instead of deadlocking."""
     global _spawner, _spawner_lock, _record_lock, _owner_identity
+    global _generation_lock, _shutdown_latch, _transition_lock
     _spawner_lock = threading.Lock()
     # A different pid here.
     _owner_identity = None
     _tracked_pids.clear()
+    _adoption_generation.clear()
     _tracked_pgids.clear()
     # A fork while another thread was inside adopt_pid / forget_pid leaves this held here with nobody to release it, and
     # the first adoption blocks forever.
     _record_lock = threading.Lock()
+    # Same hazard, same remedy: a fork taken while another thread held the generation lock
+    # leaves it locked here forever, and then process_lifecycle_generation() -- which
+    # every spawn guard calls -- deadlocks the child instead of answering it.
+    _generation_lock = threading.Lock()
+    # Same inheritance hazard, and a child that cannot take it can never tear down.
+    _transition_lock = threading.RLock()
+    # Event carries an internal lock of its own, so it inherits the same way. Rebuild it
+    # holding the flag it had, rather than resetting it: the child is still inside
+    # whichever lifecycle forked it, and a cleared latch would read as permission to spawn.
+    _was_latched = _shutdown_latch.is_set()
+    _shutdown_latch = threading.Event()
+    if _was_latched:
+        _shutdown_latch.set()
+    # _lifecycle_generation is deliberately NOT reset. It is only ever incremented, and
+    # spawn guards compare a captured value against it; restarting the count here would
+    # make a child's stale stamp compare equal to a later session's.
     _spawner = None
 
 
@@ -566,6 +589,9 @@ def forget_pid(pid: Optional[int]) -> None:
         if _group_has_members(_tracked_pgids.get(pid)):
             return
         _tracked_pids.pop(pid, None)
+        # Alongside the other per-pid records, or a long-lived Studio grows this by one
+        # entry for every update, download, sidecar and inference child it ever forgets.
+        _adoption_generation.pop(pid, None)
         _tracked_pgids.pop(pid, None)
         _write_breadcrumb()
 
@@ -965,8 +991,11 @@ def adopt_pid(pid: Optional[int]) -> None:
     _adopt_fork_reset()
     identity = _identity_for_record(pid)
     pgid = _own_process_group(pid)
+    with _generation_lock:
+        adopted_in = _lifecycle_generation
     with _record_lock:
         _tracked_pids[pid] = identity
+        _adoption_generation[pid] = adopted_in
         if pgid is not None:
             _tracked_pgids[pid] = pgid
         _write_breadcrumb()
@@ -988,7 +1017,138 @@ def adopt_pid(pid: Optional[int]) -> None:
             pass
 
 
-def terminate_all(timeout: float = 5.0) -> "list[int]":
+_shutdown_latch = threading.Event()
+# Bumped per begin_process_lifecycle. Clearing the latch necessarily clears it for the
+# PREVIOUS session too, so work admitted then compares the value it captured instead of
+# reading a boolean that has since been reset under it.
+_lifecycle_generation = 0
+_generation_lock = threading.Lock()
+# Which lifecycle adopted each pid, and which one a running shutdown belongs to. A
+# shutdown can legitimately outlast any bound a restart is willing to wait (steps 2 and
+# 3 alone allow five seconds each), so the restart cannot be made to wait it out.
+# Instead the old sweep is scoped: it never signals a child a LATER lifecycle adopted.
+# None means no shutdown has been marked, so a sweep filters nothing.
+_adoption_generation: "dict[int, int]" = {}
+
+
+# Held across a whole lifecycle transition, and across each teardown step that acts on
+# a module singleton. Reading the generation and then acting on it is check-then-act:
+# without this the restart can advance the generation in the gap, and the old shutdown
+# goes on to kill the new session's server anyway. Recursive so a step that reaches
+# another guarded helper does not deadlock on itself.
+#
+# LOCK ORDER: this one FIRST, then any subsystem lock (_teardown_lock,
+# _subprocess_shutdown_lock, _spawn_lock). Both sides take it in that order -- the
+# restart holds it across _begin_server_lifecycle, which takes _teardown_lock, and the
+# shutdown holds it across _kill_process, which takes the same. Reversing it on either
+# side is a deadlock.
+_transition_lock = threading.RLock()
+
+
+def lifecycle_transition() -> "threading.RLock":
+    """Serialise a lifecycle transition against the teardown steps it races.
+
+    Held only for one step at a time, never for a whole shutdown, so a restart still
+    waits out at most a single bounded step rather than the exit it deliberately
+    refuses to wait for.
+    """
+    return _transition_lock
+
+
+# The generation that ADMITTED the work running on this context, as opposed to whatever
+# generation happens to be current when it finally reaches a backend. A load can sit in
+# preflight (a download, a long async probe) across an embedded restart, and a backend
+# that reads the live value there stamps old work as belonging to the new session.
+#
+# A ContextVar rather than a parameter: the spawn signatures are stubbed in a dozen
+# tests, and this has to cross `asyncio.to_thread`, which copies the context into the
+# worker thread. Unset means "no admission recorded", and every reader falls back to the
+# live generation, which is exactly the behaviour that existed before.
+_admitting_generation: "contextvars.ContextVar[Optional[int]]" = contextvars.ContextVar(
+    "unsloth_admitting_generation", default = None
+)
+
+
+def set_admitting_generation(generation: "Optional[int]") -> None:
+    """Record the lifecycle that admitted the work on this context."""
+    if generation is not None and (not isinstance(generation, int) or isinstance(generation, bool)):
+        return  # only a real stamp, never a truthy stand-in
+    _admitting_generation.set(generation)
+
+
+def admitting_generation() -> int:
+    """The generation that admitted this work, or the live one if none was recorded."""
+    recorded = _admitting_generation.get()
+    if recorded is None:
+        return process_lifecycle_generation()
+    return recorded
+
+
+def process_lifecycle_generation() -> int:
+    with _generation_lock:
+        return _lifecycle_generation
+
+
+def mark_process_shutting_down() -> int:
+    """Latch "this process is quitting" for every spawner in it.
+
+    Each subsystem already refuses to spawn during its OWN teardown, but that state
+    lives on the object being torn down: a second LlamaCppBackend built for a helper
+    load, or the inference orchestrator, never sees it and can Popen a child after
+    terminate_all has taken its snapshot. Set once here, read everywhere, so the
+    answer does not depend on which object a spawn happens to belong to.
+
+    Under the generation lock, so that a set racing begin_process_lifecycle's clear
+    cannot be erased by it: whichever transition happens second is the one that stands.
+
+    Returns the lifecycle this shutdown belongs to, read under the same lock that sets
+    the latch. Reading it in a separate call would let a restart advance the generation
+    in between, and the sweep would then adopt the NEW session's number and terminate
+    the children it had just started.
+    """
+    with _generation_lock:
+        _shutdown_latch.set()
+        return _lifecycle_generation
+
+
+def is_process_shutting_down(admitted_generation: "Optional[int]" = None) -> bool:
+    """Whether a spawn must be refused.
+
+    ``admitted_generation`` is ``process_lifecycle_generation()`` read when the work
+    began. Passing it also refuses work left over from an earlier session: an embedded
+    host's second run_server clears the latch, and a helper load still running from the
+    first would otherwise take that as permission to spawn into the new one. None means
+    the caller has no session to compare, so only the latch applies.
+    """
+    if _shutdown_latch.is_set():
+        return True
+    if admitted_generation is None:
+        return False
+    with _generation_lock:
+        return admitted_generation != _lifecycle_generation
+
+
+def begin_process_lifecycle() -> None:
+    """Clear the latch for an embedded host that calls run_server again.
+
+    Shutdown is terminal for a normal CLI run, but in-process callers reuse the
+    interpreter; a latch that never cleared would refuse every spawn of the second
+    session.
+
+    The generation bump is what keeps the FIRST session's work out: a helper or preview
+    load can still be running in a thread nothing joined, and clearing the latch alone
+    would hand it permission to spawn into this session.
+    """
+    global _lifecycle_generation
+    # Bump and clear under one lock. Releasing between them let a shutdown that began
+    # in the gap be erased by the clear, leaving every spawner that reads only the
+    # latch free to start a child after that shutdown's sweep.
+    with _generation_lock:
+        _lifecycle_generation += 1
+        _shutdown_latch.clear()
+
+
+def terminate_all(timeout: float = 5.0, sweep_generation: "Optional[int]" = None) -> "list[int]":
     """Backstop sweep over adopted pids, after per-subsystem cleanup. SIGTERM,
     then SIGKILL the survivors after `timeout`. Idempotent and teardown-safe.
 
@@ -1001,11 +1161,35 @@ def terminate_all(timeout: float = 5.0) -> "list[int]":
     survivors: "list[int]" = []
     # Snapshot under the same lock the writes take: a request thread can still
     # reach adopt_pid while this runs.
+    # The filter belongs to the shutdown that is running, so it is PASSED IN rather
+    # than read from a global: a global one keeps naming the session that ended once a
+    # restart clears the latch, and every later sweep then skips everything it finds.
+    # None means "no session to compare", i.e. sweep whatever is tracked.
+    sweeping_for = sweep_generation
     with _record_lock:
         tracked = list(_tracked_pids.items())
     for pid, identity in tracked:
+        # Check and consume under ONE hold. Split, an old sweep could read the
+        # generation, lose the lock, and have the pid recycled and re-adopted by the new
+        # lifecycle before it popped -- deleting the record that had just been created
+        # for a DIFFERENT process. The identity mismatch then stopped it signalling, so
+        # nothing died, but the new child was left in no record at all: absent from the
+        # breadcrumb and from every later sweep, which is how it ends up orphaned.
         with _record_lock:
+            adopted_in = _adoption_generation.get(pid)
+            # Belongs to a lifecycle that started after the shutdown running this sweep.
+            # Left tracked as well as unsignalled: it is a live child, and its own
+            # session still needs the handle on it.
+            if sweeping_for is not None and adopted_in is not None and adopted_in > sweeping_for:
+                continue
+            # Still the record we snapshotted? A re-adoption in the meantime replaced it
+            # with another process's, and consuming that one loses the only handle on a
+            # child this sweep has no business touching. Absent means another sweep
+            # already took it.
+            if _tracked_pids.get(pid, _NO_RECORD) != identity:
+                continue
             _tracked_pids.pop(pid, None)
+            _adoption_generation.pop(pid, None)
             pgid = _tracked_pgids.pop(pid, None)
         if not _signalable(pid):
             continue

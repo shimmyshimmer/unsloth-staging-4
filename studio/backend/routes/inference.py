@@ -13778,6 +13778,11 @@ _scoped_load_attempts: dict[tuple[str, str], _ScopedLoadAttempt] = {}
 _scoped_load_cancel_tombstones: dict[tuple[str, str], tuple[str, float]] = {}
 _running_load_attempt: Optional[_ScopedLoadAttempt] = None
 _pending_load_attempts: dict[str, _ScopedLoadAttempt] = {}
+# Latched by cancel_pending_loads, cleared by begin_load_lifecycle. A snapshot alone
+# misses a request uvicorn already admitted but schedules while shutdown is running:
+# should_exit stops new connections, not existing request tasks. Lifecycle-scoped, not
+# permanent, or an embedded host's second run_server could never load anything.
+_loads_shutting_down = False
 _SCOPED_LOAD_CANCEL_TOMBSTONE_TTL_S = 60.0
 # Bound on waiting for a cancel's teardown to report back. Only the /unload
 # handler sets cancel_complete for a running attempt, so a disconnect or a
@@ -13786,6 +13791,50 @@ _SCOPED_LOAD_CANCEL_TOMBSTONE_TTL_S = 60.0
 # to_thread's executor threads are non-daemon, so it also blocks process exit.
 _SCOPED_LOAD_CANCEL_HANDSHAKE_TIMEOUT_S = 15.0
 _SCOPED_LOAD_CANCEL_TOMBSTONE_LIMIT_PER_SUBJECT = 256
+
+
+def cancel_pending_loads() -> int:
+    """Cancel every in-flight /load. Called by the app shutdown, before the kill.
+
+    The backend's shutdown flag only guards its own spawn, and a request between
+    admission and that call is not yet holding anything the flag can see: it can
+    sit in the lifecycle gate or preflight for minutes, then reach the backend in
+    a lifecycle that has already been reset and load a model the new server never
+    asked for. Cancelling through the attempt's own event stops it wherever it is,
+    including mid-download, using the path /unload already uses.
+
+    Best-effort and non-blocking: shutdown must not wait on a load's teardown.
+    """
+    global _loads_shutting_down
+    with _scoped_load_attempts_lock:
+        _loads_shutting_down = True
+        attempts = list(_pending_load_attempts.values())
+        running = _running_load_attempt
+    if running is not None and all(a.token != running.token for a in attempts):
+        attempts.append(running)
+    for attempt in attempts:
+        _cancel_for_shutdown(attempt)
+    return len(attempts)
+
+
+def _cancel_for_shutdown(attempt: _ScopedLoadAttempt) -> None:
+    """Cancel an attempt AND close its handshake.
+
+    Only /unload sets cancel_complete, and at shutdown there is no /unload to do it,
+    so setting cancel_event alone leaves _run_tracked_load_model_impl's finally
+    waiting the full handshake timeout in a to_thread. Those executor threads are
+    non-daemon and would hold the process open. Shutdown owns the teardown, so there
+    is nothing to report back.
+    """
+    attempt.cancel_event.set()
+    attempt.cancel_complete.set()
+
+
+def begin_load_lifecycle() -> None:
+    """Clear the shutdown latch so a restarted server accepts loads again."""
+    global _loads_shutting_down
+    with _scoped_load_attempts_lock:
+        _loads_shutting_down = False
 
 
 def _prune_scoped_load_cancel_tombstones(now: float) -> None:
@@ -13962,6 +14011,12 @@ async def load_model_gated(
     attempt = _begin_load_attempt(request, current_subject)
     with _scoped_load_attempts_lock:
         _pending_load_attempts[attempt.token] = attempt
+        # Registered after the shutdown sweep took its snapshot, so nothing else
+        # will ever cancel it. Under the same lock as the latch, so it cannot
+        # register between the latch and the sweep either.
+        _shutting_down_now = _loads_shutting_down
+    if _shutting_down_now:
+        _cancel_for_shutdown(attempt)
     try:
         _raise_if_sidecar_swap_in_progress()
         # Hold the lifecycle gate across the load so idle auto-unload can't unload the
@@ -14044,8 +14099,79 @@ async def _load_model_impl(
 ):
     from core.inference.llama_cpp import LlamaServerNotFoundError
 
+    def _raise_if_admitted_by_a_previous_session() -> None:
+        """Refuse a request the old server accepted.
+
+        The join in run_server is bounded and only logs on timeout, so such a request
+        can still arrive here; the stamp is the one signal that predates the lifecycle
+        reset. Absent (an internal call with no ASGI scope) means there is nothing to
+        compare, so the caller is unaffected.
+        """
+        # Typed, not merely non-None. A caller can pass something whose attribute and
+        # item access answer anything at all -- a Mock request does exactly that -- and
+        # such a value compares unequal to every generation, which would refuse a load
+        # that has nothing wrong with it. Only a real stamp from a real scope decides.
+        from collections.abc import Mapping
+
+        _scope = getattr(fastapi_request, "scope", None)
+        if not isinstance(_scope, Mapping):
+            return
+        _admitted = _scope.get("unsloth_process_generation")
+        if not isinstance(_admitted, int) or isinstance(_admitted, bool):
+            return
+        from utils.process_lifetime import process_lifecycle_generation
+
+        if _admitted != process_lifecycle_generation():
+            raise HTTPException(status_code = 409, detail = "Model load cancelled")
+
+    # At entry, not only at the points of no return below: the common path reaches
+    # acquire_for(CHAT, ...) first, and that handoff can evict the restarted session's
+    # Diffusion or Video pipeline and leave the CHAT claim behind before a check further
+    # down would have rejected this request. Nothing here has side effects yet.
+    _raise_if_admitted_by_a_previous_session()
+
+    def _record_the_admitting_generation() -> None:
+        """Pin the lifecycle that admitted this load onto the context.
+
+        The checks above are points in time; this is what the BACKENDS read. Without it
+        they call process_lifecycle_generation() on entry, which for a load that sat in
+        preflight across a restart is the NEW session's number, so old work stamps
+        itself as belonging to a session that never asked for it. The context is copied
+        into the worker by asyncio.to_thread, so the stamp survives the hop.
+
+        A request with no usable stamp records nothing, and every reader then falls back
+        to the live generation exactly as before.
+        """
+        from collections.abc import Mapping
+
+        from utils.process_lifetime import process_lifecycle_generation, set_admitting_generation
+
+        _scope = getattr(fastapi_request, "scope", None)
+        _admitted = (
+            _scope.get("unsloth_process_generation") if isinstance(_scope, Mapping) else None
+        )
+        if not isinstance(_admitted, int) or isinstance(_admitted, bool):
+            # No ASGI stamp (an internal caller). The generation now is still a better
+            # anchor than one read after a preflight that may span a restart.
+            _admitted = process_lifecycle_generation()
+        set_admitting_generation(_admitted)
+
+    _record_the_admitting_generation()
+
     def _raise_if_scoped_load_cancelled() -> None:
         if load_cancel_event is not None and load_cancel_event.is_set():
+            raise HTTPException(status_code = 409, detail = "Model load cancelled")
+        # Rechecked: a restart can land between entry and here.
+        _raise_if_admitted_by_a_previous_session()
+
+        # Auto-switch and preview call this impl directly, without a _ScopedLoadAttempt,
+        # so the shutdown sweep has no event to set for them. Reading the latch here puts
+        # both on the same footing as /load: the callers of this helper are the points of
+        # no return, so a shutdown seen before one still stops the load rather than
+        # spawning a worker that outlives quit.
+        with _scoped_load_attempts_lock:
+            _shutting_down_now = _loads_shutting_down
+        if _shutting_down_now:
             raise HTTPException(status_code = 409, detail = "Model load cancelled")
 
     # A new load starts here; arm the progress throttle so this load's first
@@ -14753,6 +14879,12 @@ async def _load_model_impl(
             # falls back to layer split so the checkbox never blocks a model from
             # loading; the response reports the backend's actual tensor_parallel
             # state so the UI toggle reflects the fallback.
+            # Immediately before the backend, not only at the point of no return above:
+            # the drain and _unload_llama_before_standard_load between them can run for
+            # minutes, and a restart in that gap bumps the generation the backend is
+            # about to capture. Only the admission stamp still remembers which session
+            # asked for this.
+            _raise_if_admitted_by_a_previous_session()
             try:
                 success = await load_with_tensor_fallback(
                     _attempt_gguf_load,
@@ -14905,6 +15037,9 @@ async def _load_model_impl(
         # claim is all that stops a second pipeline allocating over a resident model).
         # load_model fires it in between; the post-load release covers a re-taken claim.
         _release_chat_after_teardown = (lambda: release(CHAT)) if not chat_load_needs_gpu else None
+        # Same recheck as the GGUF path: _unload_llama_before_standard_load above is
+        # measured in minutes on a large model.
+        _raise_if_admitted_by_a_previous_session()
         anonymous_hf_kw = {"anonymous_hf_access": True} if anonymous_hf_access else {}
         speech_codec_kw = (
             {"audio_codec_path": speech_codec_path} if speech_codec_path is not None else {}

@@ -922,6 +922,26 @@ class ResearchPortMiddleware:
 app.add_middleware(ResearchPortMiddleware)
 
 
+class ProcessLifecycleStampMiddleware:
+    """Record which session admitted each request.
+
+    An embedded host's second run_server joins the old uvicorn thread first, but that
+    join is bounded and only logs on timeout, so a request the old server accepted can
+    still be in flight afterwards. Every other signal a load consults is captured when
+    the LOAD starts, by which point such a request looks exactly like a new one. Read
+    here instead, at the only moment the two are distinguishable.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            from utils.process_lifetime import process_lifecycle_generation
+            scope["unsloth_process_generation"] = process_lifecycle_generation()
+        await self.app(scope, receive, send)
+
+
 # img/media-src allow any https origin so HF model-card assets render (mirrors
 # tauri.conf.json); scripts/frames/connect-src stay same-origin + HF.
 from starlette.datastructures import MutableHeaders  # noqa: E402
@@ -1458,6 +1478,14 @@ app.add_middleware(KeylessToolPolicyMiddleware)
 from utils.remote_access_settings import RemoteAccessStopResponseMiddleware  # noqa: E402
 
 app.add_middleware(RemoteAccessStopResponseMiddleware)
+
+# Registered LAST, so it is the OUTERMOST middleware: add_middleware prepends, and the
+# stamp is only as good as how early it is taken. A request the old server accepted but
+# which has not reached this point yet is still stamped with the new session, so this
+# narrows that window to the smallest one available in the ASGI stack rather than
+# closing it; the bounded join and the shutdown-completion wait in run_server are what
+# make it unlikely to be open at all.
+app.add_middleware(ProcessLifecycleStampMiddleware)
 
 
 # ============ Register API Routes ============

@@ -2646,3 +2646,1603 @@ def test_a_scoped_load_cancel_that_never_reports_back_releases_the_load():
         with inf._scoped_load_attempts_lock:
             inf._scoped_load_attempts.clear()
             inf._scoped_load_cancel_tombstones.clear()
+
+
+def test_shutdown_cancels_loads_that_have_not_reached_the_backend():
+    """A /load between admission and the backend call holds nothing the backend's
+    shutdown flag can see: it can sit in the lifecycle gate or preflight for
+    minutes and then arrive in a lifecycle that has already been reset, loading a
+    model the new server never asked for. _graceful_shutdown cancels through the
+    attempt's own event, the same path /unload uses.
+    """
+    import importlib
+
+    inf = importlib.import_module("routes.inference")
+
+    def _attempt(token, path):
+        return inf._ScopedLoadAttempt(
+            token = token,
+            request_id = None,
+            model_path = path,
+            subject = "s",
+            cancel_event = threading.Event(),
+            cancel_complete = threading.Event(),
+        )
+
+    pending = _attempt("pending-token", "owner/model")
+    running = _attempt("running-token", "owner/other")
+
+    with inf._scoped_load_attempts_lock:
+        inf._pending_load_attempts[pending.token] = pending
+    prior_running = inf._running_load_attempt
+    inf._running_load_attempt = running
+    try:
+        assert inf.cancel_pending_loads() == 2
+        assert pending.cancel_event.is_set(), "a queued load survived the shutdown"
+        assert running.cancel_event.is_set(), "the running load survived the shutdown"
+    finally:
+        inf._running_load_attempt = prior_running
+        with inf._scoped_load_attempts_lock:
+            inf._pending_load_attempts.pop(pending.token, None)
+
+
+def test_a_running_attempt_already_in_the_pending_map_is_not_counted_twice():
+    import importlib
+
+    inf = importlib.import_module("routes.inference")
+
+    both = inf._ScopedLoadAttempt(
+        token = "same-token",
+        request_id = None,
+        model_path = "owner/model",
+        subject = "s",
+        cancel_event = threading.Event(),
+        cancel_complete = threading.Event(),
+    )
+    with inf._scoped_load_attempts_lock:
+        inf._pending_load_attempts[both.token] = both
+    prior_running = inf._running_load_attempt
+    inf._running_load_attempt = both
+    try:
+        assert inf.cancel_pending_loads() == 1
+        assert both.cancel_event.is_set()
+    finally:
+        inf._running_load_attempt = prior_running
+        with inf._scoped_load_attempts_lock:
+            inf._pending_load_attempts.pop(both.token, None)
+
+
+def _mk_attempt(
+    inf,
+    token,
+    path = "owner/model",
+):
+    return inf._ScopedLoadAttempt(
+        token = token,
+        request_id = None,
+        model_path = path,
+        subject = "s",
+        cancel_event = threading.Event(),
+        cancel_complete = threading.Event(),
+    )
+
+
+def test_shutdown_closes_the_cancel_handshake_itself():
+    """Only /unload sets cancel_complete, and at shutdown there is none, so setting
+    cancel_event alone leaves _run_tracked_load_model_impl's finally waiting the full
+    handshake timeout in a to_thread. Those executor threads are non-daemon and hold
+    the process open, which is what the comment above the timeout warns about."""
+    import importlib
+
+    inf = importlib.import_module("routes.inference")
+    attempt = _mk_attempt(inf, "handshake-token")
+    with inf._scoped_load_attempts_lock:
+        inf._pending_load_attempts[attempt.token] = attempt
+    try:
+        inf.cancel_pending_loads()
+        assert attempt.cancel_event.is_set()
+        assert attempt.cancel_complete.is_set(), (
+            "shutdown left the handshake open, so the load waits the full timeout in a "
+            "non-daemon executor thread and delays process exit"
+        )
+    finally:
+        inf.begin_load_lifecycle()
+        with inf._scoped_load_attempts_lock:
+            inf._pending_load_attempts.pop(attempt.token, None)
+
+
+def test_a_load_registering_after_the_sweep_is_still_cancelled():
+    """uvicorn's should_exit stops new connections, not request tasks it already
+    admitted, so a /load can register after the shutdown snapshot was taken and
+    would otherwise never be cancelled by anything."""
+    import importlib
+
+    inf = importlib.import_module("routes.inference")
+    try:
+        assert inf.cancel_pending_loads() == 0  # latches with nothing to cancel
+
+        late = _mk_attempt(inf, "late-token")
+        with inf._scoped_load_attempts_lock:
+            inf._pending_load_attempts[late.token] = late
+            latched = inf._loads_shutting_down
+        assert latched is True, "the shutdown latch did not survive an empty sweep"
+        if latched:
+            inf._cancel_for_shutdown(late)
+        assert late.cancel_event.is_set(), "a load admitted during shutdown was not cancelled"
+    finally:
+        inf.begin_load_lifecycle()
+        with inf._scoped_load_attempts_lock:
+            inf._pending_load_attempts.pop("late-token", None)
+
+
+def test_the_latch_is_scoped_to_a_lifecycle_not_the_process():
+    """An embedded host calls run_server again. A permanent latch would refuse every
+    /load of the second session; the backend flag had exactly this bug."""
+    import importlib
+
+    inf = importlib.import_module("routes.inference")
+    try:
+        inf.cancel_pending_loads()
+        with inf._scoped_load_attempts_lock:
+            assert inf._loads_shutting_down is True
+
+        inf.begin_load_lifecycle()
+        with inf._scoped_load_attempts_lock:
+            assert (
+                inf._loads_shutting_down is False
+            ), "the second session would cancel every load it admitted"
+    finally:
+        inf.begin_load_lifecycle()
+
+
+def test_run_server_clears_the_route_latch_too():
+    import ast
+    import textwrap
+    from pathlib import Path
+
+    run_py = (Path(__file__).resolve().parent.parent / "run.py").read_text(encoding = "utf-8")
+    tree = ast.parse(run_py)
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_server")
+    src = textwrap.dedent(ast.get_source_segment(run_py, fn) or "")
+    assert "begin_load_lifecycle()" in src, (
+        "run_server resets the backend but not the route latch, so a restarted "
+        "server cancels every load it admits"
+    )
+
+
+def _run_server_call_lines(name, *, owner = None):
+    """First line of each call to *name* inside run_server, by AST rather than text.
+
+    Text offsets kept breaking here: the comments above these calls name them too, and
+    indentation-anchored searches go stale the moment a call moves inside a `with`.
+    """
+    import ast
+    from pathlib import Path
+
+    run_py = (Path(__file__).resolve().parent.parent / "run.py").read_text(encoding = "utf-8")
+    fn = next(
+        n
+        for n in ast.parse(run_py).body
+        if isinstance(n, ast.FunctionDef) and n.name == "run_server"
+    )
+    lines = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == name:
+            if owner is not None and getattr(func.value, "id", None) != owner:
+                continue
+            lines.append(node.lineno)
+        elif isinstance(func, ast.Name) and func.id == name and owner is None:
+            lines.append(node.lineno)
+    assert lines, f"run_server no longer calls {name}"
+    return min(lines)
+
+
+def test_the_route_latch_clears_only_after_the_backend_lifecycle_reopens():
+    """_begin_server_lifecycle blocks on the teardown lock while a kill is running.
+    Clearing the route latch before that wait leaves a request the OLD lifecycle
+    admitted uncancelled, and it then captures the freshly advanced generation and
+    loads the previous session's model into the new one.
+
+    Nothing legitimate is refused by clearing later: uvicorn does not serve until
+    thread.start(), which is below both calls.
+    """
+    backend_reset = _run_server_call_lines("_begin_server_lifecycle")
+    route_reset = _run_server_call_lines("begin_load_lifecycle")
+    serve = _run_server_call_lines("start", owner = "thread")
+
+    assert backend_reset < route_reset, (
+        "the route latch is cleared before the backend lifecycle reopens, so a "
+        "request admitted by the old lifecycle can cross the teardown wait"
+    )
+    assert route_reset < serve, "the route latch is still set when the server starts serving"
+
+
+def _load_impl_ast():
+    """(module source, the _load_model_impl node) from routes/inference.py."""
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "routes" / "inference.py").read_text(
+        encoding = "utf-8"
+    )
+    fn = next(
+        n
+        for n in ast.parse(src).body
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "_load_model_impl"
+    )
+    return src, fn
+
+
+def test_the_shutdown_latch_is_enforced_in_the_load_impl_not_only_at_the_route():
+    """Auto-switch and preview await _load_model_impl directly, without ever
+    registering a _ScopedLoadAttempt, so the shutdown sweep has no event to set for
+    them. With the latch checked only where /load registers, one of those loads can
+    survive the sweep, reach a non-GGUF target after run.py already tore the
+    inference subprocess down, and spawn a worker that outlives quit.
+    """
+    import ast
+
+    src, impl = _load_impl_ast()
+
+    tracked = {"_run_tracked_load_model_impl", "_load_model_impl"}
+    direct = [
+        node.name
+        for node in ast.walk(ast.parse(src))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name not in tracked
+        and any(
+            isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Name)
+            and c.func.id == "_load_model_impl"
+            for c in ast.walk(node)
+        )
+    ]
+    assert direct, (
+        "no direct _load_model_impl callers left; if registration now covers every "
+        "path this guard can move back to the route"
+    )
+
+    reads = [
+        n.id for n in ast.walk(impl) if isinstance(n, ast.Name) and n.id == "_loads_shutting_down"
+    ]
+    assert reads, (
+        "_load_model_impl never consults the shutdown latch, so these direct "
+        f"callers bypass it entirely: {sorted(set(direct))}"
+    )
+
+
+def test_the_impl_cancel_check_refuses_a_load_once_shutdown_has_latched():
+    """Runs the shipped closure, rather than asserting on its text.
+
+    The callers of this helper are the load's points of no return, so refusing here
+    is what stops a shutdown-crossing load before it spawns anything.
+    """
+    import ast
+    import textwrap
+    import threading
+
+    from fastapi import HTTPException
+
+    src, impl = _load_impl_ast()
+    helper = next(
+        n
+        for n in impl.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_raise_if_scoped_load_cancelled"
+    )
+    # The closure delegates the stamp check; exec that too rather than stubbing it, or
+    # the test stops covering the branch it exists for.
+    admitted_helper = next(
+        n
+        for n in impl.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_raise_if_admitted_by_a_previous_session"
+    )
+
+    from utils import process_lifetime
+
+    class _Req:
+        def __init__(self, scope):
+            self.scope = scope
+
+    ns = {
+        "HTTPException": HTTPException,
+        "_scoped_load_attempts_lock": threading.Lock(),
+        "_loads_shutting_down": False,
+        "load_cancel_event": None,
+        # No stamp: an internal call with no ASGI scope has no session to compare.
+        "fastapi_request": _Req({}),
+    }
+    exec(textwrap.dedent(ast.get_source_segment(src, admitted_helper) or ""), ns)
+    exec(textwrap.dedent(ast.get_source_segment(src, helper) or ""), ns)
+    check = ns["_raise_if_scoped_load_cancelled"]
+
+    check()  # nothing set: a normal load must not be refused
+
+    # Stamped by THIS session: still not a cancel.
+    ns["fastapi_request"] = _Req(
+        {"unsloth_process_generation": process_lifetime.process_lifecycle_generation()}
+    )
+    check()
+
+    # Stamped by a previous one.
+    ns["fastapi_request"] = _Req({"unsloth_process_generation": -1})
+    with pytest.raises(HTTPException) as stale:
+        check()
+    assert stale.value.status_code == 409
+    ns["fastapi_request"] = _Req({})
+
+    ns["_loads_shutting_down"] = True
+    with pytest.raises(HTTPException) as excinfo:
+        check()
+    assert excinfo.value.status_code == 409
+
+    ns["_loads_shutting_down"] = False
+    ns["load_cancel_event"] = threading.Event()
+    check()  # an unset per-attempt event is still not a cancel
+    ns["load_cancel_event"].set()
+    with pytest.raises(HTTPException):
+        check()
+
+
+def test_a_second_backend_instance_is_covered_by_the_shutdown_latch():
+    """A helper/advisor load builds its OWN LlamaCppBackend (hub/utils/llm_assist.py,
+    utils/datasets/llm_assist.py). run.py only tears down the routes singleton, and
+    _shutting_down is per-instance, so that second backend would still consider a
+    spawn valid and Popen a server after terminate_all took its snapshot.
+    """
+    from core.inference.llama_cpp import LlamaCppBackend
+    from utils import process_lifetime
+
+    torn_down = LlamaCppBackend.__new__(LlamaCppBackend)
+    helper = LlamaCppBackend.__new__(LlamaCppBackend)
+    try:
+        assert helper._spawn_is_stale(None) is False, "a fresh backend must be able to spawn"
+
+        # What _kill_process(teardown = True) does to the singleton, without the kill.
+        torn_down._shutting_down = True
+        process_lifetime.mark_process_shutting_down()
+
+        assert (
+            helper._spawn_is_stale(None) is True
+        ), "a backend the shutdown never touched still thinks it may spawn"
+    finally:
+        process_lifetime.begin_process_lifecycle()
+
+    assert (
+        helper._spawn_is_stale(None) is False
+    ), "the latch outlived the lifecycle, so an embedded second session cannot spawn"
+
+
+def test_the_worker_spawn_refuses_once_shutdown_has_latched():
+    """The preview path supplies no load_cancel_event and is not a _ScopedLoadAttempt,
+    so its latch read is one-shot: it can pass that check, spend time in the drain and
+    teardown, and only then reach the worker spawn. Guarding at the spawn is what makes
+    the answer un-stale.
+    """
+    from core.inference.orchestrator import InferenceOrchestrator
+    from utils import process_lifetime
+
+    orch = InferenceOrchestrator.__new__(InferenceOrchestrator)
+    try:
+        process_lifetime.mark_process_shutting_down()
+        with pytest.raises(RuntimeError, match = "shutting down"):
+            orch._spawn_subprocess({})
+    finally:
+        process_lifetime.begin_process_lifecycle()
+
+
+def test_the_process_latch_clears_between_the_backend_and_the_route():
+    """Ordering, for the same reason the route latch clears late: the process latch is
+    what every other spawner reads, so it must outlast the teardown _begin_server_lifecycle
+    waits on, and be clear before uvicorn admits anything.
+    """
+    backend = _run_server_call_lines("_begin_server_lifecycle")
+    process = _run_server_call_lines("begin_process_lifecycle")
+    route = _run_server_call_lines("begin_load_lifecycle")
+    serve = _run_server_call_lines("start", owner = "thread")
+
+    assert backend < process < route < serve, (
+        "the process latch must clear after the backend teardown completes and "
+        "before the server starts serving"
+    )
+
+
+def test_shutdown_latches_the_process_before_any_subsystem_is_torn_down():
+    """The orchestrator is stopped at step 2 but loads are swept at step 5. A load in
+    that gap reaches a spawner nothing has marked yet, so the latch has to be set before
+    the first teardown step rather than alongside the llama-server kill.
+    """
+    import ast
+    import textwrap
+    from pathlib import Path
+
+    run_py = (Path(__file__).resolve().parent.parent / "run.py").read_text(encoding = "utf-8")
+    tree = ast.parse(run_py)
+    fn = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_graceful_shutdown"
+    )
+    src = textwrap.dedent(ast.get_source_segment(run_py, fn) or "")
+
+    latch = src.index("mark_process_shutting_down()")
+    orchestrator_stop = src.index("_shutdown_subprocess(timeout = 5.0)")
+    sweep = src.index("cancel_pending_loads()")
+
+    assert latch < orchestrator_stop, (
+        "the inference subprocess is stopped before anything latches, so a load in "
+        "flight can restart it"
+    )
+    assert latch < sweep
+
+
+def test_a_shutdown_that_begins_during_the_spawn_reaps_the_new_worker():
+    """The pre-spawn gate is a process start away from the child existing. A shutdown
+    landing in between sees no live _proc, no-ops, completes terminate_all, and would
+    leave this worker running after quit. The post-spawn recheck is what closes it.
+    """
+    from unittest import mock
+
+    from core.inference.orchestrator import InferenceOrchestrator
+    from utils import process_lifetime
+
+    orch = InferenceOrchestrator.__new__(InferenceOrchestrator)
+    torn_down = []
+    orch._shutdown_subprocess = lambda timeout = None: torn_down.append(timeout)
+
+    started = mock.Mock()
+    started.pid = 4242
+
+    class _Ctx:
+        Queue = staticmethod(lambda: mock.Mock())
+        Event = staticmethod(lambda: mock.Mock())
+
+        @staticmethod
+        def Process(**kw):
+            # Shutdown begins while the child is being born, after the gate passed.
+            process_lifetime.mark_process_shutting_down()
+            return started
+
+    try:
+        with (
+            mock.patch.object(orch_mod, "_CTX", _Ctx),
+            mock.patch.object(orch_mod, "adopt_pid", lambda pid: None, create = True),
+        ):
+            with pytest.raises(RuntimeError, match = "shutting down"):
+                orch._spawn_subprocess({})
+    finally:
+        process_lifetime.begin_process_lifecycle()
+
+    assert torn_down, "the worker born during shutdown was never torn down"
+
+
+def test_a_load_from_the_previous_session_cannot_spawn_into_the_new_one():
+    """An embedded host's second run_server clears the latch. A helper or preview load
+    still running from the first session would read that as permission to spawn, and
+    load the previous session's model into the new one. The generation is what keeps it
+    out: helper backends never receive _begin_server_lifecycle, so the per-instance
+    generation cannot answer this.
+    """
+    from utils import process_lifetime
+    try:
+        admitted = process_lifetime.process_lifecycle_generation()
+        assert process_lifetime.is_process_shutting_down(admitted) is False
+
+        # Session 1 quits, session 2 starts.
+        process_lifetime.mark_process_shutting_down()
+        process_lifetime.begin_process_lifecycle()
+
+        assert (
+            process_lifetime.is_process_shutting_down() is False
+        ), "the new session cannot spawn at all"
+        assert (
+            process_lifetime.is_process_shutting_down(admitted) is True
+        ), "a load admitted by the previous session was released by the restart"
+        assert (
+            process_lifetime.is_process_shutting_down(
+                process_lifetime.process_lifecycle_generation()
+            )
+            is False
+        ), "a load admitted by the new session was refused"
+    finally:
+        process_lifetime.begin_process_lifecycle()
+
+
+def test_a_helper_backend_load_carries_the_process_generation():
+    """The plumbing the test above relies on: load_model must capture the generation,
+    or every instance compares None and only the boolean applies.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parent.parent / "core" / "inference" / "llama_cpp.py"
+    ).read_text(encoding = "utf-8")
+    fn = _fn_named(src, "load_model")
+    # By AST, and accepting either source of the number. What matters is that the
+    # instance carries ONE, captured here; which call supplies it is the separate
+    # contract pinned by test_both_backends_read_the_admitting_generation_not_the_live_one.
+    # (This read `"process_lifecycle_generation()" in body` and broke the moment the
+    # capture moved to admitting_generation, without anything being wrong.)
+    captures = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Assign)
+        and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "id", None)
+        in {"admitting_generation", "process_lifecycle_generation"}
+    ]
+    assert captures, (
+        "load_model does not capture the process generation, so a stale load is "
+        "released by an embedded restart"
+    )
+    assert any(
+        any(getattr(t, "attr", None) == "_load_process_generation" for t in n.targets)
+        or any(getattr(t, "id", None) == "_process_generation" for t in n.targets)
+        for n in captures
+    ), "the captured generation is never carried on the instance"
+
+
+def test_the_previous_uvicorn_thread_is_joined_before_the_latches_clear():
+    """A second run_server can start while the old server thread is still draining.
+    A request it already accepted, but which has not reached load_model_gated, is in
+    no snapshot; once the latches clear it looks exactly like a new-session request and
+    its backend call captures the freshly advanced generations. Joining first is what
+    distinguishes them, and there is nothing else that can.
+    """
+    join = _run_server_call_lines("_wait_for_server_shutdown")
+    backend = _run_server_call_lines("_begin_server_lifecycle")
+    process = _run_server_call_lines("begin_process_lifecycle")
+    route = _run_server_call_lines("begin_load_lifecycle")
+
+    assert (
+        join < backend < process < route
+    ), "the old server's requests are still in flight when the latches clear"
+
+
+def test_the_drain_is_skipped_when_no_shutdown_ever_happened():
+    """The join must not cost a first run, or a host that never shut down, the full
+    5s timeout: it is gated on the latch that only _graceful_shutdown sets.
+    """
+    import ast
+    import textwrap
+    from pathlib import Path
+
+    run_py = (Path(__file__).resolve().parent.parent / "run.py").read_text(encoding = "utf-8")
+    tree = ast.parse(run_py)
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_server")
+    src = textwrap.dedent(ast.get_source_segment(run_py, fn) or "")
+
+    guard = src.index("if is_process_shutting_down():")
+    join = src.index("\n            _wait_for_server_shutdown()")
+    assert guard < join, "the drain is unconditional and would stall every first run"
+
+
+def test_the_latch_transitions_are_atomic():
+    """begin_process_lifecycle cleared the latch outside the generation lock, so a
+    shutdown starting in the gap was erased by that clear. Every spawner that reads
+    only the latch would then be free to start a child after that shutdown's sweep.
+    """
+    import ast
+    import textwrap
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "utils" / "process_lifetime.py").read_text(
+        encoding = "utf-8"
+    )
+    tree = ast.parse(src)
+
+    for name, call in (
+        ("begin_process_lifecycle", "_shutdown_latch.clear()"),
+        ("mark_process_shutting_down", "_shutdown_latch.set()"),
+    ):
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
+        # The statement must sit inside a `with _generation_lock:` block, not merely
+        # somewhere in a function that also takes the lock.
+        guarded = any(
+            call in textwrap.dedent(ast.get_source_segment(src, node) or "")
+            for node in ast.walk(fn)
+            if isinstance(node, ast.With)
+            and any(
+                isinstance(i.context_expr, ast.Name) and i.context_expr.id == "_generation_lock"
+                for i in node.items
+            )
+        )
+        assert guarded, f"{name} changes the latch outside the generation lock"
+
+
+def test_a_request_admitted_by_the_previous_session_is_refused():
+    """The bounded join can time out and only logs, so an old request can still reach
+    the load. Everything else a load consults is captured when the LOAD starts, by
+    which time it is indistinguishable from a new one; the ASGI stamp is not.
+    """
+    import ast
+    import textwrap
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "routes" / "inference.py").read_text(
+        encoding = "utf-8"
+    )
+    impl = next(
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_load_model_impl"
+    )
+    helper = next(
+        n
+        for n in impl.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_raise_if_scoped_load_cancelled"
+    )
+    body = textwrap.dedent(ast.get_source_segment(src, helper) or "")
+    assert (
+        "_raise_if_admitted_by_a_previous_session()" in body
+    ), "the point-of-no-return gate no longer rechecks the admission stamp"
+
+    admitted = next(
+        n
+        for n in impl.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_raise_if_admitted_by_a_previous_session"
+    )
+    assert "unsloth_process_generation" in textwrap.dedent(
+        ast.get_source_segment(src, admitted) or ""
+    ), (
+        "the load never consults the admission stamp, so a request the old server "
+        "accepted is released by the lifecycle reset"
+    )
+
+
+def test_every_http_request_is_stamped_at_admission():
+    """The stamp is only meaningful if it is taken in middleware. Reading it later
+    would capture the value after the reset, which is the bug it exists to prevent.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "main.py").read_text(encoding = "utf-8")
+    tree = ast.parse(src)
+
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "ProcessLifecycleStampMiddleware"
+    )
+    assert any(
+        isinstance(n, ast.AsyncFunctionDef) and n.name == "__call__" for n in cls.body
+    ), "the stamp middleware has no ASGI entry point"
+    assert any(
+        isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "add_middleware"
+        and any(isinstance(a, ast.Name) and a.id == cls.name for a in n.args)
+        for n in ast.walk(tree)
+    ), "the stamp middleware is defined but never installed"
+
+
+def test_a_llama_server_spawned_as_shutdown_began_is_reaped():
+    """The pre-spawn stale check and the process latch are only atomic for the instance
+    run.py tears down, which sets its own flag under the spawn lock. A helper backend's
+    check can pass microseconds before the latch is set, and its child would then
+    outlive the sweep. The recheck after the pid is recorded is what reaps it.
+    """
+    import ast
+    import textwrap
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parent.parent / "core" / "inference" / "llama_cpp.py"
+    ).read_text(encoding = "utf-8")
+    fn = next(
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and n.name == "_start_llama_process"
+    )
+    body = textwrap.dedent(ast.get_source_segment(src, fn) or "")
+
+    publish = body.index("self._record_server_pid(")
+    recheck = body.index("_spawn_is_stale", publish)
+    kill = body.index("self._kill_process()", publish)
+    assert publish < recheck < kill, (
+        "nothing rechecks after the child is published, so a spawn that raced the "
+        "latch leaves a server the sweep has already passed"
+    )
+
+
+def test_the_admission_check_runs_before_the_gpu_handoff():
+    """acquire_for(CHAT, ...) can evict the restarted session's Diffusion or Video
+    pipeline and leave the CHAT claim behind. A stale request must be refused before
+    that, not only at the points of no return further down.
+    """
+    import ast
+    import textwrap
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "routes" / "inference.py").read_text(
+        encoding = "utf-8"
+    )
+    impl = next(
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_load_model_impl"
+    )
+
+    # By AST node, not by text: the comment above the check names acquire_for too, and
+    # an earlier version of this test compared against its own explanation.
+    def _first_call_line(name):
+        return min(
+            (
+                n.lineno
+                for n in ast.walk(impl)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name
+            ),
+            default = None,
+        )
+
+    check = _first_call_line("_raise_if_admitted_by_a_previous_session")
+    # acquire_for is handed to asyncio.to_thread, so it appears as an argument rather
+    # than the callee.
+    handoff = min(
+        (
+            n.lineno
+            for n in ast.walk(impl)
+            if isinstance(n, ast.Call)
+            and any(isinstance(a, ast.Name) and a.id == "acquire_for" for a in n.args)
+        ),
+        default = None,
+    )
+    assert check is not None, "the impl never calls the admission check"
+    assert handoff is not None, "acquire_for is no longer dispatched here; retarget this"
+    assert check < handoff, "the GPU handoff runs before a stale request is refused"
+
+
+def test_a_restart_waits_for_the_whole_shutdown_not_just_the_teardown_lock():
+    """_begin_server_lifecycle waits on the llama teardown lock, which is released at
+    step 5. The old _graceful_shutdown then runs to step 7's terminate_all(), which
+    would reap a child this session had already adopted.
+    """
+    import ast
+    import textwrap
+    from pathlib import Path
+
+    run_py = (Path(__file__).resolve().parent.parent / "run.py").read_text(encoding = "utf-8")
+    tree = ast.parse(run_py)
+
+    shutdown = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_graceful_shutdown"
+    )
+    # By AST node: terminate_all now takes the sweep generation, so matching the bare
+    # call text stopped working the moment an argument was added.
+    sweep_line = min(
+        (
+            n.lineno
+            for n in ast.walk(shutdown)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "terminate_all"
+        ),
+        default = None,
+    )
+    done_line = min(
+        (
+            n.lineno
+            for n in ast.walk(shutdown)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "set"
+            and isinstance(n.func.value, ast.Name)
+            and n.func.value.id == "_shutdown_complete"
+        ),
+        default = None,
+    )
+    assert sweep_line is not None and done_line is not None, "shutdown shape changed; retarget"
+    assert sweep_line < done_line, (
+        "the completion flag is set before the final sweep, so waiting on it proves "
+        "nothing about the sweep"
+    )
+
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_server")
+    src = textwrap.dedent(ast.get_source_segment(run_py, fn) or "")
+    wait = src.index("_shutdown_complete.wait(")
+    backend = src.index("_llama_cpp_backend._begin_server_lifecycle()")
+    assert wait < backend, "the lifecycle reopens before the previous shutdown finished"
+
+
+def test_an_old_sweep_does_not_terminate_the_new_lifecycles_children():
+    """A legitimate shutdown can outlast any bound a restart should wait for: steps 2
+    and 3 allow five seconds each before terminate_all even starts. So the restart
+    cannot be made to wait it out, and the sweep must instead be unable to see children
+    that a later lifecycle adopted.
+
+    Driven against a real disposable child, not this process: without the fix the sweep
+    really does signal what it finds, and an earlier version of this test using
+    os.getpid() took the test runner down with it.
+    """
+    import subprocess
+    import sys
+
+    from utils import process_lifetime as pl
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        # Session 1 quits. Its sweep belongs to the generation captured HERE, the way
+        # _graceful_shutdown captures one at step 0a and carries it to step 7.
+        pl.mark_process_shutting_down()
+        sweep_generation = pl.process_lifecycle_generation()
+
+        # Session 2 opens and adopts a child while that shutdown is still in flight.
+        pl.begin_process_lifecycle()
+        pl.adopt_pid(child.pid)
+
+        # The old shutdown finally reaches its sweep.
+        pl.terminate_all(timeout = 0.5, sweep_generation = sweep_generation)
+
+        assert (
+            child.poll() is None
+        ), "the previous session's sweep killed a child this session adopted"
+        with pl._record_lock:
+            assert child.pid in pl._tracked_pids, (
+                "the child was dropped from the record, so its own session has no "
+                "handle on it either"
+            )
+    finally:
+        with pl._record_lock:
+            pl._tracked_pids.pop(child.pid, None)
+            pl._adoption_generation.pop(child.pid, None)
+            pl._tracked_pgids.pop(child.pid, None)
+        pl.begin_process_lifecycle()
+        child.kill()
+        child.wait()
+
+
+def test_the_admission_stamp_is_rechecked_immediately_before_each_backend():
+    """A preview load carries no cancel event, so between the point of no return and the
+    backend call it has only the stamp. That span includes the drain and
+    _unload_llama_before_standard_load, which this file notes can run for minutes on a
+    large model; a restart inside it bumps the generation the backend then captures, so
+    every earlier check has gone stale by the time it matters.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "routes" / "inference.py").read_text(
+        encoding = "utf-8"
+    )
+    impl = next(
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_load_model_impl"
+    )
+
+    checks = sorted(
+        n.lineno
+        for n in ast.walk(impl)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_raise_if_admitted_by_a_previous_session"
+    )
+
+    # Both backends, located as AST nodes: the non-GGUF one is dispatched through
+    # asyncio.to_thread, so load_model is an argument rather than the callee.
+    def _line_of(pred):
+        return min((n.lineno for n in ast.walk(impl) if pred(n)), default = None)
+
+    gguf = _line_of(
+        lambda n: isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "load_with_tensor_fallback"
+    )
+    standard = _line_of(
+        lambda n: isinstance(n, ast.Call)
+        and any(
+            isinstance(a, ast.Attribute) and a.attr == "load_model" for a in getattr(n, "args", [])
+        )
+    )
+    assert gguf is not None and standard is not None, "backend call sites moved; retarget"
+
+    for name, call in (("gguf", gguf), ("standard", standard)):
+        preceding = [c for c in checks if c < call]
+        assert preceding, f"no admission check before the {name} backend call"
+        # Not merely "somewhere earlier": nothing that can block may sit in between.
+        assert call - preceding[-1] < 12, (
+            f"the {name} backend is invoked {call - preceding[-1]} lines after the last "
+            "admission check, so a restart during the teardown in between goes unnoticed"
+        )
+
+
+def test_a_request_without_a_real_stamp_is_not_refused():
+    """The stamp must be a real integer from a real scope.
+
+    An in-process or test caller can pass an object whose attribute and item access
+    answer anything -- a Mock does exactly that -- and such a value compares unequal to
+    every generation. Treating "not None" as "stamped" therefore refused loads that had
+    nothing wrong with them, turning genuine 500s into 409s across two unrelated test
+    files before this was caught.
+    """
+    import ast
+    import textwrap
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from fastapi import HTTPException
+
+    from utils import process_lifetime
+
+    src = (Path(__file__).resolve().parent.parent / "routes" / "inference.py").read_text(
+        encoding = "utf-8"
+    )
+    impl = next(
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_load_model_impl"
+    )
+    helper = next(
+        n
+        for n in impl.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_raise_if_admitted_by_a_previous_session"
+    )
+
+    def _check_with(request):
+        ns = {"HTTPException": HTTPException, "fastapi_request": request}
+        exec(textwrap.dedent(ast.get_source_segment(src, helper) or ""), ns)
+        return ns["_raise_if_admitted_by_a_previous_session"]
+
+    # The shapes that must NOT refuse.
+    _check_with(mock.Mock())()
+    _check_with(SimpleNamespace(scope = {}))()
+    _check_with(SimpleNamespace())()
+    _check_with(SimpleNamespace(scope = {"unsloth_process_generation": None}))()
+    _check_with(
+        SimpleNamespace(
+            scope = {"unsloth_process_generation": process_lifetime.process_lifecycle_generation()}
+        )
+    )()
+
+    # And the one that must.
+    with pytest.raises(HTTPException) as excinfo:
+        _check_with(SimpleNamespace(scope = {"unsloth_process_generation": -1}))()
+    assert excinfo.value.status_code == 409
+
+
+def test_a_load_that_finishes_during_shutdown_is_not_published_as_resident():
+    """The spawn checks stop once the worker exists. A "loaded" reply dequeued as
+    shutdown kills it would still reach the success branch, and active_model_name plus
+    models are exactly what the already-loaded fast path trusts. That path does not test
+    liveness, so the next session would report a dead worker as resident.
+    """
+    from core.inference.orchestrator import InferenceOrchestrator
+    from utils import process_lifetime
+
+    orch = InferenceOrchestrator.__new__(InferenceOrchestrator)
+    orch.active_model_name = None
+    orch.models = {}
+    orch.loading_models = {"m"}
+    orch.load_generation = 0
+    orch._load_process_generation = process_lifetime.process_lifecycle_generation()
+
+    try:
+        process_lifetime.mark_process_shutting_down()
+        stale = process_lifetime.is_process_shutting_down(orch._load_process_generation)
+        assert stale is True, "the load no longer belongs to a live session"
+
+        # What the success branch must do instead of publishing.
+        if stale:
+            orch.loading_models.discard("m")
+            orch.active_model_name = None
+            orch.models.clear()
+
+        assert (
+            orch.active_model_name is None and not orch.models
+        ), "a worker killed by shutdown was published as resident"
+    finally:
+        process_lifetime.begin_process_lifecycle()
+
+
+def test_the_publish_branch_rechecks_shutdown_before_recording_the_model():
+    """Pins the recheck in the shipped code, ahead of the first field it publishes."""
+    import ast
+    import textwrap
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parent.parent / "core" / "inference" / "orchestrator.py"
+    ).read_text(encoding = "utf-8")
+    fn = next(
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "load_model"
+    )
+    body = textwrap.dedent(ast.get_source_segment(src, fn) or "")
+
+    check = body.index("if is_process_shutting_down(")
+    publish = body.index("self.active_model_name = model_info.get(")
+    assert check < publish, (
+        "the load publishes active_model_name before rechecking shutdown, so a worker "
+        "killed mid-load is recorded as resident"
+    )
+
+
+def test_reopening_a_lifecycle_re_arms_the_backstop_sweep():
+    """_shutdown_generation names the session whose sweep is running. Left set across a
+    reopen it keeps naming the session that ENDED, so every pid the new session adopts
+    has a higher generation than the filter, terminate_all skips all of them, and the
+    backstop is silently disabled for the rest of the process's life.
+
+    Found in a full-suite run, where it looked like a test-ordering artifact because the
+    affected tests pass in isolation. It is not: the sequence below reproduces it
+    directly.
+    """
+    import subprocess
+    import sys
+
+    from utils import process_lifetime as pl
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        pl.mark_process_shutting_down()
+        pl.begin_process_lifecycle()
+
+        assert not hasattr(pl, "_shutdown_generation"), (
+            "the sweep filter is global again; a reopen cannot clear it reliably and "
+            "every later sweep skips everything it finds"
+        )
+
+        pl.adopt_pid(child.pid)
+        pl.terminate_all(timeout = 1.0)
+        assert (
+            child.poll() is not None
+        ), "terminate_all swept nothing: the backstop is disabled after a reopen"
+    finally:
+        with pl._record_lock:
+            pl._tracked_pids.pop(child.pid, None)
+            pl._adoption_generation.pop(child.pid, None)
+            pl._tracked_pgids.pop(child.pid, None)
+        pl.begin_process_lifecycle()
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+
+
+def test_forgetting_a_pid_drops_its_adoption_record_too():
+    """A long-lived Studio forgets a child on every normal reap: update, download,
+    sidecar, inference. If only some of the per-pid maps are cleared, the remaining one
+    grows by an entry per unique pid for the life of the host.
+    """
+    import subprocess
+    import sys
+
+    from utils import process_lifetime as pl
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    try:
+        pl.adopt_pid(child.pid)
+        with pl._record_lock:
+            assert child.pid in pl._adoption_generation
+
+        pl.forget_pid(child.pid)
+        with pl._record_lock:
+            leaked = {
+                name
+                for name, mapping in (
+                    ("_tracked_pids", pl._tracked_pids),
+                    ("_tracked_pgids", pl._tracked_pgids),
+                    ("_adoption_generation", pl._adoption_generation),
+                )
+                if child.pid in mapping
+            }
+        assert not leaked, f"forget_pid left the pid in {sorted(leaked)}"
+    finally:
+        with pl._record_lock:
+            pl._tracked_pids.pop(child.pid, None)
+            pl._tracked_pgids.pop(child.pid, None)
+            pl._adoption_generation.pop(child.pid, None)
+
+
+def test_the_shutdown_generation_is_captured_by_the_marking_call():
+    """Marking and reading must be one operation. As two calls, a restart landing
+    between them gave the shutdown the NEW session's number, and its sweep would then
+    terminate the children that session had just started -- the very thing the sweep
+    scoping exists to prevent.
+    """
+    import ast
+    from pathlib import Path
+
+    from utils import process_lifetime as pl
+
+    assert isinstance(
+        pl.mark_process_shutting_down(), int
+    ), "the marking call does not report the lifecycle it latched"
+    pl.begin_process_lifecycle()
+
+    run_py = (Path(__file__).resolve().parent.parent / "run.py").read_text(encoding = "utf-8")
+    fn = next(
+        n
+        for n in ast.walk(ast.parse(run_py))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_graceful_shutdown"
+    )
+    # What must hold is that the SWEEP's number comes from the marking call. The name
+    # may legitimately appear elsewhere in here -- the supersede check reads the live
+    # generation on purpose, to compare it against this shutdown's -- so assert on the
+    # assignment that feeds terminate_all rather than on the text of the function.
+    sources = set()
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "_sweep_generation" for t in node.targets):
+            continue
+        callee = node.value.func
+        sources.add(callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", "?"))
+    assert sources == {"mark_process_shutting_down"}, (
+        "the sweep generation must come from the marking call itself, not a separate "
+        f"read; it is assigned from {sorted(sources)}"
+    )
+
+
+def test_a_fork_child_does_not_inherit_a_locked_generation_lock():
+    """A fork taken while another thread held _generation_lock leaves it locked in the
+    child forever, and every spawn guard goes through process_lifecycle_generation().
+    The child would deadlock rather than answer. _record_lock and _spawner_lock are
+    already rebuilt for exactly this reason; this one was added later and missed.
+    """
+    from utils import process_lifetime as pl
+
+    before_lock = pl._generation_lock
+    before_generation = pl.process_lifecycle_generation()
+    pl.mark_process_shutting_down()
+
+    # Stand in for the fork: hold the lock, then run the child-side reset. Holding it
+    # is the whole point -- an unheld lock would survive the reset unnoticed.
+    acquired = pl._generation_lock.acquire()
+    try:
+        pl._reset_after_fork()
+    finally:
+        if acquired and before_lock.locked():
+            before_lock.release()
+
+    assert pl._generation_lock is not before_lock, (
+        "_reset_after_fork left the inherited generation lock in place; a child that "
+        "forked while it was held deadlocks on the first spawn guard"
+    )
+    assert not pl._generation_lock.locked(), "the replacement lock is already held"
+    # Answers instead of hanging, which is the property under test.
+    assert pl.process_lifecycle_generation() == before_generation, (
+        "the fork reset restarted the generation count; a stale stamp from before the "
+        "fork would then compare equal to a later session"
+    )
+    assert (
+        pl.is_process_shutting_down() is True
+    ), "the fork reset cleared the shutdown latch, which reads as permission to spawn"
+    pl.begin_process_lifecycle()
+
+
+def test_a_shutdown_overtaken_by_a_restart_does_not_tear_down_the_new_session():
+    """The restart's wait for a slow shutdown is bounded, so the new session can be
+    serving while the old _graceful_shutdown is still walking its steps. Every step
+    reaches its subsystem through a module singleton the new session reuses, so an
+    unscoped old shutdown removes the live pid record and, through step 5's teardown
+    kill, latches the process shut again -- leaving that session refusing every spawn
+    for good.
+    """
+    import run
+    from utils import process_lifetime as pl
+
+    steps = []
+    _real_remove = run._remove_pid_file
+    run._remove_pid_file = lambda: steps.append("remove_record")
+
+    class _Server:
+        # Step 1 (should_exit). The restart lands here: after the shutdown latched its
+        # generation at step 0a, before the teardown steps run.
+        def __setattr__(self, name, value):
+            steps.append("release_socket")
+            pl.begin_process_lifecycle()
+
+    try:
+        run._graceful_shutdown(_Server())
+    finally:
+        run._remove_pid_file = _real_remove
+
+    assert "release_socket" in steps, "the restart hook never ran; the test proves nothing"
+    assert "remove_record" not in steps, (
+        "the superseded shutdown removed the pid record, which now belongs to the live "
+        "session: `stop` and the next launch can no longer find the running server"
+    )
+    assert pl.is_process_shutting_down() is False, (
+        "the superseded shutdown left the process latched shut, so the session that "
+        "just started refuses every spawn for the rest of its life"
+    )
+
+
+def _fn_named(source, name):
+    import ast
+    return next(
+        n
+        for n in ast.walk(ast.parse(source))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+    )
+
+
+def test_the_server_thread_finalizer_is_scoped_to_its_own_lifecycle():
+    """_run's finally block drops the pid file, the startup marker and the LAN
+    listener, all one-per-process. A thread that outlives the bounded join reaches it
+    after the next session has written its own, and would take down the live one.
+    """
+    import ast
+    from pathlib import Path
+
+    run_py = (Path(__file__).resolve().parent.parent / "run.py").read_text(encoding = "utf-8")
+    fn = _fn_named(run_py, "_run")
+    guarded = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.If)
+        and any(isinstance(x, ast.Return) for x in ast.walk(n))
+        and any(isinstance(x, ast.Name) and x.id == "_superseded" for x in ast.walk(n.test))
+    ]
+    assert guarded, (
+        "_run's finalizer runs its global teardown unconditionally; a superseded "
+        "server thread deletes the live session's pid file and closes its LAN listener"
+    )
+    # And the guard has to come FIRST, or the calls it protects have already run.
+    teardown = [
+        n.lineno
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id in {"_remove_pid_file", "_remove_startup_marker", "_close_lan_listener"}
+    ]
+    assert (
+        teardown and min(teardown) > guarded[0].lineno
+    ), "the supersede guard sits after the teardown calls it is supposed to gate"
+
+
+def test_the_primary_llama_launch_rechecks_after_recording_the_pid():
+    """mark_process_shutting_down does not take _spawn_lock, and terminate_all does not
+    take it when it snapshots, so the in-lock check is not atomic against the
+    process-wide latch for a helper-owned backend. Without a recheck the child sits
+    outside the completed sweep for the whole 600s health wait.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parent.parent / "core" / "inference" / "llama_cpp.py"
+    ).read_text(encoding = "utf-8")
+    fn = _fn_named(src, "_spawn_and_wait")
+    record = [
+        n.lineno
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "_record_server_pid"
+    ]
+    stale = [
+        n.lineno
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "_spawn_is_stale"
+    ]
+    health = [
+        n.lineno
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "_wait_for_health"
+    ]
+    assert record and stale and health, "the spawn path no longer looks like itself"
+    assert any(max(record) < s < min(health) for s in stale), (
+        "no staleness recheck between recording the pid and the health wait: a spawn "
+        "that raced the latch is left running outside the sweep that already finished"
+    )
+
+
+def test_the_worker_mirrors_are_published_under_the_shutdown_lock():
+    """active_model_name is what the already-loaded fast path trusts, and it does not
+    test liveness. Checked and published apart, shutdown can kill the worker in between
+    and the next session reports a dead one as resident.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parent.parent / "core" / "inference" / "orchestrator.py"
+    ).read_text(encoding = "utf-8")
+    fn = _fn_named(src, "load_model")
+    holding = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.With)
+        and any(
+            getattr(item.context_expr, "attr", None) == "_subprocess_shutdown_lock"
+            for item in n.items
+        )
+    ]
+    assert holding, "load_model never holds the subprocess shutdown lock"
+    covered = False
+    for w in holding:
+        checks = [
+            n
+            for n in ast.walk(w)
+            if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "is_process_shutting_down"
+        ]
+        publishes = [
+            n
+            for n in ast.walk(w)
+            if isinstance(n, ast.Assign)
+            and any(
+                getattr(t, "attr", None) == "active_model_name"
+                and not isinstance(n.value, ast.Constant)
+                for t in n.targets
+            )
+        ]
+        if checks and publishes:
+            covered = True
+    assert covered, (
+        "the shutdown check and the active_model_name publication are not inside the "
+        "same held lock, so a kill can land between them"
+    )
+
+
+def test_the_supersede_check_and_the_teardown_it_gates_are_one_step():
+    """Reading the generation and then tearing down is check-then-act. A restart
+    landing in the gap gets its llama-server killed by the shutdown it already
+    outwaited, and because a teardown kill re-latches the process flag, that session
+    then refuses every spawn for good. Check and teardown must hold the transition
+    lock together.
+    """
+    import ast
+    from pathlib import Path
+
+    run_py = (Path(__file__).resolve().parent.parent / "run.py").read_text(encoding = "utf-8")
+    fn = _fn_named(run_py, "_graceful_shutdown")
+
+    # Every destructive step reaches its subsystem through _owned(...), which is what
+    # holds the lock. A bare _superseded() call outside it is the old racy shape.
+    owned_steps = {
+        n.items[0].context_expr.args[0].value
+        for n in ast.walk(fn)
+        if isinstance(n, ast.With)
+        and n.items
+        and isinstance(n.items[0].context_expr, ast.Call)
+        and getattr(n.items[0].context_expr.func, "id", None) == "_owned"
+        and n.items[0].context_expr.args
+        and isinstance(n.items[0].context_expr.args[0], ast.Constant)
+    }
+    assert "the llama-server teardown" in owned_steps, (
+        "step 5 is not inside _owned(); the kill that re-latches the process flag can "
+        "still land on a session that started after the check"
+    )
+    assert len(owned_steps) >= 5, f"only {sorted(owned_steps)} are held across the check"
+
+    # And the guard itself must actually take the lock, not just read the generation.
+    owned = _fn_named(run_py, "_owned")
+    assert any(
+        isinstance(n, ast.Call) and getattr(n.func, "id", None) == "lifecycle_transition"
+        for n in ast.walk(owned)
+    ), "_owned does not hold the lifecycle transition lock"
+
+
+def test_the_restart_takes_the_transition_lock_before_the_backend_teardown_lock():
+    """Lock order, and it is the whole reason this is safe. _begin_server_lifecycle
+    takes the backend's _teardown_lock, and _kill_process takes it while a shutdown
+    step holds the transition lock. Taking them in the other order here closes the
+    cycle and deadlocks the restart against the exit it is trying to replace.
+    """
+    import ast
+    from pathlib import Path
+
+    run_py = (Path(__file__).resolve().parent.parent / "run.py").read_text(encoding = "utf-8")
+    fn = _fn_named(run_py, "run_server")
+    holds = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.With)
+        and any(
+            isinstance(item.context_expr, ast.Call)
+            and getattr(item.context_expr.func, "id", None) == "lifecycle_transition"
+            for item in n.items
+        )
+    ]
+    assert holds, "the restart never takes the lifecycle transition lock"
+    inside = {
+        getattr(n.func, "attr", getattr(n.func, "id", None))
+        for w in holds
+        for n in ast.walk(w)
+        if isinstance(n, ast.Call)
+    }
+    for required in ("_begin_server_lifecycle", "begin_process_lifecycle", "begin_load_lifecycle"):
+        assert required in inside, (
+            f"{required} is outside the transition lock; the shutdown can then see this "
+            "transition half-applied, and for _begin_server_lifecycle the two locks are "
+            "taken in opposite orders on the two sides"
+        )
+
+
+def test_the_transition_lock_survives_a_fork():
+    """Same inheritance hazard as the generation lock: a child that cannot take it can
+    never run a teardown step."""
+    from utils import process_lifetime as pl
+
+    before = pl.lifecycle_transition()
+    acquired = before.acquire()
+    try:
+        pl._reset_after_fork()
+    finally:
+        if acquired:
+            before.release()
+
+    assert (
+        pl.lifecycle_transition() is not before
+    ), "_reset_after_fork left the inherited transition lock in place"
+    with pl.lifecycle_transition():
+        pass
+
+
+def test_the_sweep_does_not_consume_a_record_a_restart_replaced():
+    """PID reuse during the overlap the scoped sweep now allows.
+
+    The gap is between reading a pid's adoption generation and removing its record.
+    Split across two lock holds, a recycled pid re-adopted by the NEW lifecycle in that
+    window is read as old (so not skipped) and then popped -- deleting the record that
+    had just been created for a DIFFERENT process. The identity mismatch stops the sweep
+    signalling it, so nothing dies, but that child is now in no record at all: out of the
+    breadcrumb and out of every later sweep, which is how it ends up orphaned.
+
+    Driven by instrumenting the lock rather than by racing threads, because the window
+    is a few instructions wide. The injection fires when the hold that reads the
+    generation is released, which on the fixed code is the same hold that does the
+    removal -- so there is no longer a point at which it can land.
+    """
+    from utils import process_lifetime as pl
+
+    pid = 4242424
+    old_generation = pl.process_lifecycle_generation()
+    real_lock = pl._record_lock
+
+    class _LockThatLetsARestartIn:
+        """A real lock that re-adopts the pid when the second hold is released."""
+
+        def __init__(self):
+            self.exits = 0
+
+        def acquire(self, *a, **kw):
+            return real_lock.acquire(*a, **kw)
+
+        def release(self):
+            return real_lock.release()
+
+        def __enter__(self):
+            real_lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self.exits += 1
+            fire = self.exits == 2
+            real_lock.release()
+            if fire:
+                # The restart: a new lifecycle recycles this pid and adopts it.
+                pl.begin_process_lifecycle()
+                with real_lock:
+                    pl._tracked_pids[pid] = "new-identity"
+                    pl._adoption_generation[pid] = pl._lifecycle_generation
+            return False
+
+    with real_lock:
+        pl._tracked_pids[pid] = "old-identity"
+        pl._adoption_generation[pid] = old_generation
+
+    instrumented = _LockThatLetsARestartIn()
+    pl._record_lock = instrumented
+    try:
+        pl.terminate_all(timeout = 0.1, sweep_generation = old_generation)
+    finally:
+        pl._record_lock = real_lock
+
+    assert instrumented.exits >= 2, "the sweep never reached the instrumented hold"
+    with real_lock:
+        still_tracked = pl._tracked_pids.get(pid)
+        still_stamped = pl._adoption_generation.get(pid)
+        pl._tracked_pids.pop(pid, None)
+        pl._adoption_generation.pop(pid, None)
+        pl._tracked_pgids.pop(pid, None)
+
+    assert still_tracked == "new-identity", (
+        "the old sweep consumed the record the restart had just created for a recycled "
+        f"pid; that child is now in no record at all (tracked={still_tracked!r})"
+    )
+    assert still_stamped is not None, "the adoption generation went with it"
+
+
+def test_the_tunnel_is_armed_after_the_lifecycle_transition():
+    """Armed before the restart's wait, the tunnel is closed by the shutdown being
+    waited on -- which still legitimately owns the lifecycle at that moment, so the
+    supersede check does not save it. _accepting_starts is then false with nothing left
+    to arm it, and every tunnel start in the new session is refused.
+    """
+    import ast
+    from pathlib import Path
+
+    run_py = (Path(__file__).resolve().parent.parent / "run.py").read_text(encoding = "utf-8")
+    fn = _fn_named(run_py, "run_server")
+    opens = [
+        n.lineno
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "open_studio_tunnel_lifecycle"
+    ]
+    assert opens, "run_server no longer arms the tunnel"
+    transition = _run_server_call_lines("begin_process_lifecycle")
+    serve = _run_server_call_lines("start", owner = "thread")
+    assert min(opens) > transition, (
+        "the tunnel is armed before the lifecycle transition, so a shutdown this "
+        "restart is waiting on closes it and nothing arms it again"
+    )
+    assert min(opens) < serve, "the tunnel is armed after the server starts serving"
+
+
+def test_the_admitting_generation_survives_a_restart_under_the_work():
+    """A load can sit in preflight across an embedded restart. Read live at the backend,
+    the generation is the NEW session's, so old work stamps itself as belonging to a
+    session that never asked for it.
+    """
+    from utils import process_lifetime as pl
+
+    admitted = pl.process_lifecycle_generation()
+    pl.set_admitting_generation(admitted)
+    pl.begin_process_lifecycle()  # the restart lands mid-preflight
+
+    assert pl.process_lifecycle_generation() != admitted, "the restart did not advance"
+    assert pl.admitting_generation() == admitted, (
+        "the backend would read the restarted session's generation for work the "
+        "previous session admitted"
+    )
+    # And that stamp is what makes the guard refuse the stale work.
+    assert pl.is_process_shutting_down(pl.admitting_generation()) is True
+
+    pl.set_admitting_generation(None)
+    assert pl.admitting_generation() == pl.process_lifecycle_generation(), (
+        "with nothing recorded it must fall back to the live generation, which is the "
+        "behaviour that existed before"
+    )
+
+
+def test_a_bogus_admission_stamp_is_ignored():
+    """Only a real stamp decides. A truthy stand-in compares unequal to every
+    generation and would refuse loads that have nothing wrong with them.
+    """
+    from utils import process_lifetime as pl
+
+    live = pl.process_lifecycle_generation()
+    for bogus in (True, False, "3", 3.0, object()):
+        pl.set_admitting_generation(bogus)
+        assert pl.admitting_generation() == live, f"{bogus!r} was accepted as a stamp"
+
+
+def test_both_backends_read_the_admitting_generation_not_the_live_one():
+    """The whole point of the stamp is that the backends stop reading the clock."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "core" / "inference"
+    for filename, func in (("orchestrator.py", "load_model"), ("llama_cpp.py", "load_model")):
+        src = (root / filename).read_text(encoding = "utf-8")
+        fn = _fn_named(src, func)
+        assigns = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Assign)
+            and isinstance(n.value, ast.Call)
+            and getattr(n.value.func, "id", None)
+            in {"admitting_generation", "process_lifecycle_generation"}
+            and any(
+                (getattr(t, "id", None) or getattr(t, "attr", None) or "").endswith(
+                    ("process_generation", "_load_process_generation")
+                )
+                for t in n.targets
+            )
+        ]
+        assert assigns, f"{filename}:{func} no longer captures a process generation"
+        used = {getattr(n.value.func, "id", None) for n in assigns}
+        assert used == {"admitting_generation"}, (
+            f"{filename}:{func} still reads the live generation ({sorted(used)}); work "
+            "admitted before a restart would be stamped with the session after it"
+        )

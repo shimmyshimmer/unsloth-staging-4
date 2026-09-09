@@ -6,8 +6,10 @@
 Self-contained; can be moved to any directory.
 """
 
+import contextlib
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import NoReturn, Optional, Sequence, Tuple
@@ -1591,6 +1593,13 @@ def _install_windows_console_handler(shutdown) -> bool:
         return False
 
 
+# Set only when _graceful_shutdown has run to completion, including step 7's sweep.
+# A concurrent embedded restart waits on this: reopening after the llama teardown lock
+# alone still leaves terminate_all() ahead, and that sweep would reap a child the new
+# lifecycle had already adopted, as if it belonged to the previous session.
+_shutdown_complete = threading.Event()
+
+
 def _graceful_shutdown(server = None):
     """Shut down all subprocess backends and the uvicorn server.
 
@@ -1598,6 +1607,70 @@ def _graceful_shutdown(server = None):
     Windows where atexit handlers are unreliable after Ctrl+C.
     """
     logger.info("Graceful shutdown initiated -- cleaning up subprocesses...")
+    _shutdown_complete.clear()
+
+    # 0a. Latch "quitting" before any subsystem is torn down. Each step below refuses
+    # to respawn its OWN child once it has run, but a load still in flight can reach a
+    # different spawner afterwards: the orchestrator is stopped at step 2 and swept at
+    # step 5, and a helper load owns a backend no step touches at all. One flag read at
+    # every spawn covers the gaps between the steps.
+    _sweep_generation = None
+    try:
+        from utils.process_lifetime import mark_process_shutting_down
+
+        # Returned by the marking call itself, under the lock that sets the latch, so
+        # step 7's sweep belongs to THIS shutdown. Reading it in a separate call let a
+        # restart advance the generation in between, and the sweep would then adopt the
+        # new session's number and terminate the children it had just started.
+        _sweep_generation = mark_process_shutting_down()
+    except Exception as e:
+        logger.warning("Could not latch the process shutdown flag: %s", e)
+
+    def _superseded(step: str) -> bool:
+        """Whether a NEW session has reopened the lifecycle while this shutdown runs.
+
+        The restart's wait for us is bounded (a legitimate shutdown can outlast any
+        bound worth making a restart pay), so it reopens and starts serving while these
+        steps may still be going. Every step below reaches its subsystem through a
+        MODULE SINGLETON, which the new session reuses -- so once the lifecycle has
+        moved on, the object a step would tear down is the live one, not ours. Step 7's
+        sweep is already scoped the same way, and it remains the backstop for whatever
+        we skip here: it still reaps children adopted by this lifecycle or an earlier.
+        """
+        if _sweep_generation is None:
+            return False
+        try:
+            from utils.process_lifetime import process_lifecycle_generation
+            if process_lifecycle_generation() == _sweep_generation:
+                return False
+        except Exception:
+            return False
+        logger.info(
+            "A new session reopened while this shutdown was running; skipping %s "
+            "(its subsystems now belong to the live session)",
+            step,
+        )
+        return True
+
+    @contextlib.contextmanager
+    def _owned(step: str):
+        """Yield whether this shutdown still owns *step*, holding the transition lock.
+
+        Reading the generation and then tearing down is check-then-act: the restart can
+        advance it in the gap, and the kill lands on the session that just started --
+        which for step 5 also re-latches the process flag and leaves that session
+        refusing every spawn for good. Held across the check AND the teardown, so the
+        transition either happens entirely before (we skip) or entirely after (we are
+        done). Only one step at a time, so a restart waits out a single bounded step.
+        """
+        try:
+            from utils.process_lifetime import lifecycle_transition
+            with lifecycle_transition():
+                yield not _superseded(step)
+                return
+        except ImportError:
+            pass
+        yield not _superseded(step)
 
     # 0. Drop the LAN listener first: it shares the loop uvicorn is about to stop.
     try:
@@ -1613,58 +1686,88 @@ def _graceful_shutdown(server = None):
     # 2. Clean up inference subprocess (if instantiated).
     try:
         from core.inference.orchestrator import _inference_backend
-        if _inference_backend is not None:
-            _inference_backend._shutdown_subprocess(timeout = 5.0)
+        with _owned("the inference subprocess") as _mine:
+            if _inference_backend is not None and _mine:
+                _inference_backend._shutdown_subprocess(timeout = 5.0)
     except Exception as e:
         logger.warning("Error shutting down inference subprocess: %s", e)
 
     # 3. Clean up export subprocess (if instantiated).
     try:
         from core.export.orchestrator import _export_backend
-        if _export_backend is not None:
-            _export_backend._shutdown_subprocess(timeout = 5.0)
+        with _owned("the export subprocess") as _mine:
+            if _export_backend is not None and _mine:
+                _export_backend._shutdown_subprocess(timeout = 5.0)
     except Exception as e:
         logger.warning("Error shutting down export subprocess: %s", e)
 
     # 4. Clean up training subprocess (if active).
     try:
         from core.training.training import _training_backend
-        if _training_backend is not None:
-            _training_backend.force_terminate()
+        with _owned("the training subprocess") as _mine:
+            if _training_backend is not None and _mine:
+                _training_backend.force_terminate()
     except Exception as e:
         logger.warning("Error shutting down training subprocess: %s", e)
 
     # 5. Kill llama-server subprocess (if loaded).
     try:
-        from routes.inference import _llama_cpp_backend
-        if _llama_cpp_backend is not None:
-            _llama_cpp_backend._kill_process()
+        from routes.inference import _llama_cpp_backend, cancel_pending_loads
+
+        # Before the kill: a load still in the gate or preflight is invisible to the
+        # backend's shutdown flag and would spawn into the next lifecycle.
+        # Both calls are the sharpest case for the supersede check. cancel_pending_loads
+        # would cancel loads the NEW session admitted, and _kill_process(teardown=True)
+        # would kill its llama-server and, because a teardown kill latches the process
+        # flag again, leave that session refusing every later spawn for good.
+        with _owned("the llama-server teardown") as _mine:
+            if _mine:
+                try:
+                    cancelled = cancel_pending_loads()
+                    if cancelled:
+                        logger.info("Cancelled %d in-flight model load(s) for shutdown", cancelled)
+                except Exception as e:
+                    logger.warning("Could not cancel in-flight loads: %s", e)
+                if _llama_cpp_backend is not None:
+                    _llama_cpp_backend._kill_process(teardown = True)
     except Exception as e:
         logger.warning("Error shutting down llama-server: %s", e)
 
     # 6. Stop the Cloudflare tunnel (if started).
     try:
         from cloudflare_tunnel import close_studio_tunnel_lifecycle
-        close_studio_tunnel_lifecycle()
+        with _owned("the Cloudflare tunnel") as _mine:
+            if _mine:
+                close_studio_tunnel_lifecycle()
     except Exception as e:
         logger.warning("Error stopping Cloudflare tunnel: %s", e)
 
     # 7. Backstop sweep for any adopted child the steps above missed.
     try:
         from utils.process_lifetime import clear_breadcrumb, terminate_all
-        terminate_all()
+        terminate_all(sweep_generation = _sweep_generation)
         clear_breadcrumb()  # nothing left for the next startup to sweep
     except Exception as e:
         logger.warning("Error in process-lifetime sweep: %s", e)
 
     # Last: while cleanup runs the server is still alive, and dropping the record
     # early leaves a retried `stop` or a new launch unable to find it.
-    _remove_pid_file()
+    # One record per process, so a restart has already overwritten it with its own:
+    # removing it here would leave the LIVE server unfindable by `stop` or by a launch.
+    with _owned("the pid file") as _mine:
+        if _mine:
+            _remove_pid_file()
     logger.info("All subprocesses cleaned up")
+    _shutdown_complete.set()
 
 
 # Bound the join so a stuck uvicorn shutdown cannot hang the terminal.
 _SERVER_SHUTDOWN_JOIN_TIMEOUT = 5.0
+
+# Longer than the join: this waits on the whole of _graceful_shutdown, whose own steps
+# already allow 5s + 5s before the final sweep. Still bounded, because correctness comes
+# from the sweep being lifecycle-scoped rather than from this wait.
+_SHUTDOWN_COMPLETE_WAIT = 30.0
 
 
 def _flush_standard_streams() -> None:
@@ -2970,14 +3073,24 @@ def run_server(
         app.state.suppress_bootstrap_injection = True
         app.state.bootstrap_password = None
 
-    from cloudflare_tunnel import open_studio_tunnel_lifecycle
-
-    open_studio_tunnel_lifecycle()
+    # NOT opened here. The reopen block below waits for a previous shutdown, and that
+    # shutdown's Cloudflare step legitimately still owns the lifecycle while we wait --
+    # so a tunnel armed before the wait is closed by it, leaving _accepting_starts false
+    # with nothing left to arm it again and every tunnel start in this session refused.
+    # It is opened inside the transition instead, once this session owns the lifecycle.
 
     # Run server in a daemon thread with explicit new_event_loop() +
     # run_until_complete() (not asyncio.run) so nest_asyncio's patches don't
     # interfere when Colab/IPython already runs a loop on the main thread.
     def _run():
+        # Which lifecycle this thread serves. The bump below happens before
+        # thread.start(), so this reads THIS session's number, and the finalizer can
+        # tell "I am the current server" from "a newer one replaced me".
+        try:
+            from utils.process_lifetime import process_lifecycle_generation
+            _my_generation = process_lifecycle_generation()
+        except Exception:
+            _my_generation = None
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         # settings > LAN access adds its listener to this loop from a request thread
@@ -2991,6 +3104,26 @@ def run_server(
             loop.close()
             if not ready_event.is_set():
                 startup_failed.set()
+            # Every call below writes module-global or on-disk state that is NOT
+            # per-thread: the pid file, the startup marker and the LAN listener are one
+            # set per process. The join before a restart is bounded (a request still
+            # draining can outlast it), so this thread can reach here after a newer
+            # session has already written its own pid file and opened its own listener,
+            # and these would then delete and close the LIVE server's. Only the current
+            # server tears them down; an outlived one leaves them to their owner.
+            _superseded = False
+            if _my_generation is not None:
+                try:
+                    from utils.process_lifetime import process_lifecycle_generation
+                    _superseded = process_lifecycle_generation() != _my_generation
+                except Exception:
+                    _superseded = False
+            if _superseded:
+                logger.info(
+                    "Previous server thread exited after a restart; leaving the pid "
+                    "file, startup marker and LAN listener to the current session"
+                )
+                return
             # An embedded host stays alive after the server thread ends, and a
             # post-readiness failure in here never reaches run_server's caller,
             # so nothing else takes these back. They would keep validating
@@ -3004,6 +3137,76 @@ def run_server(
             from lan_access import close_lan_listener_lifecycle as _close_lan_listener
 
             _close_lan_listener()
+
+    # A new server lifecycle: the backend is a module singleton, so an embedded host
+    # calling run_server again reuses the instance _graceful_shutdown marked as
+    # shutting down. Last, after every pre-serve exit, because clearing the flag is
+    # what lets a spawn through; and after `from main import app`, or reaching for
+    # the route module here would build the singleton ahead of the startup steps
+    # above that must come first.
+    try:
+        from routes.inference import _llama_cpp_backend, begin_load_lifecycle
+
+        # The route latch as well as the backend's: shutdown sets both, and a second
+        # session that cleared only one would refuse every /load it admitted.
+        # Backend first, route latch second. _begin_server_lifecycle blocks on the
+        # teardown lock while a kill is still running, and clearing the latch before
+        # that wait would leave a request the OLD lifecycle admitted uncancelled: it
+        # would then capture the freshly advanced generation and load the previous
+        # session's model into this one. Nothing legitimate is refused by the later
+        # clear, since uvicorn does not serve until thread.start() below.
+        # The process latch clears between the two for the same reason: it is what
+        # every OTHER spawner reads, so it must stay set until the teardown this waits
+        # on has finished, and be clear before anything is admitted.
+        from utils.process_lifetime import begin_process_lifecycle, is_process_shutting_down
+
+        # Before any of that: let the previous session's uvicorn thread drain. A request
+        # it already accepted may not have reached load_model_gated yet, so it is in no
+        # snapshot and captures its generations only once it gets there -- by which time
+        # the clears below have made it indistinguishable from a new-session request.
+        # Joining is the only thing that can tell them apart. Gated on the latch so a
+        # first run, or a host that never shut down, does not wait; bounded by the same
+        # 5s timeout as the normal exit path, which logs and proceeds.
+        if is_process_shutting_down():
+            _wait_for_server_shutdown()
+            # And for the shutdown itself to finish, so the common case reopens onto a
+            # quiet process. This CANNOT be the guarantee: a legitimate shutdown runs
+            # longer than any bound a restart should wait for, since steps 2 and 3 each
+            # allow five seconds on their own. What makes reopening safe regardless is
+            # that terminate_all only signals pids adopted by its own lifecycle or an
+            # earlier one, so the old sweep cannot reach this session's children.
+            if not _shutdown_complete.wait(timeout = _SHUTDOWN_COMPLETE_WAIT):
+                logger.warning(
+                    "Previous shutdown still running; reopening the lifecycle anyway "
+                    "(its sweep cannot reach this session's children)"
+                )
+
+        # All three under the transition lock, and it is taken BEFORE
+        # _begin_server_lifecycle rather than around the generation bump alone. That
+        # call takes the backend's _teardown_lock, which _kill_process also takes while
+        # a shutdown step holds the transition lock: acquiring the two in the opposite
+        # order here would close the cycle and deadlock the restart against the exit.
+        # Holding it across all three is also what makes a superseded shutdown's check
+        # and teardown atomic -- it sees the generation either wholly before or wholly
+        # after this block, never halfway through it.
+        from utils.process_lifetime import lifecycle_transition
+
+        with lifecycle_transition():
+            if _llama_cpp_backend is not None:
+                _llama_cpp_backend._begin_server_lifecycle()
+            begin_process_lifecycle()
+            begin_load_lifecycle()
+    except Exception as e:
+        logger.warning("Could not reset llama-server shutdown state: %s", e)
+
+    # After the transition, never before it. The generation has advanced by now, so an
+    # old shutdown still walking its steps finds its Cloudflare step superseded and
+    # skips it; if it closed the tunnel while we were waiting, this arms it again.
+    # Outside the try above on purpose: an import failure there must not silently cost
+    # this session its tunnel, and a failure here is not "llama-server shutdown state".
+    from cloudflare_tunnel import open_studio_tunnel_lifecycle
+
+    open_studio_tunnel_lifecycle()
 
     thread = Thread(target = _run, daemon = True)
     _server_thread = thread
