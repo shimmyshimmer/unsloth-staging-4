@@ -8,7 +8,6 @@ from typing import Optional, Sequence
 
 from hub.utils.download_manifest import ExpectedFile
 from hub.utils.gguf import (
-    bare_quant_alias,
     drop_shadowed_appledouble_siblings,
     extract_quant_label,
     gguf_variant_family,
@@ -18,6 +17,7 @@ from hub.utils.gguf import (
     is_imatrix_filename,
     is_mmproj_filename,
     is_mtp_drafter_path,
+    resolve_variant_alias,
 )
 
 
@@ -72,12 +72,14 @@ def is_companion_gguf_path(path: str) -> bool:
     return is_gguf_filename(path) and (is_mmproj_filename(path) or is_mtp_drafter_path(path))
 
 
-def is_main_gguf_variant_path(path: str, variant: str) -> bool:
-    """Whether *path* is one of *variant*'s own weight files.
+def is_main_gguf_candidate(path: str) -> bool:
+    """Whether *path* could be SOME variant's own weight file, whichever one.
 
-    Keyed on :func:`gguf_variant_key`, in lockstep with the listers: a row built under
-    one identity and matched under another produces a variant that can be shown but
-    not downloaded.
+    The variant-independent half of :func:`is_main_gguf_variant_path`, split out so that a
+    caller resolving a spelling onto a key sees exactly the files that predicate would accept.
+    An mmproj is named for its OWN precision and keys like any other file
+    (``Qwen3.8-27B-mmproj-hybrid-Q8_0-F16.gguf`` -> ``Q8_0``), so leaving companions in that set
+    let one match a bare quant exactly and shadow the real build the caller asked for.
     """
     return (
         is_gguf_filename(path)
@@ -87,8 +89,17 @@ def is_main_gguf_variant_path(path: str, variant: str) -> bool:
         # The endian predicate reads a quant TOKEN, so hand it the label: given the qualified key it
         # cannot see a parent-only quant and drops the file, leaving the plan with no main files.
         and not is_big_endian_gguf_path(path, extract_quant_label(path))
-        and gguf_variant_key(path).lower() == variant.lower()
     )
+
+
+def is_main_gguf_variant_path(path: str, variant: str) -> bool:
+    """Whether *path* is one of *variant*'s own weight files.
+
+    Keyed on :func:`gguf_variant_key`, in lockstep with the listers: a row built under
+    one identity and matched under another produces a variant that can be shown but
+    not downloaded.
+    """
+    return is_main_gguf_candidate(path) and gguf_variant_key(path).lower() == variant.lower()
 
 
 def _gguf_rfilename(sibling) -> Optional[str]:
@@ -298,10 +309,11 @@ def build_gguf_variant_plans(siblings: Sequence) -> dict[str, GgufVariantPlan]:
 def plan_for_variant(plans: dict[str, GgufVariantPlan], variant: str) -> Optional[GgufVariantPlan]:
     """The plan for *variant*, accepting a bare quant when exactly one plan carries it.
 
-    A repo that files every variant under one shared container (``weights/model-Q4_K_M.gguf``)
-    qualifies every key, because the key is a pure function of the path and cannot know that the
-    directory disambiguates nothing. Every stored pin and every explicit ``repo:Q4_K_M`` then
-    missed the plan map and the worker exited with "No GGUF shards matching variant".
+    A repo that files every variant under one shared container (``weights/model-Q4_K_M.gguf``),
+    or that tags every build past its quant (``gemma-4-31B_q4_0-it.gguf``), qualifies every key,
+    because the key is a pure function of the path and cannot know that the container or the tag
+    disambiguates nothing. Every stored pin and every explicit ``repo:Q4_K_M`` then missed the
+    plan map and the worker exited with "No GGUF shards matching variant".
 
     Resolved at LOOKUP rather than by aliasing the map, so the key stays a pure function of the
     path -- the remote listing and a partial cache scan have to agree on it -- and the advertised
@@ -315,10 +327,10 @@ def plan_for_variant(plans: dict[str, GgufVariantPlan], variant: str) -> Optiona
     exact = plans.get(wanted)
     if exact is not None:
         return exact
-    # PATH-qualified keys only, not is_qualified_gguf_variant_key: an H3 root stem's bare quant names
-    # both partitions, and picking either would load a different task.
-    matches = [key for key in plans if "/" in key and bare_quant_alias(key).lower() == wanted]
-    return plans[matches[0]] if len(matches) == 1 else None
+    # Every qualified key but an H3 root stem, whose bare quant names both partitions and would
+    # load a different task.
+    key = resolve_variant_alias(plans, wanted)
+    return plans[key] if key is not None else None
 
 
 def _one_shard_family(main_files: Sequence[ExpectedFile]) -> tuple[ExpectedFile, ...]:
@@ -351,7 +363,17 @@ def plan_from_expected_files(
     all_mmproj_hashes: frozenset[str] | None = None,
 ) -> GgufVariantPlan:
     expected = tuple(expected_files)
-    all_main = tuple(file for file in expected if is_main_gguf_variant_path(file.path, variant))
+    # A download started through the legacy bare quant writes its manifest under that spelling,
+    # while the manifest's files key to the qualified identity. Resolving here keeps resume from
+    # finding no main file and aborting on top of the partial blobs it already fetched.
+    resolved = (
+        resolve_variant_alias(
+            {gguf_variant_key(file.path) for file in expected if is_main_gguf_candidate(file.path)},
+            variant,
+        )
+        or variant
+    )
+    all_main = tuple(file for file in expected if is_main_gguf_variant_path(file.path, resolved))
     main_files = _one_shard_family(all_main)
     # A discarded family has to leave the plan ENTIRELY: target_filenames, required_hashes and
     # download_size_bytes are what the worker fetches, so leaving the copy there downloaded it, then

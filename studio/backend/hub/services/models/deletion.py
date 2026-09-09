@@ -17,7 +17,10 @@ from hub.utils import download_manifest
 from hub.utils import download_registry
 from hub.utils import inventory_scan as hf_cache_scan
 from hub.utils.gguf import (
+    resolve_variant_alias,
+    accepts_bare_quant_alias,
     bare_quant_alias,
+    variant_spellings_may_name_one_build,
     extract_quant_token,
     gguf_variant_key,
     is_qualified_gguf_variant_key,
@@ -253,10 +256,84 @@ def _variant_keys_to_delete(target_repo, variant: str) -> set[str]:
     }
     if wanted in keys:
         return {wanted}
-    # PATH-qualified keys only, not is_qualified_gguf_variant_key: an H3 root stem's bare quant names
-    # both partitions, so it must not delete either.
-    aliased = {key for key in keys if "/" in key and bare_quant_alias(key).lower() == wanted}
-    return aliased if len(aliased) == 1 else {wanted}
+    # The shared resolution, root precedence included: a tagged root beside
+    # ``distilled/model-Q4_K_M`` is what a legacy ``Q4_K_M`` names to the download and the
+    # loaders, so requiring global uniqueness here matched no file and 404'd the delete. An H3
+    # root stem is still excluded inside the resolver, and two root builds still refuse.
+    resolved = resolve_variant_alias(keys, wanted)
+    return {resolved.lower()} if resolved else {wanted}
+
+
+def _state_spellings_for_delete(
+    target_repo,
+    variant: str,
+    repo_id: Optional[str] = None,
+    root: Optional[Path] = None,
+) -> set[str]:
+    """Every spelling the manifest and cancel marker for this build could be stored under.
+
+    State is written under the spelling the DOWNLOAD used, which need not be the one the delete
+    asks for, and the two are keyed separately, so whichever direction is missed leaves state
+    that outlives its files -- an offline refresh then rebuilds a partial row for a checkpoint
+    that is gone. ``_variant_keys_to_delete`` covers bare-request-to-qualified-key; this adds the
+    reverse, and only when no plain sibling owns the bare spelling, since then it is another
+    build's state.
+
+    The snapshot entries alone cannot answer that. An interrupted plain-build download has a
+    bare-spelled manifest and an incomplete blob but no snapshot file yet, so it is invisible
+    here and the bare spelling looked unowned -- purging it would have thrown away that
+    download's resumability and orphaned its bytes. The manifest is read before claiming the
+    spelling, and any manifest naming files this delete is not removing keeps it.
+    """
+    wanted = (variant or "").strip().lower()
+    spellings = {wanted} | _variant_keys_to_delete(target_repo, variant)
+    if not wanted or not accepts_bare_quant_alias(wanted):
+        return spellings
+    bare = bare_quant_alias(wanted).lower()
+    if not bare:
+        return spellings
+    keys = {
+        gguf_variant_key(name).lower()
+        for _snap, _blob, name in _repo_file_matches(target_repo, _is_main_gguf_filename)
+    }
+    owners = {
+        key
+        for key in keys
+        if key == bare or (accepts_bare_quant_alias(key) and bare_quant_alias(key).lower() == bare)
+    }
+    # Ownership through the shared resolver, root precedence included: a tagged root beside
+    # ``distilled/model-Q4_K_M`` is two owners, and treating that as "not ours" kept a legacy
+    # download's manifest and marker alive after its weights were deleted -- a phantom partial
+    # row on the next offline refresh. Two ROOT owners still resolve to nothing and still keep it.
+    resolved_owner = resolve_variant_alias(sorted(owners), bare) if owners else None
+    if (resolved_owner or "").lower() != wanted:
+        return spellings
+    if repo_id and _bare_state_belongs_to_another_build(repo_id, bare, spellings, root):
+        return spellings
+    spellings.add(bare)
+    return spellings
+
+
+def _bare_state_belongs_to_another_build(
+    repo_id: str, bare: str, deleting: set[str], root: Optional[Path]
+) -> bool:
+    """Whether a manifest under *bare* describes a build this delete is NOT removing.
+
+    Fails CLOSED on an unreadable or absent manifest: leaving a stale marker costs a phantom
+    partial row, while purging a live one costs the download's resume state and leaves its
+    incomplete blobs untracked.
+    """
+    try:
+        manifest = download_manifest.read_manifest("model", repo_id, bare, hub_cache = root)
+    except Exception:
+        return True
+    if manifest is None:
+        return False
+    paths = [getattr(f, "path", "") for f in getattr(manifest, "expected_files", ())]
+    main = [p for p in paths if p and _is_main_gguf_filename(p)]
+    if not main:
+        return False
+    return any(gguf_variant_key(p).lower() not in deleting for p in main)
 
 
 def _delete_gguf_variant_from_repos(
@@ -273,10 +350,16 @@ def _delete_gguf_variant_from_repos(
     deleted_bytes = 0
     deleted_blobs = 0
     completed_hashes: set[str] = set()
+    # Every spelling whose blobs this delete actually removed. The manifest and cancel marker are
+    # written under the spelling the DOWNLOAD used, which for a legacy bare pin is not the
+    # qualified key the blobs key to, so purging only the request left the state behind and an
+    # offline refresh rebuilt a partial row for a checkpoint that is gone.
+    purge_variants: set[str] = {variant}
 
     for target_repo in target_repos:
         repo_dir = Path(target_repo.repo_path) if getattr(target_repo, "repo_path", None) else None
         wanted_keys = _variant_keys_to_delete(target_repo, variant)
+        purge_variants.update(_state_spellings_for_delete(target_repo, variant, repo_id, root))
         matched = _repo_file_matches(
             target_repo,
             lambda name, keys = wanted_keys: _is_main_gguf_filename(name)
@@ -360,7 +443,12 @@ def _delete_gguf_variant_from_repos(
             ),
         )
 
-    state_purged = download_manifest.purge_state("model", repo_id, variant, hub_cache = root)
+    state_purged = any(
+        [
+            download_manifest.purge_state("model", repo_id, spelling, hub_cache = root)
+            for spelling in sorted(purge_variants)
+        ]
+    )
     # Reclaim the empty quant folder so it stops 404ing on delete.
     removed_dirs, dir_failures = _remove_empty_variant_dirs(target_repos, variant)
     removed_snap_dirs, snap_dir_failures = _remove_empty_snapshot_dirs(target_repos)
@@ -616,7 +704,12 @@ def _loaded_repo_variant_blocks_delete(
         return True
     if not loaded_variant:
         return True
-    return loaded_variant.lower() == delete_variant.lower()
+    # ``_variant_keys_to_delete`` resolves the legacy bare quant onto the one qualified key that
+    # answers to it, and a build can be loaded under either spelling, so the guard has to compare
+    # them SYMMETRICALLY. Literal comparison let a bare request unlink a build loaded under its
+    # qualified key, and the one-directional check let the advertised qualified row unlink a build
+    # loaded through a legacy bare pin.
+    return variant_spellings_may_name_one_build(loaded_variant, delete_variant)
 
 
 _LOAD_STATE_UNVERIFIABLE_DETAIL = (
