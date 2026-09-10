@@ -15,6 +15,9 @@ from typing import Callable, Mapping, Optional, Sequence
 
 from fastapi import HTTPException
 
+from hub.services.models import account_access
+from utils.account_context import OWNER_ACCOUNT_ID, account_thread, current_account_id
+
 from hub.schemas.downloads import ActiveDownload, DownloadJobState
 from hub.utils import download_manifest
 from hub.utils import download_registry
@@ -23,6 +26,42 @@ from hub.utils.hf_cache_state import EXIT_CANCELLED
 from hub.utils.state_dir import RepoType
 
 logger = logging.getLogger(__name__)
+
+
+_job_accounts: dict[tuple[int, str], str] = {}
+_job_accounts_lock = threading.Lock()
+
+
+def record_download_account(registry, key: str) -> None:
+    """Attribute *key* the instant the claim succeeds: until then it names the last downloader."""
+    if account_access.account_scope() is None:
+        return
+    with _job_accounts_lock:
+        _job_accounts[(id(registry), key)] = current_account_id()
+
+
+def download_belongs_to_account(registry, key: str) -> bool:
+    if account_access.account_scope() is None:
+        return True
+    with _job_accounts_lock:
+        owner = _job_accounts.get((id(registry), key), OWNER_ACCOUNT_ID)
+    return owner == current_account_id()
+
+
+def require_download_account(registry, key: str) -> None:
+    if not download_belongs_to_account(registry, key):
+        raise HTTPException(status_code = 404, detail = "Download not found")
+
+
+def require_live_account(registry, key: str) -> None:
+    """Called right after ownership is recorded: a claim before retirement's scan is cancelled
+    by it, and one after sees the tombstone here, so neither reaches spawn with the token."""
+    from core.training.account_jobs import account_is_retired
+
+    if not account_is_retired():
+        return
+    registry.set_job(key, "error", "Account is retired")
+    raise HTTPException(status_code = 403, detail = "Account is retired")
 
 
 def backend_dir() -> Path:
@@ -168,6 +207,7 @@ def spawn_worker(
     concurrent same-repo peer is writing, excluded from the cache-prep purge so a
     shared ``.incomplete`` (e.g. bundled mmproj) is never deleted.
     """
+    allow_ambient_token = allow_ambient_token and not account_access.managed_account()
     cwd = backend_dir()
     mode = download_registry.TRANSPORT_XET if use_xet else download_registry.TRANSPORT_HTTP
     from utils.hf_cache_settings import get_hf_cache_paths
@@ -364,6 +404,8 @@ def finalize_worker_exit(
     metadata = registry.get_job_metadata(key)
     state = classify_exit(rc, cancel_requested = cancel_requested)
     if state == "complete":
+        if repo_id and repo_type:
+            account_access.record_model_grant(repo_id, repo_type)
         hf_cache_scan.invalidate_hf_cache_scans()
         registry.set_job(key, "complete")
         # Where /v1 learns a new model exists: its resolver answers from a cached scan with no watcher,
@@ -1192,7 +1234,8 @@ def register_worker(
             finally:
                 hf_cache_scan.invalidate_hf_cache_scans()
 
-    threading.Thread(target = _watch, name = watch_name, daemon = True).start()
+    # Always pinned, so a policy cache miss cannot unbind a job.
+    account_thread(target = _watch, name = watch_name, daemon = True).start()
     return True
 
 
@@ -1213,6 +1256,14 @@ def launch_worker(
 ) -> str:
     # Only the Xet success-recording consumes this, and sampling lazy-loads unsloth_zoo, so torch and
     # transformers, on the request path.
+    if account_access.account_scope() is not None:
+        record_download_account(registry, key)
+        require_live_account(registry, key)
+        try:
+            account_access.authorize_download(repo_id, repo_type, hf_token)
+        except HTTPException:
+            registry.set_job(key, "error", "Repository not found")
+            raise
     _baseline: Optional[int] = None
     if transport == download_registry.TRANSPORT_XET:
         # Before spawn(), deliberately: a small download can finalize its blobs while we are still
@@ -1268,6 +1319,7 @@ def cancel_worker(
     label: str,
     logger,
 ) -> str:
+    require_download_account(registry, key)
     proc = registry.get_process(key)
     # No worker process yet: arm a pending cancel so register_process kills it on arrival during the
     # claim-to-register window.
@@ -1315,6 +1367,10 @@ def idle_status(
 ) -> tuple[DownloadJobState, Optional[str], int]:
     state = registry.get_job(key)
     generation = registry.current_generation(key)
+    # Ownership is recorded per job, so a repo with no job (never downloaded, or lost to a
+    # restart) has no owner to compare; a 404 there strands a client hydrating a download.
+    if state.state != "idle":
+        require_download_account(registry, key)
     if (
         state.state == "idle"
         and repo_id
@@ -1333,6 +1389,8 @@ def active_download_refs(
 ) -> list[ActiveDownload]:
     downloads: list[ActiveDownload] = []
     for ref in registry.active_job_refs(repo_id):
+        if not download_belongs_to_account(registry, ref.key):
+            continue
         metadata = ref.metadata
         if with_variant:
             ref_repo_id = metadata.repo_id if metadata is not None else ref.key.split("::", 1)[0]

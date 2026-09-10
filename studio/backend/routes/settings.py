@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+"""Settings policy: the account, shared and owner routers decide who may reach each
+/api/settings path."""
+
 import functools
 import hashlib
 import re
@@ -28,6 +31,8 @@ from auth.authentication import (
     get_current_subject,
 )
 from auth.storage import rotate_preview_link_secret
+from auth import policy
+from utils.account_context import OWNER, bind_account, current_account, reset_account
 from hub.utils.hf_tokens import cache_reads_authorized, cached_read_refused, hf_token_arg
 
 from routes.provider_credentials import current_credential_write, require_ui_session
@@ -171,7 +176,26 @@ from utils.media_generation_preset_settings import (
     upsert_media_generation_preset,
 )
 
+
+async def _require_installation_owner(current_subject: str = Depends(get_current_subject)) -> None:
+    await policy.require_owner()
+
+
+async def _shared_policy_read(current_subject: str = Depends(get_current_subject)):
+    marker = None
+    if not current_account().is_owner:
+        marker = bind_account(OWNER)
+    try:
+        yield
+    finally:
+        if marker is not None:
+            reset_account(marker)
+
+
 router = APIRouter()
+_account_settings_router = APIRouter()
+_owner_settings_router = APIRouter(dependencies = [Depends(_require_installation_owner)])
+_shared_settings_router = APIRouter(dependencies = [Depends(_shared_policy_read)])
 
 logger = get_logger(__name__)
 
@@ -419,7 +443,7 @@ def _get_generation_preset_settings(kind, schema):
     return response
 
 
-@router.get(
+@_account_settings_router.get(
     "/generation-presets/image",
     response_model = ImageGenerationPresetSettings,
 )
@@ -429,7 +453,7 @@ def get_image_generation_preset_settings(
     return _get_generation_preset_settings("image", ImageGenerationPresetSettings)
 
 
-@router.put("/generation-presets/image")
+@_account_settings_router.put("/generation-presets/image")
 def update_image_generation_preset_settings(
     payload: ImageGenerationPresetState, current_subject: str = Depends(get_current_subject)
 ) -> dict[str, bool]:
@@ -443,7 +467,7 @@ def update_image_generation_preset_settings(
     return {"saved": True}
 
 
-@router.get(
+@_account_settings_router.get(
     "/generation-presets/video",
     response_model = VideoGenerationPresetSettings,
 )
@@ -453,7 +477,7 @@ def get_video_generation_preset_settings(
     return _get_generation_preset_settings("video", VideoGenerationPresetSettings)
 
 
-@router.put("/generation-presets/video")
+@_account_settings_router.put("/generation-presets/video")
 def update_video_generation_preset_settings(
     payload: VideoGenerationPresetState, current_subject: str = Depends(get_current_subject)
 ) -> dict[str, bool]:
@@ -482,21 +506,21 @@ def _upsert_custom_generation_preset(
     return {"saved": True}
 
 
-@router.put("/generation-presets/image/custom")
+@_account_settings_router.put("/generation-presets/image/custom")
 def upsert_custom_image_generation_preset(
     payload: ImageGenerationPreset, current_subject: str = Depends(get_current_subject)
 ) -> dict[str, bool]:
     return _upsert_custom_generation_preset("image", payload)
 
 
-@router.put("/generation-presets/video/custom")
+@_account_settings_router.put("/generation-presets/video/custom")
 def upsert_custom_video_generation_preset(
     payload: VideoGenerationPreset, current_subject: str = Depends(get_current_subject)
 ) -> dict[str, bool]:
     return _upsert_custom_generation_preset("video", payload)
 
 
-@router.delete("/generation-presets/{kind}/custom")
+@_account_settings_router.delete("/generation-presets/{kind}/custom")
 def delete_custom_generation_preset(
     kind: Literal["image", "video"],
     name: str,
@@ -539,7 +563,7 @@ class HuggingFaceTokenResponse(BaseModel):
     has_token: bool = False
 
 
-@router.get("/hugging-face-token", response_model = HuggingFaceTokenResponse)
+@_account_settings_router.get("/hugging-face-token", response_model = HuggingFaceTokenResponse)
 def get_hugging_face_token(
     _current_subject: str = Depends(get_current_subject),
     via_api_key: bool = Depends(authenticated_via_api_key),
@@ -549,7 +573,7 @@ def get_hugging_face_token(
     return HuggingFaceTokenResponse(token = token, has_token = token is not None)
 
 
-@router.put("/hugging-face-token", response_model = HuggingFaceTokenResponse)
+@_account_settings_router.put("/hugging-face-token", response_model = HuggingFaceTokenResponse)
 def update_hugging_face_token(
     payload: HuggingFaceTokenPayload,
     credential: tuple = Depends(get_current_credential),
@@ -564,7 +588,9 @@ def update_hugging_face_token(
     return HuggingFaceTokenResponse(token = payload.token, has_token = True)
 
 
-@router.put("/hugging-face-token/migrate", response_model = HuggingFaceTokenResponse)
+@_account_settings_router.put(
+    "/hugging-face-token/migrate", response_model = HuggingFaceTokenResponse
+)
 def migrate_hugging_face_token(
     payload: HuggingFaceTokenPayload,
     credential: tuple = Depends(get_current_credential),
@@ -579,7 +605,7 @@ def migrate_hugging_face_token(
     return HuggingFaceTokenResponse(token = token, has_token = token is not None)
 
 
-@router.delete("/hugging-face-token", response_model = HuggingFaceTokenResponse)
+@_account_settings_router.delete("/hugging-face-token", response_model = HuggingFaceTokenResponse)
 def clear_hugging_face_token(
     credential: tuple = Depends(get_current_credential),
     via_api_key: bool = Depends(authenticated_via_api_key),
@@ -1060,14 +1086,14 @@ def _llama_cpp_path_response() -> LlamaCppPathResponse:
     )
 
 
-@router.get("/hugging-face-cache", response_model = HuggingFaceCacheResponse)
+@_owner_settings_router.get("/hugging-face-cache", response_model = HuggingFaceCacheResponse)
 def get_hugging_face_cache(
     current_subject: str = Depends(get_current_subject),
 ) -> HuggingFaceCacheResponse:
     return _hugging_face_cache_response()
 
 
-@router.put("/hugging-face-cache", response_model = HuggingFaceCacheResponse)
+@_owner_settings_router.put("/hugging-face-cache", response_model = HuggingFaceCacheResponse)
 def update_hugging_face_cache(
     payload: HuggingFaceCachePayload, current_subject: str = Depends(get_current_subject)
 ) -> HuggingFaceCacheResponse:
@@ -1080,12 +1106,12 @@ def update_hugging_face_cache(
     return _hugging_face_cache_response()
 
 
-@router.get("/llama-cpp-path", response_model = LlamaCppPathResponse)
+@_owner_settings_router.get("/llama-cpp-path", response_model = LlamaCppPathResponse)
 def get_llama_cpp_path(current_subject: str = Depends(get_current_subject)) -> LlamaCppPathResponse:
     return _llama_cpp_path_response()
 
 
-@router.put("/llama-cpp-path", response_model = LlamaCppPathResponse)
+@_owner_settings_router.put("/llama-cpp-path", response_model = LlamaCppPathResponse)
 def update_llama_cpp_path(
     payload: LlamaCppPathPayload,
     current_subject: str = Depends(get_current_subject),
@@ -1109,12 +1135,12 @@ def update_llama_cpp_path(
     return _llama_cpp_path_response()
 
 
-@router.get("/upload-limit", response_model = UploadLimitResponse)
+@_shared_settings_router.get("/upload-limit", response_model = UploadLimitResponse)
 def get_upload_limit(current_subject: str = Depends(get_current_subject)) -> UploadLimitResponse:
     return _upload_limit_response(get_upload_limit_mb())
 
 
-@router.put("/upload-limit", response_model = UploadLimitResponse)
+@_owner_settings_router.put("/upload-limit", response_model = UploadLimitResponse)
 def update_upload_limit(
     payload: UploadLimitPayload, current_subject: str = Depends(get_current_subject)
 ) -> UploadLimitResponse:
@@ -1131,14 +1157,14 @@ def update_upload_limit(
     return _upload_limit_response(limit_mb)
 
 
-@router.get("/helper-precache", response_model = HelperPrecacheResponse)
+@_shared_settings_router.get("/helper-precache", response_model = HelperPrecacheResponse)
 def get_helper_precache(
     current_subject: str = Depends(get_current_subject),
 ) -> HelperPrecacheResponse:
     return _helper_precache_response()
 
 
-@router.put("/helper-precache", response_model = HelperPrecacheResponse)
+@_owner_settings_router.put("/helper-precache", response_model = HelperPrecacheResponse)
 def update_helper_precache(
     payload: HelperPrecachePayload, current_subject: str = Depends(get_current_subject)
 ) -> HelperPrecacheResponse:
@@ -1155,14 +1181,14 @@ def update_helper_precache(
     return _helper_precache_response(enabled)
 
 
-@router.get("/download-transport", response_model = DownloadTransportResponse)
+@_shared_settings_router.get("/download-transport", response_model = DownloadTransportResponse)
 def get_download_transport(
     current_subject: str = Depends(get_current_subject),
 ) -> DownloadTransportResponse:
     return _download_transport_response()
 
 
-@router.put("/download-transport", response_model = DownloadTransportResponse)
+@_owner_settings_router.put("/download-transport", response_model = DownloadTransportResponse)
 def update_download_transport(
     payload: DownloadTransportPayload, current_subject: str = Depends(get_current_subject)
 ) -> DownloadTransportResponse:
@@ -1179,7 +1205,7 @@ def update_download_transport(
     return _download_transport_response(mode)
 
 
-@router.post("/xet-notice/reserve", response_model = XetNoticeResponse)
+@_owner_settings_router.post("/xet-notice/reserve", response_model = XetNoticeResponse)
 def post_xet_notice_reserve(
     payload: XetNoticeReservePayload, current_subject: str = Depends(get_current_subject)
 ) -> XetNoticeResponse:
@@ -1197,7 +1223,9 @@ def post_xet_notice_reserve(
     return XetNoticeResponse(**result)
 
 
-@router.post("/igpu-carveout-notice/dismiss", response_model = IgpuCarveoutNoticeResponse)
+@_account_settings_router.post(
+    "/igpu-carveout-notice/dismiss", response_model = IgpuCarveoutNoticeResponse
+)
 def post_igpu_carveout_notice_dismiss(
     payload: IgpuCarveoutNoticeDismissPayload, current_subject: str = Depends(get_current_subject)
 ) -> IgpuCarveoutNoticeResponse:
@@ -1221,14 +1249,14 @@ def post_igpu_carveout_notice_dismiss(
     return IgpuCarveoutNoticeResponse(dismissed_at_gb = stored)
 
 
-@router.get("/chat-preferences", response_model = ChatPreferencesResponse)
+@_account_settings_router.get("/chat-preferences", response_model = ChatPreferencesResponse)
 def get_chat_preferences(
     current_subject: str = Depends(get_current_subject),
 ) -> ChatPreferencesResponse:
     return _chat_preferences_response()
 
 
-@router.put("/chat-preferences", response_model = ChatPreferencesResponse)
+@_account_settings_router.put("/chat-preferences", response_model = ChatPreferencesResponse)
 def update_chat_preferences(
     payload: ChatPreferencesPayload, current_subject: str = Depends(get_current_subject)
 ) -> ChatPreferencesResponse:
@@ -1245,7 +1273,7 @@ def update_chat_preferences(
     return _chat_preferences_response(enabled)
 
 
-@router.post("/chat-preferences/migrate", response_model = ChatPreferencesResponse)
+@_account_settings_router.post("/chat-preferences/migrate", response_model = ChatPreferencesResponse)
 def migrate_chat_preferences(
     payload: ChatPreferencesMigrationPayload, current_subject: str = Depends(get_current_subject)
 ) -> ChatPreferencesResponse:
@@ -1262,12 +1290,12 @@ def migrate_chat_preferences(
     return _chat_preferences_response(enabled)
 
 
-@router.get("/model-memory", response_model = ModelMemoryResponse)
+@_owner_settings_router.get("/model-memory", response_model = ModelMemoryResponse)
 def get_model_memory(current_subject: str = Depends(get_current_subject)) -> ModelMemoryResponse:
     return _model_memory_response()
 
 
-@router.put("/model-memory", response_model = ModelMemoryResponse)
+@_owner_settings_router.put("/model-memory", response_model = ModelMemoryResponse)
 def update_model_memory(
     payload: ModelMemoryPayload, current_subject: str = Depends(get_current_subject)
 ) -> ModelMemoryResponse:
@@ -1293,6 +1321,8 @@ _LAST_LOCAL_MODEL_LOCK = threading.Lock()
 
 def _last_local_model_key(subject: str) -> str:
     """Per-subject key: one shared row would hand user B user A's last model."""
+    if not current_account().is_owner:
+        subject = current_account().account_id
     subject = (subject or "").strip()
     if not subject:
         return LAST_LOCAL_MODEL_SETTING_KEY
@@ -1337,7 +1367,7 @@ class LastLocalModelResponse(BaseModel):
     server_now: Optional[int] = None
 
 
-@router.get("/last-local-model", response_model = LastLocalModelResponse)
+@_account_settings_router.get("/last-local-model", response_model = LastLocalModelResponse)
 def get_last_local_model(
     current_subject: str = Depends(get_current_subject),
 ) -> LastLocalModelResponse:
@@ -1352,7 +1382,7 @@ def get_last_local_model(
     return LastLocalModelResponse(**payload.model_dump(exclude = {"client_now"}), server_now = _now)
 
 
-@router.put("/last-local-model", response_model = LastLocalModelResponse)
+@_account_settings_router.put("/last-local-model", response_model = LastLocalModelResponse)
 def update_last_local_model(
     payload: LastLocalModelPayload, current_subject: str = Depends(get_current_subject)
 ) -> LastLocalModelResponse:
@@ -1391,12 +1421,12 @@ def update_last_local_model(
     )
 
 
-@router.get("/vram-budget", response_model = VramBudgetResponse)
+@_owner_settings_router.get("/vram-budget", response_model = VramBudgetResponse)
 def get_vram_budget(current_subject: str = Depends(get_current_subject)) -> VramBudgetResponse:
     return _vram_budget_response()
 
 
-@router.put("/vram-budget", response_model = VramBudgetResponse)
+@_owner_settings_router.put("/vram-budget", response_model = VramBudgetResponse)
 def update_vram_budget(
     payload: VramBudgetPayload, current_subject: str = Depends(get_current_subject)
 ) -> VramBudgetResponse:
@@ -1421,12 +1451,12 @@ class CodingAgentsResponse(BaseModel):
     detected: list[str]
 
 
-@router.get("/coding-agents", response_model = CodingAgentsResponse)
+@_owner_settings_router.get("/coding-agents", response_model = CodingAgentsResponse)
 def get_coding_agents(current_subject: str = Depends(get_current_subject)) -> CodingAgentsResponse:
     return CodingAgentsResponse(detected = detect_installed_coding_agents())
 
 
-@router.get("/openai-auto-switch", response_model = OpenAIAutoSwitchResponse)
+@_owner_settings_router.get("/openai-auto-switch", response_model = OpenAIAutoSwitchResponse)
 def get_openai_auto_switch(
     current_subject: str = Depends(get_current_subject),
 ) -> OpenAIAutoSwitchResponse:
@@ -1443,7 +1473,7 @@ def get_openai_auto_switch(
     )
 
 
-@router.put("/openai-auto-switch", response_model = OpenAIAutoSwitchResponse)
+@_owner_settings_router.put("/openai-auto-switch", response_model = OpenAIAutoSwitchResponse)
 def update_openai_auto_switch(
     payload: OpenAIAutoSwitchPayload, current_subject: str = Depends(get_current_subject)
 ) -> OpenAIAutoSwitchResponse:
@@ -1491,7 +1521,7 @@ def update_openai_auto_switch(
     )
 
 
-@router.get("/openai-auto-switch/overrides", response_model = ModelOverridesResponse)
+@_owner_settings_router.get("/openai-auto-switch/overrides", response_model = ModelOverridesResponse)
 def get_openai_auto_switch_overrides(
     model_id: Optional[str] = None,
     alias_id: Optional[str] = None,
@@ -1655,7 +1685,7 @@ def _serialized_override_write(func):
     return wrapper
 
 
-@router.put("/openai-auto-switch/overrides", response_model = ModelOverridesResponse)
+@_owner_settings_router.put("/openai-auto-switch/overrides", response_model = ModelOverridesResponse)
 @_serialized_override_write
 def update_openai_auto_switch_override(
     payload: ModelOverridePayload, current_subject: str = Depends(get_current_subject)
@@ -2035,7 +2065,7 @@ def _no_embedding_weights_error(candidates: list[str]) -> str:
     )
 
 
-@router.get("/embedding-model", response_model = EmbeddingModelResponse)
+@_owner_settings_router.get("/embedding-model", response_model = EmbeddingModelResponse)
 def get_embedding_model(
     current_subject: str = Depends(get_current_subject),
 ) -> EmbeddingModelResponse:
@@ -2651,7 +2681,9 @@ def _resolve_embedding_model_plan(
     )
 
 
-@router.get("/embedding-model/resolve", response_model = EmbeddingModelResolveResponse)
+@_owner_settings_router.get(
+    "/embedding-model/resolve", response_model = EmbeddingModelResolveResponse
+)
 def resolve_embedding_model(
     model: str,
     # Header, not a query param: keeps a gated-repo token out of URLs and logs.
@@ -2680,7 +2712,7 @@ def resolve_embedding_model(
     return _resolve_embedding_model_plan(resolved, token)
 
 
-@router.put("/embedding-model", response_model = EmbeddingModelResponse)
+@_owner_settings_router.put("/embedding-model", response_model = EmbeddingModelResponse)
 def update_embedding_model(
     payload: EmbeddingModelPayload,
     allow_ambient_token: bool = Depends(allow_ambient_hf_token),
@@ -2856,7 +2888,7 @@ def update_embedding_model(
     return _embedding_model_response()
 
 
-@router.post("/embedding-model/unload", response_model = EmbeddingModelResponse)
+@_owner_settings_router.post("/embedding-model/unload", response_model = EmbeddingModelResponse)
 def unload_embedding_model(
     current_subject: str = Depends(get_current_subject),
 ) -> EmbeddingModelResponse:
@@ -2870,7 +2902,7 @@ def unload_embedding_model(
     return _embedding_model_response()
 
 
-@router.delete("/embedding-model", response_model = EmbeddingModelResponse)
+@_owner_settings_router.delete("/embedding-model", response_model = EmbeddingModelResponse)
 def reset_embedding_model(
     current_subject: str = Depends(get_current_subject),
 ) -> EmbeddingModelResponse:
@@ -2884,7 +2916,7 @@ class PreviewLinkRotateResponse(BaseModel):
     rotated: bool = True
 
 
-@router.post("/preview-links/rotate", response_model = PreviewLinkRotateResponse)
+@_owner_settings_router.post("/preview-links/rotate", response_model = PreviewLinkRotateResponse)
 def rotate_preview_links(
     current_subject: str = Depends(get_current_subject),
 ) -> PreviewLinkRotateResponse:
@@ -2951,7 +2983,7 @@ def _remote_access_response(request: Request) -> RemoteAccessResponse:
     return RemoteAccessResponse(**remote_access_status(request.app.state))
 
 
-@router.get("/remote-access", response_model = RemoteAccessResponse)
+@_owner_settings_router.get("/remote-access", response_model = RemoteAccessResponse)
 def get_remote_access(
     request: Request,
     current_subject: str = Depends(get_current_subject),
@@ -2960,7 +2992,7 @@ def get_remote_access(
     return _remote_access_response(request)
 
 
-@router.post("/remote-access/start", response_model = RemoteAccessResponse)
+@_owner_settings_router.post("/remote-access/start", response_model = RemoteAccessResponse)
 def start_remote_access_route(
     request: Request,
     current_subject: str = Depends(get_current_subject),
@@ -2974,7 +3006,7 @@ def start_remote_access_route(
     return response
 
 
-@router.post("/remote-access/stop", response_model = RemoteAccessResponse)
+@_owner_settings_router.post("/remote-access/stop", response_model = RemoteAccessResponse)
 def stop_remote_access_route(
     request: Request,
     current_subject: str = Depends(get_current_subject),
@@ -2997,7 +3029,7 @@ def stop_remote_access_route(
     return response
 
 
-@router.put("/remote-access/auto-start", response_model = RemoteAccessResponse)
+@_owner_settings_router.put("/remote-access/auto-start", response_model = RemoteAccessResponse)
 def update_remote_access_auto_start(
     request: Request,
     payload: RemoteAccessAutoStartPayload,
@@ -3048,7 +3080,7 @@ def _lan_access_response(request: Request) -> LanAccessResponse:
     return LanAccessResponse(**lan_access_status(request.app))
 
 
-@router.get("/lan-access", response_model = LanAccessResponse)
+@_owner_settings_router.get("/lan-access", response_model = LanAccessResponse)
 def get_lan_access(
     request: Request,
     current_subject: str = Depends(get_current_subject),
@@ -3057,7 +3089,7 @@ def get_lan_access(
     return _lan_access_response(request)
 
 
-@router.post("/lan-access/start", response_model = LanAccessResponse)
+@_owner_settings_router.post("/lan-access/start", response_model = LanAccessResponse)
 def start_lan_access_route(
     request: Request,
     current_subject: str = Depends(get_current_subject),
@@ -3071,7 +3103,7 @@ def start_lan_access_route(
     return response
 
 
-@router.post("/lan-access/stop", response_model = LanAccessResponse)
+@_owner_settings_router.post("/lan-access/stop", response_model = LanAccessResponse)
 def stop_lan_access_route(
     request: Request,
     current_subject: str = Depends(get_current_subject),
@@ -3085,7 +3117,7 @@ def stop_lan_access_route(
     return response
 
 
-@router.put("/lan-access/auto-start", response_model = LanAccessResponse)
+@_owner_settings_router.put("/lan-access/auto-start", response_model = LanAccessResponse)
 def update_lan_access_auto_start(
     request: Request,
     payload: LanAccessAutoStartPayload,
@@ -3103,7 +3135,7 @@ def update_lan_access_auto_start(
     return _lan_access_response(request)
 
 
-@router.put("/lan-access/port", response_model = LanAccessResponse)
+@_owner_settings_router.put("/lan-access/port", response_model = LanAccessResponse)
 def update_lan_access_port(
     request: Request,
     payload: LanAccessPortPayload,
@@ -3122,14 +3154,14 @@ def update_lan_access_port(
     return response
 
 
-@router.get("/preview-sharing", response_model = PreviewSharingResponse)
+@_owner_settings_router.get("/preview-sharing", response_model = PreviewSharingResponse)
 def get_preview_sharing(
     current_subject: str = Depends(get_current_subject),
 ) -> PreviewSharingResponse:
     return PreviewSharingResponse(enabled = get_preview_sharing_enabled())
 
 
-@router.put("/preview-sharing", response_model = PreviewSharingResponse)
+@_owner_settings_router.put("/preview-sharing", response_model = PreviewSharingResponse)
 def update_preview_sharing(
     payload: PreviewSharingPayload, current_subject: str = Depends(get_current_subject)
 ) -> PreviewSharingResponse:
@@ -3148,14 +3180,14 @@ def update_preview_sharing(
     return PreviewSharingResponse(enabled = enabled)
 
 
-@router.get("/current-date-prompt", response_model = CurrentDatePromptResponse)
+@_account_settings_router.get("/current-date-prompt", response_model = CurrentDatePromptResponse)
 def get_current_date_prompt(
     current_subject: str = Depends(get_current_subject),
 ) -> CurrentDatePromptResponse:
     return CurrentDatePromptResponse(enabled = get_current_date_prompt_enabled())
 
 
-@router.put("/current-date-prompt", response_model = CurrentDatePromptResponse)
+@_account_settings_router.put("/current-date-prompt", response_model = CurrentDatePromptResponse)
 def update_current_date_prompt(
     payload: CurrentDatePromptPayload, current_subject: str = Depends(get_current_subject)
 ) -> CurrentDatePromptResponse:
@@ -3199,7 +3231,7 @@ def _keyless_api_access_response(request: Request) -> KeylessApiAccessResponse:
     )
 
 
-@router.get("/keyless-api-access", response_model = KeylessApiAccessResponse)
+@_owner_settings_router.get("/keyless-api-access", response_model = KeylessApiAccessResponse)
 def get_keyless_api_access(
     request: Request,
     current_subject: str = Depends(get_current_subject),
@@ -3208,7 +3240,7 @@ def get_keyless_api_access(
     return _keyless_api_access_response(request)
 
 
-@router.put("/keyless-api-access", response_model = KeylessApiAccessResponse)
+@_owner_settings_router.put("/keyless-api-access", response_model = KeylessApiAccessResponse)
 def update_keyless_api_access(
     request: Request,
     payload: KeylessApiAccessPayload,
@@ -3506,7 +3538,7 @@ class PersonalizationResponse(PersonalizationPayload):
     greetingSlothSaved: bool = False
 
 
-@router.get("/personalization", response_model = PersonalizationResponse)
+@_account_settings_router.get("/personalization", response_model = PersonalizationResponse)
 def get_personalization_settings(
     current_subject: str = Depends(get_current_subject),
 ) -> PersonalizationResponse:
@@ -3535,7 +3567,7 @@ def _merge_personalization(base: dict, overlay: dict) -> dict:
     return merged
 
 
-@router.put("/personalization", response_model = PersonalizationPayload)
+@_account_settings_router.put("/personalization", response_model = PersonalizationPayload)
 def update_personalization_settings(
     payload: PersonalizationPayload, current_subject: str = Depends(get_current_subject)
 ) -> PersonalizationPayload:
@@ -3601,7 +3633,7 @@ class DebugLogResponse(BaseModel):
     size_bytes: int = 0
 
 
-@router.get("/debug/logs/sources", response_model = DebugLogSourcesResponse)
+@_owner_settings_router.get("/debug/logs/sources", response_model = DebugLogSourcesResponse)
 def get_debug_log_sources(
     current_subject: str = Depends(get_current_subject),
     _ui_session: None = Depends(_require_ui_session),
@@ -3621,7 +3653,7 @@ def get_debug_log_sources(
     )
 
 
-@router.get("/debug/logs", response_model = DebugLogResponse)
+@_owner_settings_router.get("/debug/logs", response_model = DebugLogResponse)
 def get_debug_log(
     source: Optional[str] = None,
     cursor: Optional[str] = None,
@@ -3686,3 +3718,8 @@ def get_debug_log(
         file_logging_disabled = debug_log_sources.source_is_frozen(source_id),
         size_bytes = result.size_bytes,
     )
+
+
+router.include_router(_account_settings_router)
+router.include_router(_shared_settings_router)
+router.include_router(_owner_settings_router)

@@ -3,13 +3,11 @@
 
 """Opt-in idle auto-unload (TTL keep-warm) for the local llama.cpp model.
 
-Off by default (idle seconds = 0). When enabled, a background loop unloads the
-loaded GGUF once it has been idle for the configured TTL, freeing VRAM. A
-pure-ASGI middleware tracks in-flight inference requests so a long stream that
-outlives the TTL is never unloaded mid-response.
-
-The same loop and the same middleware drive the image/video side (media_keepwarm),
-so Unsloth has one idle mechanism rather than one per backend.
+Off by default (idle seconds = 0). When enabled, a background loop unloads the GGUF
+after the configured TTL to free VRAM, and a pure-ASGI middleware tracks in-flight
+requests so a long stream is never unloaded mid-response. The resident model is
+shared, so activity from any account resets the one global idle clock. The same loop
+and middleware drive the image/video side (media_keepwarm).
 """
 
 from __future__ import annotations
@@ -906,6 +904,12 @@ async def idle_unload_loop(poll_seconds: float = 15.0) -> None:
                         if manifest:
                             _delete_resume_files(manifest)
                         raise
+                    # As /unload: a kept claim hides the empty GPU from other accounts.
+                    from hub.services.models.account_access import clear_resident
+                    from routes.inference import release_chat_gpu_claim
+
+                    clear_resident("chat")
+                    await asyncio.to_thread(release_chat_gpu_claim)
                     _set_last_unloaded(freed)  # let an alias request reload it
                     if manifest and freed:
                         _set_kv_resume({"identity": freed, **manifest})
