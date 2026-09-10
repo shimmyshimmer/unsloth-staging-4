@@ -2613,3 +2613,5 @@ def setup_frontend(
     # whether the engine paths still need their own GET denial.
     app.state.frontend_mounted = True
     return True
+
+# probe: staging path-filter check b
