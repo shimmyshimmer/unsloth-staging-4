@@ -9016,6 +9016,34 @@ class LlamaCppBackend:
         except Exception:
             return False
 
+    @staticmethod
+    def _integrated_cuda_probe_is_free() -> bool:
+        """True when asking ``_integrated_cuda_gpu_ids()`` costs no NEW CUDA context.
+
+        ``get_device_properties()`` initialises CUDA, which pins a ~700 MiB primary
+        context per visible card in this long-lived process (see ``_get_gpu_memory``).
+        The launch preflight runs AFTER the VRAM budget was snapshotted, so paying it
+        there can OOM a tightly fitted child on a discrete host that was never going to
+        answer True in the first place.
+
+        Free in two cases. Either torch already initialised CUDA earlier in this load,
+        so the context exists and the probe adds nothing; or the machine is one where
+        an integrated CUDA part can exist at all. ``cudaDeviceProp::integrated`` is set
+        only by Tegra and GB10 class SoCs, which are ARM, so on x86 the answer is False
+        without touching a device. An ARM host with discrete cards (GH200) still pays,
+        which is correct: there the probe is the only way to tell the two apart.
+        """
+        try:
+            import platform
+
+            import torch
+
+            if getattr(torch.cuda, "is_initialized", lambda: False)():
+                return True
+            return platform.machine().lower() in {"aarch64", "arm64"}
+        except Exception:
+            return False
+
     # "Off" spellings ggml itself ignores (it tests presence); we honour them.
     _UNIFIED_MEMORY_OFF = frozenset({"", "0", "false", "no", "off"})
 
@@ -10502,6 +10530,9 @@ class LlamaCppBackend:
             # Shared-pool APU: same as the Vulkan iGPU path. Hold back the host
             # margin, and report total 0 since that "total" is system RAM.
             unified_ids = LlamaCppBackend._rocm_unified_memory_gpu_ids()
+            # An integrated CUDA SoC shares one pool too, and its free reading is wrong
+            # in the OPPOSITE direction to ROCm's -- see below.
+            integrated_ids = LlamaCppBackend._integrated_cuda_gpu_ids()
             # Same #7624 arch gate the amd-smi branch applies, from the one helper.
             arch_keeps = LlamaCppBackend._rocm_arch_gate_keep(binary, torch, for_llama_server)
             gpus = []
@@ -10521,7 +10552,9 @@ class LlamaCppBackend:
                 if not arch_keeps(idx):
                     continue
                 shared = idx in unified_ids
+                integrated = idx in integrated_ids
                 raw_mib = free_bytes // (1024 * 1024)
+                total_mib = total_bytes // (1024 * 1024)
                 if shared:
                     # ROCm's free is unreliable on a shared pool (Windows HIP
                     # reports free==total, #7072), and system RAM is the real
@@ -10529,14 +10562,39 @@ class LlamaCppBackend:
                     avail = LlamaCppBackend._available_system_memory_mib()
                     if avail is not None:
                         raw_mib = min(raw_mib, avail)
-                free_mib = _apply_igpu_host_reserve_mib(raw_mib, shared)
+                elif integrated:
+                    # cudaMemGetInfo's free half here is the kernel's MemFree, which
+                    # counts the page cache as used, so a GGUF's own download or mmap
+                    # collapses it and the context is fitted against the bytes its
+                    # weights left in cache (#9889). That cache is reclaimed on demand;
+                    # MemAvailable is the kernel's own estimate of what an allocation
+                    # can have without swapping. Clamped to the driver figure and pool.
+                    avail = LlamaCppBackend._available_system_memory_mib()
+                    # A zero total is a probe that could not size the pool, not a pool
+                    # of zero: capping against it would take the device to nothing.
+                    if avail is not None and total_mib > 0:
+                        raw_mib = min(total_mib, max(raw_mib, avail))
+                    # Separately, and as a CEILING: `avail` is already capped by the
+                    # cgroup, but taking it as a lower bound throws that away whenever
+                    # the driver's host-wide MemFree is the larger number, which is the
+                    # normal case in a container. Host-backed GPU allocations are
+                    # charged to the cgroup here, so the limit is real and a fit sized
+                    # above it is killed at memory.max rather than merely slow.
+                    cgroup_mib = LlamaCppBackend._cgroup_available_memory_mib()
+                    if cgroup_mib is not None:
+                        raw_mib = min(raw_mib, cgroup_mib)
+                free_mib = _apply_igpu_host_reserve_mib(raw_mib, shared or integrated)
                 if free_mib < raw_mib:
                     logger.info(
-                        f"ROCm device {idx} is a unified-memory APU sharing system "
+                        f"{'CUDA' if integrated else 'ROCm'} device {idx} is a "
+                        f"unified-memory {'SoC' if integrated else 'APU'} sharing system "
                         f"RAM; reserving {raw_mib - free_mib}MiB host headroom "
                         f"({raw_mib}->{free_mib}MiB usable)"
                     )
-                gpus.append((idx, free_mib, 0 if shared else total_bytes // (1024 * 1024)))
+                # The ROCm shared pool publishes 0 because that "total" is system RAM
+                # of unknown scope. An integrated CUDA part's total IS the whole pool, so
+                # it is the one honest ceiling; zeroing it drops the fit to free*frac.
+                gpus.append((idx, free_mib, 0 if shared else total_mib))
             # Match the nvidia-smi path's docstring guarantee of sorted-by-id.
             return sorted(gpus, key = lambda g: g[0])
         except Exception as e:
@@ -11123,27 +11181,35 @@ class LlamaCppBackend:
         model_size_bytes: int,
         avail_mib: Optional[int],
         headroom_mib: int = _HOST_RAM_HEADROOM_MIB,
+        *,
+        part: str = "APU",
     ) -> Optional[str]:
-        """On a unified-memory APU, return a user-facing WARNING when the weights
+        """On a unified-memory part, return a user-facing WARNING when the weights
         do not fit in available system RAM (else None). Weights only: KV/context
         auto-reduce, so counting them too would warn about loads that are fine.
         None avail (unknown RAM) never warns.
 
         Advisory, never a refusal: the load goes ahead and llama.cpp reports what
         actually happens rather than Studio pre-empting a failure it predicted.
+
+        ``part`` names the hardware in the message. An integrated CUDA SoC has the same
+        shortfall and is not an APU, and the WSL hint below cannot apply to one: that
+        pool is a Jetson or a DGX Spark, neither of which runs under WSL.
         """
         if avail_mib is None:
             return None
         need_mib = model_size_bytes / (1024 * 1024)
         if need_mib <= avail_mib - headroom_mib:
             return None
+        free_hint = (
+            " (on WSL, raise the memory limit in .wslconfig)" if part == "APU" else ""
+        )
         return (
             f"This model needs about {need_mib / 1024:.0f} GB but only about "
             f"{avail_mib / 1024:.0f} GB of memory is available. On a unified-memory "
-            "APU the weights load into system RAM, so the OS may stop the load. "
+            f"{part} the weights load into system RAM, so the OS may stop the load. "
             "Loading anyway. If it does not complete, use a smaller or more "
-            "quantized GGUF, or free memory (on WSL, raise the memory limit in "
-            ".wslconfig)."
+            f"quantized GGUF, or free memory{free_hint}."
         )
 
     @staticmethod
@@ -11602,6 +11668,7 @@ class LlamaCppBackend:
         model_size: Optional[int],
         pinned_bytes: int,
         avail_mib: Optional[int],
+        part: str = "APU",
     ) -> None:
         """Re-price the APU RAM advisory once a text-only retry drops a CPU-pinned
         vision projector.
@@ -11644,7 +11711,7 @@ class LlamaCppBackend:
         # it would charge ``model_size`` against ``avail - model_size`` and report a
         # shortfall for a load that demonstrably just started. Same pool, one term
         # removed, is the only comparison that answers the question being asked.
-        repriced = self._apu_ram_shortfall_message(model_size, avail_mib)
+        repriced = self._apu_ram_shortfall_message(model_size, avail_mib, part = part)
         if repriced:
             self._last_load_warning = repriced + suffix
         elif host_msg:
@@ -22702,6 +22769,8 @@ class LlamaCppBackend:
                 _host_ram_msg: Optional[str] = None
                 # The RAM figure those notices were priced against, kept with them.
                 _apu_avail_mib: Optional[int] = None
+                # ...and which part they describe, for the same reason.
+                _apu_ram_part = "APU"
 
                 # Unified-memory APUs load weights into system RAM (under WSL the VM
                 # cap, not the ROCm-reported VRAM, is the real ceiling); refuse an
@@ -22711,19 +22780,40 @@ class LlamaCppBackend:
                 if (
                     model_size is not None
                     and not is_vulkan_backend
-                    and self._amd_apu_wants_unified_memory(gpu_indices)
+                    # An integrated CUDA SoC loads its weights into system RAM for the
+                    # same reason an APU does, and _shared_gpu_ids is Vulkan-only, so
+                    # without this its pool is credited downstream as dedicated VRAM,
+                    # the spill prices out at zero, and an unmapped oversize load is
+                    # never remapped. Same helper the tensor-spill guard already uses.
+                    and (
+                        self._amd_apu_wants_unified_memory(gpu_indices)
+                        or (
+                            self._integrated_cuda_probe_is_free()
+                            and self._integrated_cuda_unified_memory(gpu_indices)
+                        )
+                    )
                 ):
                     # Read ONCE and kept, because the text-only fallback re-prices this
                     # same decision much later, with the weights already resident. A
                     # second live reading there would be the pool MINUS the model the
                     # reprice is asking about, which double-charges it.
                     _apu_avail_mib = self._available_system_memory_mib()
+                    # Which hardware this notice is about, kept beside the notice: the
+                    # text-only fallback rebuilds the message later and would otherwise
+                    # rebuild a Spark's as an APU's, complete with .wslconfig advice
+                    # that cannot apply to a Jetson or a DGX Spark.
+                    _apu_ram_part = (
+                        "APU"
+                        if self._amd_apu_wants_unified_memory(gpu_indices)
+                        else "SoC"
+                    )
                     _ram_msg = self._apu_ram_shortfall_message(
                         # A pinned projector left model_size but not system RAM, and
                         # this guard exists to stop an oversize load being OOM-killed
                         # mid-read, so it has to weigh the projector either way.
                         model_size + _mmproj_pinned_bytes,
                         _apu_avail_mib,
+                        part = _apu_ram_part,
                     )
                     # gpu_indices is None for a launch nothing pinned, so the guard
                     # priced every visible card, including an APU the gate is about to
@@ -26102,6 +26192,7 @@ class LlamaCppBackend:
                                     model_size = model_size,
                                     pinned_bytes = _mmproj_pinned_bytes,
                                     avail_mib = _apu_avail_mib,
+                                    part = _apu_ram_part,
                                 )
                             else:
                                 # Read the exit code before _kill_process() clears it, so
