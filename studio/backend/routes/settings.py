@@ -14,6 +14,8 @@ from typing import Any, Literal, Optional, get_args
 from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -3601,6 +3603,92 @@ def get_debug_log(
         more_pending = result.more_pending,
         file_logging_disabled = debug_log_sources.source_is_frozen(source_id),
         size_bytes = result.size_bytes,
+    )
+
+
+# One build at a time, process-wide.
+#
+# The route is a sync `def`, so FastAPI runs it in the anyio worker pool -- 40
+# threads, shared with every other sync endpoint in the backend. A build is
+# seconds of CPU, so a handful of concurrent exports starve that pool and every
+# sync route stops answering. anyio cannot cancel a running thread, so the pool
+# does not recover on its own. One user pressing a button needs exactly one
+# build in flight; a second gets told to wait rather than queued behind it.
+_DEBUG_LOG_EXPORT_LOCK = threading.Semaphore(1)
+
+
+@_owner_settings_router.get("/debug/logs/export")
+def export_debug_logs(
+    current_subject: str = Depends(get_current_subject),
+    _ui_session: None = Depends(_require_ui_session),
+) -> StreamingResponse:
+    """Every log the picker lists, redacted, as one ZIP.
+
+    The same two dependencies as the routes above, for the same reason: a
+    bundle of log files and the paths they came from is UI-operator material,
+    so an API-key or keyless caller is refused here too.
+
+    On `_owner_settings_router` for the same reason the single-file viewer and
+    the source list are: that router carries `_require_installation_owner`, and
+    on a shared install a non-owner account must not be handed the host's logs.
+    Registering this on the bare `router` instead would leave the BUNDLE of
+    every log reachable by an account that cannot read a single one of them
+    individually, which is the wrong way round.
+
+    Built before the response exists rather than inside the generator: the
+    archive is bounded by size AND wall clock in debug_log_export, and building
+    eagerly is what lets a failure be a 500 instead of a truncated download.
+    """
+    from utils import debug_log_export
+
+    if not _DEBUG_LOG_EXPORT_LOCK.acquire(blocking = False):
+        raise HTTPException(
+            status_code = 429,
+            detail = "A log export is already running. Wait for it to finish and try again.",
+        )
+    try:
+        archive = debug_log_export.build_log_archive()
+    finally:
+        _DEBUG_LOG_EXPORT_LOCK.release()
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    def _chunks():
+        try:
+            while True:
+                chunk = archive.read(debug_log_export.STREAM_CHUNK_BYTES)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            archive.close()
+
+    return StreamingResponse(
+        _chunks(),
+        media_type = "application/zip",
+        headers = {
+            # Neither shipping caller reads this back: the browser path turns the
+            # response into a Blob and names it with its own local-time stamp, and
+            # the desktop path names the file in Rust. It is here for someone who
+            # hits the route with curl or an address bar, so do not assume the
+            # button honours it.
+            "Content-Disposition": f'attachment; filename="unsloth-logs-{stamp}.zip"',
+            # The browser path fetches this same stable URL and turns the response
+            # into a Blob, so without this the archive is an ordinary cacheable GET.
+            # Two things follow from that, and neither is acceptable for a bundle of
+            # log files: it can sit in the browser's on-disk cache after the user has
+            # deleted the download, and a second export can be answered from that
+            # cache rather than from the logs as they are now, which is exactly the
+            # moment the user is trying to capture. `no-store` rather than `no-cache`
+            # because the file must not be WRITTEN, not merely revalidated.
+            "Cache-Control": "no-store, no-cache, must-revalidate, private",
+            "Pragma": "no-cache",
+        },
+        # Belt and braces with the `finally` above. On a client abort Starlette
+        # cancels the task group without driving the generator to GeneratorExit,
+        # so that `finally` does not run until a cyclic GC pass -- leaving up to
+        # SPOOL_MAX_BYTES per aborted download on the heap for an unbounded time.
+        background = BackgroundTask(archive.close),
     )
 
 
