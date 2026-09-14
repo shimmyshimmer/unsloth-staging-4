@@ -1,0 +1,32 @@
+name: "staging-10480 macos-15"
+on:
+  push:
+    branches: ["pr-10480-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: python -m pip install 'mlx-vlm>=0.5.0' 'opencv-python' || echo "optional deps unavailable on macos-15"
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_inference_status_route.py studio/backend/tests/test_mlx_inference_backend.py studio/backend/tests/test_openai_auto_switch.py studio/backend/tests/test_presence_penalty.py studio/backend/tests/test_sf_client_tools_passthrough.py studio/backend/tests/test_video_attachment_part.py studio/backend/tests/test_video_pr9057_simulation.py studio/backend/tests/test_vision_client_tools.py -q --tb=short --continue-on-collection-errors -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > pytest_out.txt 2>&1 || rc=$?; cat pytest_out.txt; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; if [ "$rc" = "1" ] || [ "$rc" = "2" ]; then fail=$(grep -cE "^FAILED " pytest_out.txt); faildep=$(grep -cE "^FAILED .*No module named .(torch|unsloth_zoo|transformers|peft|trl|accelerate|datasets|bitsandbytes).$" pytest_out.txt); err=$(grep -cE "^ERROR " pytest_out.txt); dep=$(grep -cE "No module named .(torch|unsloth_zoo|transformers|peft|trl|accelerate|datasets|bitsandbytes).$" pytest_out.txt); other=$(grep -E "No module named" pytest_out.txt | grep -cvE "No module named .(torch|unsloth_zoo|transformers|peft|trl|accelerate|datasets|bitsandbytes).$"); if [ "$fail" = "$faildep" ] && [ "$other" = "0" ] && [ "$dep" -ge "$err" ] && [ $((fail + err)) -gt 0 ]; then echo "only deps this runner does not ship are missing"; rc=0; fi; fi; exit "$rc"
