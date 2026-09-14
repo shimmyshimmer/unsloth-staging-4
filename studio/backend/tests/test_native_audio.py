@@ -13,6 +13,52 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import importlib
+import types
+from unittest.mock import MagicMock
+
+
+# core/inference/inference.py imports unsloth, and through it unsloth_zoo, at module scope.
+# This file reaches that module from inside a helper rather than at module scope, so the source
+# scan in test_backend_tests_stub_heavy_imports.py never saw the dependency. The pytest matrix
+# here deliberately does not install unsloth_zoo, so the import only ever succeeded when another
+# file on the same xdist worker had already stubbed unsloth. Sharding the job changed which
+# files share a worker and the luck ran out, so the stub is explicit here now.
+_STUBBED: list[str] = []
+
+
+def _stub_if_missing(name, attrs):
+    """Register a stub module for a dep the backend pytest job does not install.
+
+    Same helper and reason as test_trainer_stdout_quiet.py: core.training.trainer imports
+    unsloth (and through it unsloth_zoo) and trl at module scope, while the pytest matrix in
+    studio-backend-ci.yml installs studio.txt plus torch and transformers and deliberately
+    stops there, because the repo-cpu-tests job beside it is the one that installs
+    unsloth_zoo, for the REPO-ROOT tests/ tree. Unstubbed, this module fails COLLECTION and
+    takes the whole job down. A real install is left alone. __spec__ = None keeps the
+    trainer's own _ensure_real_packages namespace-shadow guard a no-op on the stub.
+    """
+    if name in sys.modules:
+        return
+    try:
+        importlib.import_module(name)
+        return
+    except Exception:  # noqa: BLE001 - unusable here either way, so stub it
+        pass
+    _STUBBED.append(name)
+    mod = types.ModuleType(name)
+    mod.__spec__ = None
+    for attr in attrs:
+        setattr(mod, attr, MagicMock())
+    sys.modules[name] = mod
+    parent, _, child = name.rpartition(".")
+    if parent and parent in sys.modules:
+        setattr(sys.modules[parent], child, mod)
+
+
+_stub_if_missing("unsloth", ("FastLanguageModel", "FastVisionModel", "is_bfloat16_supported"))
+_stub_if_missing("unsloth.chat_templates", ("get_chat_template",))
+
 from core.inference.native_audio import (
     HIGGS_TTS2_CODEC_REPO,
     HIGGS_TTS3_CODEC_REPO,
@@ -27,6 +73,20 @@ from core.inference.native_audio import (
     native_audio_security_targets,
     native_audio_type_from_local_path,
 )
+
+# Bind the dependency the stubs exist for while they still stand, then drop them. Left in
+# place they outlive this module: every file collected after it on the same xdist worker sees
+# "unsloth" already in sys.modules, so its own _stub_if_missing returns before recording
+# ownership and cannot clean up what it did not create. The cost is not hypothetical --
+# utils.hardware.hardware._shared_policy branches on `"unsloth" in sys.modules`, and off a
+# spec-less non-package stub the inner import raises and it returns None, never reaching the
+# find_spec disk fallback below it that loads the real dataset_num_proc.py without importing
+# the package. Same reason and same shape as test_trainer_stdout_quiet.py. A real install
+# stubs nothing, so this is a no-op there.
+import core.inference.inference  # noqa: F401,E402 - imported to bind it under the stubs
+
+for _name in reversed(_STUBBED):
+    sys.modules.pop(_name, None)
 
 
 def _backend(audio_type: str, **entry):
