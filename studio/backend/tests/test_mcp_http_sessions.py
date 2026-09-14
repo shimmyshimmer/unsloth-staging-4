@@ -81,6 +81,12 @@ class RecordingClient:
 
     instances: list["RecordingClient"] = []
 
+    # Class-level: two chats mean two clients, and no single instance sees their overlap.
+    # Reset by the `clients` fixture.
+    live_lock = threading.Lock()
+    live_now = 0
+    live_peak = 0
+
     def __init__(self, url: str, headers, use_oauth: bool):
         self.url = url
         self.headers = headers
@@ -131,6 +137,9 @@ class RecordingClient:
         with self._lock:
             self.live += 1
             self.max_live = max(self.max_live, self.live)
+        with RecordingClient.live_lock:
+            RecordingClient.live_now += 1
+            RecordingClient.live_peak = max(RecordingClient.live_peak, RecordingClient.live_now)
         try:
             if self.call_delay:
                 await asyncio.sleep(self.call_delay)
@@ -140,11 +149,15 @@ class RecordingClient:
         finally:
             with self._lock:
                 self.live -= 1
+            with RecordingClient.live_lock:
+                RecordingClient.live_now -= 1
 
 
 @pytest.fixture
 def clients(monkeypatch):
     RecordingClient.instances = []
+    RecordingClient.live_now = 0
+    RecordingClient.live_peak = 0
     monkeypatch.setattr(
         mcp_client,
         "_client",
@@ -377,7 +390,7 @@ def test_two_http_calls_in_one_chat_run_concurrently(monkeypatch, clients):
     assert len(out) == 2
     assert len(clients) == 1, "the two calls should share one client"
     assert clients[0].max_live == 2, "the server never saw them overlap"
-    assert elapsed < 0.75, f"calls were serialized: {elapsed:.2f}s"
+    assert elapsed < 30.0, f"the parallel batch never came back: {elapsed:.2f}s"
 
 
 def test_two_stdio_calls_in_one_chat_stay_serialized(monkeypatch, clients):
@@ -414,7 +427,9 @@ def test_calls_in_different_chats_run_concurrently(monkeypatch, clients):
     out, elapsed = _parallel(HTTP_URL, [SCOPE, SCOPE_B])
     assert len(out) == 2
     assert len(clients) == 2
-    assert elapsed < 0.75, f"different chats were serialized: {elapsed:.2f}s"
+    # Two clients, so only the class-level peak sees the overlap.
+    assert RecordingClient.live_peak == 2, "different chats were serialized"
+    assert elapsed < 30.0, f"the parallel batch never came back: {elapsed:.2f}s"
 
 
 def test_concurrent_first_calls_publish_one_session(monkeypatch, clients):
@@ -624,11 +639,13 @@ def test_closing_many_sessions_does_not_run_serially(monkeypatch, clients):
     """A popular HTTP server holds a session per chat, and close runs on the
     request thread during an edit or delete."""
     closes = []
+    overlapping = threading.Barrier(6, timeout = 30)
 
     class SlowExit(RecordingClient):
         async def __aexit__(self, *exc):
             closes.append(time.monotonic())
-            await asyncio.sleep(0.4)
+            # A serial close deadlocks here and fails, rather than merely running slowly.
+            await asyncio.to_thread(overlapping.wait)
             return await super().__aexit__(*exc)
 
     monkeypatch.setattr(
@@ -642,7 +659,8 @@ def test_closing_many_sessions_does_not_run_serially(monkeypatch, clients):
     close_mcp_sessions()
     elapsed = time.monotonic() - started
     assert len(closes) == 6
-    assert elapsed < 6 * 0.4 * 0.75, f"closes ran serially: {elapsed:.2f}s"
+    assert not overlapping.broken, "closes ran serially: the six never overlapped"
+    assert elapsed < 60.0, f"close_mcp_sessions never came back: {elapsed:.2f}s"
 
 
 def test_a_slow_but_live_idle_session_survives_the_recheck(monkeypatch, clients):
@@ -674,12 +692,18 @@ def test_evicting_another_scope_does_not_run_on_the_callers_deadline(monkeypatch
     """Whoever happens to trip the cap is mid tool call. The victim belongs to a
     different chat and nobody is waiting on it, so its teardown must not be
     charged to that caller's budget."""
-    monkeypatch.setattr(mcp_client, "_MAX_SESSIONS", 1)
+    tearing_down = threading.Event()
+    release = threading.Event()
     closed = threading.Event()
 
-    class SlowExit(RecordingClient):
+    class HeldExit(RecordingClient):
         async def __aexit__(self, *exc):
-            await asyncio.sleep(1.5)
+            # Held rather than slow: a sleep only has to outlast the assertion, so a
+            # caller that joins the teardown for PART of it still reads as prompt. This
+            # never finishes until the test says so, leaving a caller that waits on it
+            # at all no way to return, so there is no partial wait to get away with.
+            tearing_down.set()
+            await asyncio.get_running_loop().run_in_executor(None, release.wait)
             out = await super().__aexit__(*exc)
             closed.set()
             return out
@@ -687,13 +711,32 @@ def test_evicting_another_scope_does_not_run_on_the_callers_deadline(monkeypatch
     monkeypatch.setattr(
         mcp_client,
         "_client",
-        lambda url, headers, use_oauth = False: SlowExit(url, headers, use_oauth),
+        lambda url, headers, use_oauth = False: HeldExit(url, headers, use_oauth),
     )
+    # The same call with the cap out of the way: a new scope, a connect and one tool call,
+    # differing from the measured call only in that nothing is evicted. Bounding against
+    # it rather than against a clock is what makes "did not pay for the eviction" the
+    # claim; a fixed budget loose enough for a slow runner also passes a caller that
+    # blocked for a second before handing the victim off.
     _call(HTTP_URL, scope = SCOPE)  # fills the cache
+    control_started = time.monotonic()
+    assert _call(HTTP_URL_2, scope = SCOPE) == "call-1"
+    control = time.monotonic() - control_started
+
+    monkeypatch.setattr(mcp_client, "_MAX_SESSIONS", 1)
     started = time.monotonic()
     assert _call(HTTP_URL, scope = SCOPE_B) == "call-1"
     elapsed = time.monotonic() - started
-    assert elapsed < 0.5, f"the caller paid for an unrelated eviction: {elapsed:.2f}s"
+    assert tearing_down.wait(10), "the eviction never started, so nothing was under test"
+    assert not closed.is_set(), "the caller waited out an unrelated eviction"
+    # Generous at 20x over a floor, since the control is sub-millisecond here and small
+    # absolute jitter is a large ratio; still nowhere near the seconds a real stall costs.
+    ceiling = min(max(control * 20, 0.1), mcp_client._SESSION_CLOSE_TIMEOUT / 2)
+    assert elapsed < ceiling, (
+        f"the caller was charged the eviction: {elapsed * 1000:.1f}ms against "
+        f"{control * 1000:.1f}ms for the same call with nothing to evict"
+    )
+    release.set()
     assert closed.wait(10), "the evicted session was never closed"
 
 
