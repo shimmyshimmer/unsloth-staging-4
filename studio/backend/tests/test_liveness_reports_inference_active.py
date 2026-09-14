@@ -27,6 +27,7 @@ CPU-only, no network, no GPU, no weights.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -64,7 +65,25 @@ hw.ensure_hardware_detected = must_not_run
 
 app = FastAPI()
 app.add_api_route("/api/liveness", main.liveness_check, methods = ["GET"])
+
+# A route that does nothing, served by the same app through the same TestClient. The
+# claim here is "liveness costs about what answering costs", and a bare answer is the
+# only honest zero: everything a runner charges the real probe, it charges this too.
+async def _nothing():
+    return {"ok": True}
+
+app.add_api_route("/api/nothing", _nothing, methods = ["GET"])
 client = TestClient(app)
+
+def _control():
+    # Best of several: a ratio is only as tight as its denominator, and one descheduled
+    # control run inflates the budget far more than it inflates the measurement.
+    samples = []
+    for _ in range(5):
+        started = time.perf_counter()
+        client.get("/api/nothing")
+        samples.append(time.perf_counter() - started)
+    return min(samples)
 
 def probe():
     started = time.perf_counter()
@@ -117,6 +136,7 @@ probes["broken"] = probe()
 
 print("RESULT" + json.dumps({
     "probes": probes,
+    "control": _control(),
     "media_import_free": media_import_free,
     "media_modules": list(media_modules),
     "scanned": scanned,
@@ -168,15 +188,48 @@ def test_the_marker_disappears_once_nothing_is_generating():
     )
 
 
+def _watchdog_probe_budget_s() -> float:
+    """The launcher's per-probe HTTP budget, read out of the Rust that owns it.
+
+    A ceiling on this route has to sit under the number the watchdog actually allows, or a
+    regression that makes /api/liveness block for most of a probe passes here while every
+    real probe times out. Derived rather than written down so the two cannot drift apart,
+    the way test_health_answers_within_probe_budget.py derives its own budget.
+    """
+    assert _COMMANDS_RS.is_file(), f"{_COMMANDS_RS} moved; update this guard"
+    match = re.search(
+        r"const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs\((\d+)\)",
+        _COMMANDS_RS.read_text(encoding = "utf-8"),
+    )
+    assert match, "commands.rs no longer sets a whole-seconds probe timeout"
+    return float(match.group(1))
+
+
 def test_the_marker_costs_nothing_to_read():
     """A probe every 15s cannot pay for anything that waits, which is why the route reads
     a registry len() rather than asking the backend what it is doing."""
-    result = _probe()["probes"]
+    measured = _probe()
+    result = measured["probes"]
 
+    # Two bounds, because they answer different questions and neither covers the other.
+    #
+    # The first is the one that matters: liveness against a route in the same app that
+    # only returns a dict. Both pay the same interpreter, the same TestClient and the same
+    # scheduler, so what is left is the route's own work, and a second of new I/O shows up
+    # as a ratio however slow the runner is. Generous at 40x, since the floor here is tens
+    # of microseconds and small absolute jitter is a large ratio.
+    #
+    # The second is the absolute one the watchdog imposes: at or over its per-probe budget
+    # every real probe times out. A relative bound cannot see that, because a control that
+    # somehow took seconds would scale with it.
+    control = measured["control"]
+    relative = max(control * 40, 0.05)
+    ceiling = min(relative, _watchdog_probe_budget_s() / 2)
     for state, sample in result.items():
-        assert sample["elapsed"] < 0.5, (
-            f"/api/liveness took {sample['elapsed']:.2f}s while {state}; it must read the "
-            f"registry rather than wait on the generations in it"
+        assert sample["elapsed"] < ceiling, (
+            f"/api/liveness took {sample['elapsed'] * 1000:.1f}ms while {state}, against "
+            f"{control * 1000:.1f}ms to answer a route that does nothing; it must read "
+            f"the registry rather than wait on the generations in it"
         )
 
 

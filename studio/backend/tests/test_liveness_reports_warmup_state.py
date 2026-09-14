@@ -94,7 +94,24 @@ hw.ensure_hardware_detected = must_not_run
 
 app = FastAPI()
 app.add_api_route("/api/liveness", main.liveness_check, methods = ["GET"])
+
+# A route that does nothing, served by the same app through the same TestClient. The
+# claim here is "liveness costs about what answering costs", and a bare answer is the
+# only honest zero: everything a runner charges the real probe, it charges this too.
+async def _nothing():
+    return {"ok": True}
+
+app.add_api_route("/api/nothing", _nothing, methods = ["GET"])
 client = TestClient(app)
+
+# Best of several: a ratio is only as tight as its denominator, and one descheduled
+# control run inflates the budget far more than it inflates the measurement.
+_controls = []
+for _ in range(5):
+    _c0 = time.perf_counter()
+    client.get("/api/nothing")
+    _controls.append(time.perf_counter() - _c0)
+control = min(_controls)
 
 started = time.perf_counter()
 response = client.get("/api/liveness")
@@ -104,6 +121,7 @@ body = response.json()
 print("RESULT" + json.dumps({
     "status_code": response.status_code,
     "elapsed": elapsed,
+    "control": control,
     "status": body.get("status"),
     "service": body.get("service"),
     "hardware_detecting": body.get("hardware_detecting"),
@@ -219,14 +237,41 @@ def test_a_warm_retired_mid_stage_is_not_reported_as_warming_forever():
     )
 
 
+def _watchdog_probe_budget_s() -> float:
+    """The launcher's per-probe HTTP budget, read out of the Rust that owns it.
+
+    A ceiling on this route has to sit under the number the watchdog actually allows, or a
+    regression that makes /api/liveness block for most of a probe passes here while every
+    real probe times out. Derived rather than written down so the two cannot drift apart,
+    the way test_health_answers_within_probe_budget.py derives its own budget.
+    """
+    assert _COMMANDS_RS.is_file(), f"{_COMMANDS_RS} moved; update this guard"
+    match = re.search(
+        r"const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs\((\d+)\)",
+        _COMMANDS_RS.read_text(encoding = "utf-8"),
+    )
+    assert match, "commands.rs no longer sets a whole-seconds probe timeout"
+    return float(match.group(1))
+
+
 def test_liveness_answers_immediately_and_never_starts_detection():
     """The route exists because health's detection wait is too expensive to probe every
     15s. The stub raises if detection is started, so returning at all proves it was not."""
     result = _probe(settled = False)
 
-    assert result["elapsed"] < 0.5, (
-        f"/api/liveness took {result['elapsed']:.2f}s; it must read the settled snapshot "
-        f"rather than wait for one"
+    # Returning at all is most of the assertion: `must_not_run` raises if detection starts,
+    # and DETECTION_COMPLETE is cleared, so a route awaiting one never returns.
+    #
+    # Two bounds, as in test_liveness_reports_inference_active.py. The relative one is
+    # against a route in the same app that only returns a dict, so what is left after both
+    # pay the same interpreter and scheduler is the route's own work; the absolute one is
+    # the watchdog's, since a control that somehow took seconds would scale with it.
+    relative = max(result["control"] * 40, 0.05)
+    ceiling = min(relative, _watchdog_probe_budget_s() / 2)
+    assert result["elapsed"] < ceiling, (
+        f"/api/liveness took {result['elapsed'] * 1000:.1f}ms against "
+        f"{result['control'] * 1000:.1f}ms to answer a route that does nothing, so it was "
+        "waiting on something rather than reading the snapshot"
     )
     # Still the full port-validation payload the launcher matches on. The key must be
     # present because the launcher reads it; its value is environment-derived and is
