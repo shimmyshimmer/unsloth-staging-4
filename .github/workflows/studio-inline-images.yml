@@ -4,6 +4,8 @@
 name: Inline image compatibility
 
 on:
+  push:
+    branches: [test/inline-images-10954]
   pull_request:
     paths:
       - 'studio/frontend/src/components/assistant-ui/markdown-text.tsx'
