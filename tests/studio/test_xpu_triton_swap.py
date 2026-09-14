@@ -40,23 +40,48 @@ def _load_real_index_env_scrub():
     It is defined below the slice the swap comes from, so it is pulled in separately rather
     than stubbed -- a hand-written copy here would agree with a broken original forever.
     """
+    import ast as _ast
+    import atexit as _atexit
+    import functools as _functools
     import os as _os
+    import shutil as _shutil
+    import subprocess as _subprocess
+    import sys as _sys
+    import tempfile as _tempfile
 
     src = STACK.read_text(encoding = "utf-8")
-    ns: dict = {"os": _os}
+    ns: dict = {
+        "os": _os,
+        "ast": _ast,
+        "atexit": _atexit,
+        "functools": _functools,
+        "shutil": _shutil,
+        "subprocess": _subprocess,
+        "sys": _sys,
+        "tempfile": _tempfile,
+        # Windows-only console suppression, irrelevant to the scrub and the one dependency
+        # of _pip_config_without_sources that is not a module.
+        "_windows_hidden_subprocess_kwargs": dict,
+    }
     for anchor, end, keep in (
         ("_UV_INDEX_ENV_VARS = (", "\n)\n", 2),
-        # _install_env_for_cmd calls both of these, and they resolve from this namespace at CALL time, so omitting
-        # either only shows up as a NameError once a test actually invokes the scrub.
-        ("_PM_POLICY_ENV_VARS = (", "\n)\n", 2),
+        # _install_env_for_cmd calls all of these, and they resolve from this namespace at CALL time, so omitting
+        # any only shows up as a NameError once a test actually invokes the scrub.
+        ("_PM_HASH_ENV_VARS = (", "\n)\n", 2),
+        ("_PM_FORCE_SOURCE_ENV_VARS = (", "\n)\n", 2),
+        # One line, so it ends at the first newline; "\n)\n" would swallow the file.
+        ("_PINNED_PIP_CONFIG_KEEP_KEYS = (", "\n)\n", 2),
+        ("_PINNED_PIP_CONFIG_SECTIONS = (", "\n", 1),
+        ("@functools.lru_cache(maxsize = 1)\ndef _pinned_pip_config_overrides(", "\n\ndef ", 0),
         ("def _relaxed_pip_policy_env(", "\n\ndef ", 0),
+        ("def _is_pip_subcommand(", "\n\ndef ", 0),
         ("def _is_pinned_index_cmd(", "\n\ndef ", 0),
         ("def _install_env_for_cmd(", "\n\ndef ", 0),
     ):
         start = src.index(anchor)
         exec(compile(src[start : src.index(end, start) + keep], str(STACK), "exec"), ns)
     assert "PIP_NO_INDEX" in ns["_UV_INDEX_ENV_VARS"], "extraction lost the pip vars"
-    assert "PIP_REQUIRE_HASHES" in ns["_PM_POLICY_ENV_VARS"], "extraction lost the policy vars"
+    assert "PIP_REQUIRE_HASHES" in ns["_PM_HASH_ENV_VARS"], "extraction lost the hash vars"
     return ns["_install_env_for_cmd"]
 
 
@@ -393,12 +418,27 @@ class TestTheFetchIgnoresTheUsersIndexEnvironment:
         assert var not in env
 
     def test_the_fetch_neutralises_the_pip_config_file(self, monkeypatch, tmp_path):
-        # A pip.conf index-url outranks nothing on the CLI, but no-index in it does.
+        # A pip.conf index-url outranks nothing on the CLI, but no-index in it does, and
+        # devnull is the only spelling that reaches a SITE or GLOBAL file.
         mod, _ = _load(monkeypatch, tmp_path, spec = "pytorch-triton-xpu==3.5.0", generic = "3.7.1")
         mod.__dict__["_ensure_xpu_triton"]()
         env = mod.__dict__["_test_download_envs"][0]
         assert env["PIP_CONFIG_FILE"] == os.devnull
         assert env["UV_NO_CONFIG"] == "1"
+
+    def test_the_fetch_keeps_the_operators_build_policy(self, monkeypatch, tmp_path):
+        # The pin is a wheel, so an only-binary / exclude-newer policy costs it nothing;
+        # only hash enforcement, which no requirement we ship can satisfy, is cleared. The
+        # fetch is `pip download`, so PIP_ONLY_BINARY is the one that decides here.
+        monkeypatch.setenv("PIP_ONLY_BINARY", ":all:")
+        monkeypatch.setenv("UV_EXCLUDE_NEWER", "2024-01-01T00:00:00Z")
+        monkeypatch.setenv("PIP_REQUIRE_HASHES", "1")
+        mod, _ = _load(monkeypatch, tmp_path, spec = "pytorch-triton-xpu==3.5.0", generic = "3.7.1")
+        mod.__dict__["_ensure_xpu_triton"]()
+        env = mod.__dict__["_test_download_envs"][0]
+        assert env["PIP_ONLY_BINARY"] == ":all:"
+        assert env["UV_EXCLUDE_NEWER"] == "2024-01-01T00:00:00Z"
+        assert "PIP_REQUIRE_HASHES" not in env
 
     def test_unrelated_environment_survives(self, monkeypatch, tmp_path):
         # Scrub the index vars, not the environment: HTTPS_PROXY and friends are how a corporate host reaches the index
