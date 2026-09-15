@@ -333,6 +333,21 @@ if ($CompareAgainst) {
                         [void]$rewritten.Add("shortcut $key (rewritten at $($shortcutWrites[$key]))")
                     }
                 }
+                # And the other direction. The loop above walks the CURRENT keys, so a shortcut that
+                # existed after the first install and was deleted by the second was never looked at.
+                # The second collector overwrites shortcuts.json with the final state, so a candidate
+                # that creates an extra shortcut on a fresh install and removes it on reinstall ends
+                # with manifests that match the base and an empty rewrittenOnSecondRun: a false PASS
+                # on a shortcut a user watched disappear.
+                foreach ($key in $beforeKeys) {
+                    # `-contains` on .Keys, not ContainsKey: $shortcutWrites is an
+                    # [ordered]@{}, which is an OrderedDictionary and has Contains rather than
+                    # ContainsKey, and calling the wrong one throws into the catch below and reports
+                    # idempotency as unmeasured.
+                    if (@($shortcutWrites.Keys) -notcontains $key) {
+                        [void]$rewritten.Add("shortcut $key (removed by the second run)")
+                    }
+                }
             } elseif ($shortcuts.Count -gt 0) {
                 # Shortcuts exist now and the first run recorded nothing about them, so the shortcut
                 # half of this measurement did not happen. VOID rather than a silent pass: the

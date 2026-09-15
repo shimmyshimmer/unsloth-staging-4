@@ -1274,3 +1274,57 @@ def test_script_normalisation_does_not_erase_a_changed_port_or_limit(tmp_path: P
     assert cmp.normalise_script("$p = 'C:\\Temp\\unsloth-probe-0a1b2c3d.tmp'") == (
         cmp.normalise_script("$p = 'C:\\Temp\\unsloth-probe-9f8e7d6c.tmp'")
     )
+
+
+def test_a_shortcut_the_second_run_deletes_is_recorded(tmp_path: Path) -> None:
+    """Run, not reasoned about: the collector is driven with a first-run manifest whose shortcut is
+    gone by the second run.
+
+    The idempotency loop walked the CURRENT shortcut keys, so a shortcut that existed after the
+    first install and was deleted by the second was never looked at. The second collector overwrites
+    shortcuts.json with the final state, so a candidate that creates an extra shortcut on a fresh
+    install and removes it on reinstall ended with manifests matching the base and an empty
+    `rewrittenOnSecondRun`: a PASS on a shortcut the user watched disappear.
+    """
+    sys.path.insert(0, str(REPO / "tests" / "_shared"))
+    from unsloth_pwsh_runner import PWSH, run_pwsh  # noqa: PLC0415
+
+    if PWSH is None:
+        pytest.skip("no PowerShell on this host")
+
+    collector = REPO / ".github" / "scripts" / "Collect-InstallerEvidence.ps1"
+    first = tmp_path / "first-run-artifacts.json"
+    first.write_text(
+        json.dumps(
+            {
+                "studioHome": str(tmp_path / "home"),
+                "files": {},
+                "shortcutWrites": {"UserDesktop/Unsloth Studio.lnk": "2026-01-01T00:00:00.0000000Z"},
+                "installId": None,
+                "embeddedId": None,
+            }
+        ),
+        encoding = "utf-8",
+    )
+    out = tmp_path / "evidence"
+    (tmp_path / "home").mkdir()
+    script = f"""
+$ErrorActionPreference = 'Stop'
+& '{collector.as_posix()}' -StudioHome '{(tmp_path / "home").as_posix()}' `
+    -OutDir '{out.as_posix()}' -CompareAgainst '{first.as_posix()}' | Out-Null
+Write-Output 'COLLECTOR-OK'
+"""
+    result = run_pwsh(
+        [PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output = True,
+        text = True,
+        verdict = "COLLECTOR-OK",
+        timeout = 300,
+    )
+    assert "COLLECTOR-OK" in result.stdout, result.stdout + result.stderr
+    artifacts = json.loads((out / "artifacts.json").read_text(encoding = "utf-8-sig"))
+    rewritten = artifacts.get("rewrittenOnSecondRun")
+    assert rewritten is not None, "idempotency was not measured at all"
+    assert any("removed by the second run" in entry for entry in rewritten), (
+        f"a shortcut deleted by the reinstall was not recorded: {rewritten!r}"
+    )
