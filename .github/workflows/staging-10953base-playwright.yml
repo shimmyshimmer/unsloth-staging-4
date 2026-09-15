@@ -1,4 +1,4 @@
-name: "staging-10953 studio-playwright"
+name: "staging-10953base studio-playwright"
 on:
   push:
     branches: ["pr-10953-xplat-ci"]

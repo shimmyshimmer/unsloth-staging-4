@@ -1,4 +1,4 @@
-name: "staging-10953 macos-15"
+name: "staging-10953base windows-latest"
 on:
   push:
     branches: ["pr-10953-xplat-ci"]
@@ -15,7 +15,7 @@ defaults:
     shell: bash
 jobs:
   test:
-    runs-on: macos-15
+    runs-on: windows-latest
     timeout-minutes: 30
     env:
       UNSLOTH_COMPILE_DISABLE: '1'
