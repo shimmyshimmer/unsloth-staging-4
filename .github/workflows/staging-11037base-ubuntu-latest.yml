@@ -1,0 +1,36 @@
+name: "staging-11037-base ubuntu-latest"
+on:
+  push:
+    branches: ["r2j-11037-base-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: python -m pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple 'torch>=2.4,<2.13' 'transformers>=4.57,<5.6' 'unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo' accelerate peft trl datasets tyro sentencepiece protobuf pillow msgspec regex hf_transfer psutil packaging 'numpy<3'
+      - run: python -m pip install triton || echo "optional deps unavailable on ubuntu-latest"
+      - name: The same two suites the head branch runs, on unmodified main
+        run: |
+          PYTHONPATH=studio/backend python -m pytest tests/test_import_fixes_drift.py \
+            tests/utils/test_rope_scaling_drift.py -q --tb=line -rs -p no:cacheprovider
