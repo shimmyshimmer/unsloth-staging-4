@@ -1299,7 +1299,9 @@ def test_a_shortcut_the_second_run_deletes_is_recorded(tmp_path: Path) -> None:
             {
                 "studioHome": str(tmp_path / "home"),
                 "files": {},
-                "shortcutWrites": {"UserDesktop/Unsloth Studio.lnk": "2026-01-01T00:00:00.0000000Z"},
+                "shortcutWrites": {
+                    "UserDesktop/Unsloth Studio.lnk": "2026-01-01T00:00:00.0000000Z"
+                },
                 "installId": None,
                 "embeddedId": None,
             }
@@ -1325,9 +1327,9 @@ Write-Output 'COLLECTOR-OK'
     artifacts = json.loads((out / "artifacts.json").read_text(encoding = "utf-8-sig"))
     rewritten = artifacts.get("rewrittenOnSecondRun")
     assert rewritten is not None, "idempotency was not measured at all"
-    assert any("removed by the second run" in entry for entry in rewritten), (
-        f"a shortcut deleted by the reinstall was not recorded: {rewritten!r}"
-    )
+    assert any(
+        "removed by the second run" in entry for entry in rewritten
+    ), f"a shortcut deleted by the reinstall was not recorded: {rewritten!r}"
 
 
 def _collect(tmp_path: Path, home_names: list[str], first_files: dict) -> list:
@@ -1359,7 +1361,10 @@ def _collect(tmp_path: Path, home_names: list[str], first_files: dict) -> list:
     collector = REPO / ".github" / "scripts" / "Collect-InstallerEvidence.ps1"
     result = run_pwsh(
         [
-            PWSH, "-NoProfile", "-NonInteractive", "-Command",
+            PWSH,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
             f"& '{collector.as_posix()}' -StudioHome '{home.as_posix()}' "
             f"-OutDir '{out.as_posix()}' -CompareAgainst '{first.as_posix()}' | Out-Null; "
             f"Write-Output 'COLLECTOR-OK'",
@@ -1386,9 +1391,9 @@ def test_a_transient_top_level_artifact_is_reported(tmp_path: Path) -> None:
     """
     rewritten = _collect(tmp_path, ["kept"], {"kept": {"present": True}, "gone": {"present": True}})
     assert any("gone (removed by the second run)" == e for e in rewritten), rewritten
-    assert not any(e.startswith("kept ") for e in rewritten), (
-        f"a file present on both runs was reported as a change: {rewritten!r}"
-    )
+    assert not any(
+        e.startswith("kept ") for e in rewritten
+    ), f"a file present on both runs was reported as a change: {rewritten!r}"
 
 
 def test_an_empty_first_run_map_invents_no_phantom_key(tmp_path: Path) -> None:
@@ -1408,18 +1413,18 @@ def test_an_unrelated_label_does_not_restart_the_two_installs() -> None:
     has to look at the label that was just applied; `synchronize` still reads the full list, because
     there no single label was applied.
     """
-    body = (
-        REPO / ".github" / "workflows" / "windows-installer-differential-ci.yml"
-    ).read_text(encoding = "utf-8")
-    gate = body[body.index("name: Skip unless the label asked for it"):]
-    gate = gate[:gate.index("name: Pick the two commits")]
-    assert "github.event.label.name" in gate, (
-        "the gate never reads the label that was applied, so any label restarts two clean installs"
+    body = (REPO / ".github" / "workflows" / "windows-installer-differential-ci.yml").read_text(
+        encoding = "utf-8"
     )
+    gate = body[body.index("name: Skip unless the label asked for it") :]
+    gate = gate[: gate.index("name: Pick the two commits")]
+    assert (
+        "github.event.label.name" in gate
+    ), "the gate never reads the label that was applied, so any label restarts two clean installs"
     assert '[ "$ACTION" = "labeled" ]' in gate, "there is no branch for the labeled event"
     # And the full-list check has to survive for synchronize, or a labelled PR stops being
     # re-measured as it is pushed to.
     assert '"installer-differential"' in gate
-    assert gate.index('[ "$ACTION" = "labeled" ]') < gate.index("grep -q"), (
-        "the full label list is consulted before the labeled branch, so the branch cannot help"
-    )
+    assert gate.index('[ "$ACTION" = "labeled" ]') < gate.index(
+        "grep -q"
+    ), "the full label list is consulted before the labeled branch, so the branch cannot help"
