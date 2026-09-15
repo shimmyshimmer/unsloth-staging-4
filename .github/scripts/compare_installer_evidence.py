@@ -137,6 +137,35 @@ def normalise_line(line: str) -> str:
     return out.rstrip()
 
 
+def normalise_script(text: str) -> list[str]:
+    """A generated script, with only the volatile VALUES rewritten.
+
+    Deliberately not `normalise_transcript`. That one is built for captured console output: it drops
+    blank lines, rstrips every line, and discards lines starting with runner noise like `Run `,
+    `shell: ` or `env:`. Every one of those is destructive applied to a script. Trailing whitespace
+    in a CMD `set` value is part of the value, a dropped blank line changes a here-string, and an
+    echoed line that happens to begin with `Run ` is content. A candidate could change any of them
+    and both sides would still compare equal.
+    """
+    return [
+        # The scratch names, hashes and version strings still have to go: they differ between the
+        # two sides for reasons that are not behaviour. Nothing else is touched, and the line is
+        # kept exactly as it is otherwise, trailing spaces and all.
+        _VERSION_PATTERN.sub(
+            lambda m: f"{m.group(1)}/<version>",
+            _apply_value_normalisers(raw),
+        )
+        for raw in text.splitlines()
+    ]
+
+
+def _apply_value_normalisers(line: str) -> str:
+    out = line
+    for pattern, replacement, _why in _NORMALISERS:
+        out = pattern.sub(replacement, out)
+    return out
+
+
 def normalise_transcript(text: str) -> list[str]:
     lines = []
     for raw in text.splitlines():
@@ -441,8 +470,8 @@ def compare_artifacts(base: dict, head: dict, verdict: Verdict) -> None:
             # python-3.13.0 was normalised away and the lane returned PASS with no note at all,
             # which is the one thing normalisation is supposed to buy back.
             report_version_drift(before["content"], after["content"], f"generated {name}", verdict)
-            b = normalise_transcript(before["content"])
-            a = normalise_transcript(after["content"])
+            b = normalise_script(before["content"])
+            a = normalise_script(after["content"])
             if b != a:
                 verdict.differences.append(
                     f"the generated {name} changed:\n" + "\n".join(_unified(b, a, name))

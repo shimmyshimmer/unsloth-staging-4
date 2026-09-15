@@ -1111,6 +1111,7 @@ def test_a_malformed_artifact_entry_is_void_not_skipped() -> None:
     while nothing about that contract was compared at all. The run then reported agreement. The
     shortcut manifest and the top-level manifests are already validated this way; this one was not.
     """
+
     def side(entry) -> dict:
         return {
             "studioHome": "X",
@@ -1161,8 +1162,51 @@ def test_the_trigger_only_lists_files_this_lane_actually_runs() -> None:
     for script in ("studio/setup.bat", "scripts/uninstall.ps1"):
         if script in paths:
             # Only legitimate if something in the workflow actually invokes it.
-            assert re.search(re.escape(Path(script).name) + r"[^\n]*(&|Start-Process|cmd|-File)", body), (
+            assert re.search(
+                re.escape(Path(script).name) + r"[^\n]*(&|Start-Process|cmd|-File)", body
+            ), (
                 f"{script} starts this workflow but nothing in it runs the file, so a PR that "
                 f"changes only that script gets a PASS from a lane that never read it"
             )
     assert "install.ps1" in paths, "the lane no longer starts on the file it actually measures"
+
+
+def test_generated_scripts_are_not_normalised_like_console_output() -> None:
+    """`normalise_transcript` is built for captured output and destroys script content.
+
+    It drops blank lines, rstrips every line, and discards lines beginning with runner noise such
+    as `Run `, `shell: ` or `env:`. Applied to a generated script each of those hides a real change:
+    trailing whitespace in a CMD `set` value is part of the value, a dropped blank line changes a
+    here-string, and an echoed line starting with `Run ` is content rather than noise.
+    """
+    def side(body: str) -> dict:
+        return {
+            "studioHome": "X",
+            "files": {
+                "unsloth.cmd": {
+                    "foundAt": "home/bin\\unsloth.cmd",
+                    "content": body,
+                    "sha256": "A",
+                    "bom": "none",
+                }
+            },
+            "rewrittenOnSecondRun": [],
+        }
+
+    for before, after, what in (
+        ("set UNSLOTH_HOME=C:\\u \r\n", "set UNSLOTH_HOME=C:\\u\r\n", "a trailing space in a set value"),
+        ("@echo off\n\necho hi\n", "@echo off\necho hi\n", "a dropped blank line"),
+        ("echo Run the installer\n", "echo Run the setup\n", "a line starting with Run"),
+    ):
+        verdict = cmp.Verdict()
+        cmp.compare_artifacts(side(before), side(after), verdict)
+        assert verdict.differences, f"{what} was normalised away and compared equal"
+
+    # And the volatile values must still be normalised, or every run would differ.
+    same = cmp.Verdict()
+    cmp.compare_artifacts(
+        side("echo C:\\Users\\r\\AppData\\Local\\Temp\\unsloth-aaaaaa\\x\n"),
+        side("echo C:\\Users\\r\\AppData\\Local\\Temp\\unsloth-bbbbbb\\x\n"),
+        same,
+    )
+    assert not same.differences, f"a scratch name was not normalised: {same.differences}"
