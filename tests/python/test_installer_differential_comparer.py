@@ -1428,6 +1428,16 @@ def test_an_unrelated_label_does_not_restart_the_two_installs() -> None:
     assert gate.index('[ "$ACTION" = "labeled" ]') < gate.index(
         "grep -q"
     ), "the full label list is consulted before the labeled branch, so the branch cannot help"
+    # And the step gate alone is not enough. Workflow concurrency is evaluated before any job runs,
+    # so an unrelated label took the group and cancelled the installs already in flight however
+    # quickly the step then decided to do nothing. The group has to separate those events.
+    group = body[body.index("concurrency:"):body.index("env:", body.index("concurrency:"))]
+    assert "github.event.label.name" in group, (
+        "the concurrency group does not distinguish the label, so an unrelated label still cancels "
+        "a measurement in progress before this gate can run"
+    )
+    assert "unrelated-label" in group and "cancel-in-progress: true" in group
+
 
 
 def test_installer_output_that_looks_like_a_runner_header_survives() -> None:
@@ -1490,9 +1500,46 @@ def test_a_manual_dispatch_compares_against_the_default_branch() -> None:
     # HEAD~1 may remain only as a last resort, and only with the difference stated. Keyed on the
     # command rather than on the string, which also appears in the comment explaining why it was
     # wrong.
-    if "rev-parse HEAD~1" in step:
-        where = step.index("rev-parse HEAD~1")
-        assert "::warning::" in step[max(0, where - 700):where], (
-            "HEAD~1 is still used without saying that it is the previous commit and not the "
-            "default branch"
+    # Every use of HEAD~1 has to say what it is. Two are legitimate now: the default branch, where
+    # the previous commit IS the intended baseline, and the fallback where the default branch could
+    # not be resolved at all, which is a degradation and says so as a warning.
+    lines = step.splitlines()
+    for i, line in enumerate(lines):
+        if "rev-parse HEAD~1" not in line:
+            continue
+        window = "\n".join(lines[max(0, i - 6):i])
+        assert "::warning::" in window or "previous commit on that branch" in window, (
+            "HEAD~1 is used here without saying that it is the previous commit and not the default "
+            f"branch:\n{window}\n{line}"
         )
+
+
+def test_a_default_branch_run_gets_a_distinct_base() -> None:
+    """The weekly health run and a dispatch from main both have head == the default branch tip.
+
+    Taking the merge base of the default branch with itself yields head, and the same-commit guard
+    then VOIDs the run, so the advertised weekly health run could never reach the measurement jobs.
+    On the default branch the baseline is the previous commit, which is the right question for a run
+    whose job is to show the lane still works.
+    """
+    body = (
+        REPO / ".github" / "workflows" / "windows-installer-differential-ci.yml"
+    ).read_text(encoding = "utf-8")
+    assert "schedule:" in body, "there is no scheduled run any more, so this test is describing"
+    step = body[body.index("name: Pick the two commits"):]
+    step = step[:step.index("- name:", 10)]
+    # Keyed on the message, not on the comparison: the same-commit GUARD tests `$base` = `$head`
+    # too, so asserting on the expression alone is satisfied by the very code this is about.
+    assert "the tip of $DEFAULT_BRANCH" in step, (
+        "nothing notices that the merge base resolved to head, so every scheduled run VOIDs before "
+        "it reaches the measurement jobs"
+    )
+    # And it has to be handled BEFORE the guard that aborts on a same-commit pair.
+    assert step.index("the tip of $DEFAULT_BRANCH") < body.index(
+        "base and head are the same commit"
+    ), "the same-commit guard runs before the default-branch case is handled"
+    # The resolution has to actually change the base, or the guard still fires.
+    after = step[step.index("the tip of $DEFAULT_BRANCH"):]
+    assert "rev-parse HEAD~1" in after[:400], (
+        "the default-branch case is detected and then does not pick a different baseline"
+    )

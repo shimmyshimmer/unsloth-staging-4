@@ -63,7 +63,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # The label is part of the group, not only of the step gate. Workflow concurrency is evaluated
+  # before any job runs, so a step that decides to do nothing still cancelled the measurement that
+  # was in flight: applying any label to a PR whose files match the filter above started a run,
+  # that run took this group, and the installs already going were killed. Label events that are not
+  # `installer-differential` now share a group of their own, so they cancel each other and never a
+  # measurement.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.action == 'labeled' && github.event.label.name != 'installer-differential') && 'unrelated-label' || 'measure' }}
   cancel-in-progress: true
 
 env:
@@ -157,7 +163,14 @@ jobs:
             if [ -z "$base" ]; then
               base="$(git merge-base "origin/$DEFAULT_BRANCH" "$head" 2>/dev/null || true)"
             fi
-            if [ -z "$base" ]; then
+            if [ "$base" = "$head" ]; then
+              # We ARE the default branch: the weekly health run, and a manual dispatch from main.
+              # The merge base of main with main is main, and the same-commit guard below would VOID
+              # every scheduled run, so the baseline here is the previous commit. That is the right
+              # question for a health run, whose job is to show the lane still works.
+              echo "head is the tip of $DEFAULT_BRANCH, so this compares it against the previous commit on that branch"
+              base="$(git rev-parse HEAD~1)"
+            elif [ -z "$base" ]; then
               # Said out loud. HEAD~1 answers a narrower question than this lane claims to, and a
               # reader has to know which one they got.
               echo "::warning::could not resolve $DEFAULT_BRANCH, so this compares against HEAD~1. That is the previous commit, not the default branch, and an installer change older than one commit is present on both sides."
