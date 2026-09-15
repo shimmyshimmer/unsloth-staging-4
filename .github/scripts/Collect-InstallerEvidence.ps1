@@ -315,10 +315,35 @@ if ($CompareAgainst) {
                     [void]$rewritten.Add("$contract (moved from $($b.foundAt) to $($a.foundAt))")
                 }
             }
+            # The whole tree, not only the two contracts. Every top-level name is already in
+            # $files (the `present = $true` entries above), and the contract loop looks at two of
+            # them, so a candidate that creates a file or directory on a fresh install and removes
+            # it on reinstall was invisible: the second collector overwrites artifacts.json with the
+            # post-reinstall tree, so both final manifests match the base and nothing is reported.
+            # Where-Object, because member enumeration over an EMPTY PSObject.Properties yields
+            # $null and @($null) has Count 1. Without the filter a first run that recorded no files
+            # produced one phantom key named '' and every clean run reported it as removed.
+            $beforeFileKeys = @($before.files.PSObject.Properties.Name | Where-Object { $_ })
+            $nowFileKeys = @($files.Keys | Where-Object { $_ })
+            $contractNames = @($contentFiles.Keys)
+            foreach ($name in $beforeFileKeys) {
+                # The contracts are handled above, with their hash, write time and location; adding
+                # them here too would report the same file twice.
+                if ($contractNames -contains $name) { continue }
+                if ($nowFileKeys -notcontains $name) {
+                    [void]$rewritten.Add("$name (removed by the second run)")
+                }
+            }
+            foreach ($name in $nowFileKeys) {
+                if ($contractNames -contains $name) { continue }
+                if ($beforeFileKeys -notcontains $name) {
+                    [void]$rewritten.Add("$name (created by the second run)")
+                }
+            }
             # The shortcuts too. Their properties are compared between the two SIDES elsewhere; this
             # is the other question, whether the second install on ONE side rewrote them.
             if ($before.PSObject.Properties.Name -contains 'shortcutWrites' -and $before.shortcutWrites) {
-                $beforeKeys = @($before.shortcutWrites.PSObject.Properties.Name)
+                $beforeKeys = @($before.shortcutWrites.PSObject.Properties.Name | Where-Object { $_ })
                 foreach ($key in $shortcutWrites.Keys) {
                     if ($beforeKeys -notcontains $key) {
                         # Present now, absent after the first install. A reinstall that CREATES a
@@ -344,7 +369,7 @@ if ($CompareAgainst) {
                     # [ordered]@{}, which is an OrderedDictionary and has Contains rather than
                     # ContainsKey, and calling the wrong one throws into the catch below and reports
                     # idempotency as unmeasured.
-                    if (@($shortcutWrites.Keys) -notcontains $key) {
+                    if (@($shortcutWrites.Keys | Where-Object { $_ }) -notcontains $key) {
                         [void]$rewritten.Add("shortcut $key (removed by the second run)")
                     }
                 }

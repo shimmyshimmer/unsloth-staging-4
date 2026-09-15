@@ -1328,3 +1328,72 @@ Write-Output 'COLLECTOR-OK'
     assert any("removed by the second run" in entry for entry in rewritten), (
         f"a shortcut deleted by the reinstall was not recorded: {rewritten!r}"
     )
+
+
+def _collect(tmp_path: Path, home_names: list[str], first_files: dict) -> list:
+    """Run the collector against a home directory and a hand-made first-run manifest."""
+    sys.path.insert(0, str(REPO / "tests" / "_shared"))
+    from unsloth_pwsh_runner import PWSH, run_pwsh  # noqa: PLC0415
+
+    if PWSH is None:
+        pytest.skip("no PowerShell on this host")
+
+    home = tmp_path / "home"
+    home.mkdir()
+    for name in home_names:
+        (home / name).write_text("x", encoding = "utf-8")
+    first = tmp_path / "first-run-artifacts.json"
+    first.write_text(
+        json.dumps(
+            {
+                "studioHome": str(home),
+                "files": first_files,
+                "shortcutWrites": {},
+                "installId": None,
+                "embeddedId": None,
+            }
+        ),
+        encoding = "utf-8",
+    )
+    out = tmp_path / "evidence"
+    collector = REPO / ".github" / "scripts" / "Collect-InstallerEvidence.ps1"
+    result = run_pwsh(
+        [
+            PWSH, "-NoProfile", "-NonInteractive", "-Command",
+            f"& '{collector.as_posix()}' -StudioHome '{home.as_posix()}' "
+            f"-OutDir '{out.as_posix()}' -CompareAgainst '{first.as_posix()}' | Out-Null; "
+            f"Write-Output 'COLLECTOR-OK'",
+        ],
+        capture_output = True,
+        text = True,
+        verdict = "COLLECTOR-OK",
+        timeout = 300,
+    )
+    assert "COLLECTOR-OK" in result.stdout, result.stdout + result.stderr
+    artifacts = json.loads((out / "artifacts.json").read_text(encoding = "utf-8-sig"))
+    rewritten = artifacts.get("rewrittenOnSecondRun")
+    assert rewritten is not None, "idempotency was not measured at all"
+    return rewritten
+
+
+def test_a_transient_top_level_artifact_is_reported(tmp_path: Path) -> None:
+    """The idempotency loop walked the two content contracts only.
+
+    Every top-level name is already in the manifest, so a candidate that creates a file or directory
+    on a fresh install and removes it on reinstall was invisible: the second collector overwrites
+    artifacts.json with the post-reinstall tree, both final manifests match the base, and the lane
+    reported PASS on an install that left an extra artifact behind.
+    """
+    rewritten = _collect(tmp_path, ["kept"], {"kept": {"present": True}, "gone": {"present": True}})
+    assert any("gone (removed by the second run)" == e for e in rewritten), rewritten
+    assert not any(e.startswith("kept ") for e in rewritten), (
+        f"a file present on both runs was reported as a change: {rewritten!r}"
+    )
+
+
+def test_an_empty_first_run_map_invents_no_phantom_key(tmp_path: Path) -> None:
+    """Member enumeration over an EMPTY `PSObject.Properties` yields `$null`, and `@($null)` has
+    Count 1. Without filtering, a first run that recorded nothing produced one key named `''` and
+    every clean run reported it as removed, which fails a lane that should pass."""
+    rewritten = _collect(tmp_path, [], {})
+    assert not any("removed by the second run" in e for e in rewritten), rewritten
