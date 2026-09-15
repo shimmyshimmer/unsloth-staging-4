@@ -206,7 +206,9 @@ def test_version_drift_is_normalised_but_still_printed(tmp_path: Path) -> None:
     head = _write(tmp_path / "head", transcript = BASELINE.replace("0.12.1", "0.12.4"))
     result = _run(base, head)
     assert result.returncode == 0
-    assert "version drift in the first-run transcript" in result.stdout and "0.12.4" in result.stdout
+    assert (
+        "version drift in the first-run transcript" in result.stdout and "0.12.4" in result.stdout
+    )
 
 
 # ---------------------------------------------------------------------------

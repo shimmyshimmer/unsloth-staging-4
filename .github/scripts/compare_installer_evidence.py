@@ -72,7 +72,12 @@ _NORMALISERS: tuple[tuple[re.Pattern[str], str, str, bool], ...] = (
         "unsloth.cmd, a file whose text this lane treats as a contract",
         True,
     ),
-    (re.compile(r"\\Temp\\[A-Za-z0-9._-]{6,}"), r"\\Temp\\<temp>", "Windows temp directory names", True),
+    (
+        re.compile(r"\\Temp\\[A-Za-z0-9._-]{6,}"),
+        r"\\Temp\\<temp>",
+        "Windows temp directory names",
+        True,
+    ),
     (re.compile(r"\b(pid|PID)[= ]\d+"), r"\1=<pid>", "process ids", False),
     (
         re.compile(r"127\.0\.0\.1:\d+|localhost:\d+"),
@@ -258,7 +263,12 @@ def _unified(
     return diff
 
 
-def compare_transcripts(base: str, head: str, verdict: Verdict, label: str = "transcript") -> None:
+def compare_transcripts(
+    base: str,
+    head: str,
+    verdict: Verdict,
+    label: str = "transcript",
+) -> None:
     base_lines = normalise_transcript(base)
     head_lines = normalise_transcript(head)
     if not base_lines or not head_lines:
@@ -637,10 +647,14 @@ def compare_directories(
     # a user-visible change. Required rather than optional: the step that writes it runs under
     # `if: always()`, so a side that does not have one did not produce the evidence.
     base_second = _load(
-        base_dir / "transcript-second-run.txt", verdict, "the base second-run transcript",
+        base_dir / "transcript-second-run.txt",
+        verdict,
+        "the base second-run transcript",
     )
     head_second = _load(
-        head_dir / "transcript-second-run.txt", verdict, "the head second-run transcript",
+        head_dir / "transcript-second-run.txt",
+        verdict,
+        "the head second-run transcript",
     )
     base_shortcuts = _load(base_dir / "shortcuts.json", verdict, "the base shortcut manifest")
     head_shortcuts = _load(head_dir / "shortcuts.json", verdict, "the head shortcut manifest")
