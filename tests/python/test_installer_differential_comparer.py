@@ -1179,6 +1179,7 @@ def test_generated_scripts_are_not_normalised_like_console_output() -> None:
     trailing whitespace in a CMD `set` value is part of the value, a dropped blank line changes a
     here-string, and an echoed line starting with `Run ` is content rather than noise.
     """
+
     def side(body: str) -> dict:
         return {
             "studioHome": "X",
@@ -1194,7 +1195,11 @@ def test_generated_scripts_are_not_normalised_like_console_output() -> None:
         }
 
     for before, after, what in (
-        ("set UNSLOTH_HOME=C:\\u \r\n", "set UNSLOTH_HOME=C:\\u\r\n", "a trailing space in a set value"),
+        (
+            "set UNSLOTH_HOME=C:\\u \r\n",
+            "set UNSLOTH_HOME=C:\\u\r\n",
+            "a trailing space in a set value",
+        ),
         ("@echo off\n\necho hi\n", "@echo off\necho hi\n", "a dropped blank line"),
         ("echo Run the installer\n", "echo Run the setup\n", "a line starting with Run"),
     ):
