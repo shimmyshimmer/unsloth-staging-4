@@ -15,8 +15,9 @@ the same coverage by a slower route.
 
 from __future__ import annotations
 
-import re
+import copy
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -1543,3 +1544,46 @@ def test_a_default_branch_run_gets_a_distinct_base() -> None:
     assert "rev-parse HEAD~1" in after[:400], (
         "the default-branch case is detected and then does not pick a different baseline"
     )
+
+
+def test_an_empty_shortcut_object_is_void_not_one_compared(tmp_path: Path) -> None:
+    """`{}` is an object, so it survived every shape check and became one `<unnamed>` shortcut.
+
+    Both sides then held the same key with the same absent fields, and the run reported "1 compared,
+    every field equal" and exited zero without a launch contract having been measured. The workflow
+    runs the candidate collector on both legs on purpose, so a schema regression is symmetric and
+    this is the shape it takes.
+    """
+    base = _write(tmp_path / "base", shortcuts = [{}])
+    head = _write(tmp_path / "head", shortcuts = [{}])
+    result = _run(base, head)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "no name and no path" in result.stdout, result.stdout
+
+
+def test_a_shortcut_with_a_name_but_no_launch_contract_is_void(tmp_path: Path) -> None:
+    base = _write(tmp_path / "base", shortcuts = [{"name": "Unsloth Studio.lnk", "root": "UserDesktop"}])
+    head = _write(tmp_path / "head", shortcuts = [{"name": "Unsloth Studio.lnk", "root": "UserDesktop"}])
+    result = _run(base, head)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "none of the launch contract fields" in result.stdout, result.stdout
+
+
+def test_a_content_contract_with_no_content_on_either_side_is_void(tmp_path: Path) -> None:
+    """Both sides listing `launch-studio.ps1` as `{}` compared nothing and passed.
+
+    The asymmetry check is false when neither side has `content`, and the comparison below it is
+    false for the same reason, so the loop fell through with the entry uncompared.
+    """
+    artifacts = copy.deepcopy(ARTIFACTS)
+    artifacts["files"]["launch-studio.ps1"] = {}
+    base = _write(tmp_path / "base", artifacts = artifacts)
+    head = _write(tmp_path / "head", artifacts = copy.deepcopy(artifacts))
+    result = _run(base, head)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "whose text is the contract" in result.stdout, result.stdout
+    # The control: with content present on both sides the same pair is a clean pass, so the new
+    # rule is not simply voiding everything.
+    ok_base = _write(tmp_path / "ok-base")
+    ok_head = _write(tmp_path / "ok-head")
+    assert _run(ok_base, ok_head).returncode == 0

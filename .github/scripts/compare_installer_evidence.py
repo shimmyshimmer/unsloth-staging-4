@@ -321,6 +321,13 @@ _SHORTCUT_FIELDS = (
 )
 
 
+# The two files this lane treats as contracts by their TEXT, kept in step with the collector's
+# $contentFiles (.github/scripts/Collect-InstallerEvidence.ps1). A name here without captured content
+# is VOID rather than skipped, and the list is explicit so adding a third place to the collector
+# without adding it here is visible rather than silent.
+_CONTENT_CONTRACTS = ("launch-studio.ps1", "unsloth.cmd")
+
+
 def _as_list(value) -> list[dict]:
     """ConvertTo-Json unwraps a one-element collection into a bare object.
 
@@ -383,6 +390,24 @@ def compare_shortcuts(base, head, verdict: Verdict) -> None:
                     f"{side} could not read shortcut {_shortcut_key(entry)!r}: {entry['error']}. "
                     f"Two sides that both failed to collect evidence agree with each other and "
                     f"prove nothing."
+                )
+                continue
+            # An entry with no identity and no launch contract is not a shortcut. `{}` survives
+            # `_shape_problem` (it IS an object), `_as_list` counts it as one, and `_shortcut_key`
+            # names it `<unnamed>`, so two empty objects compared equal and the run reported "1
+            # compared, every field equal". The same collector writes both sides, so a schema
+            # regression is symmetric and this is the shape it takes.
+            if not (entry.get("name") or entry.get("path")):
+                verdict.void.append(
+                    f"{side} reported a shortcut with no name and no path, so there is nothing to "
+                    f"identify it by and nothing was measured: {entry!r}"
+                )
+                continue
+            if not any(entry.get(field) for field in _SHORTCUT_FIELDS):
+                verdict.void.append(
+                    f"{side}'s shortcut {_shortcut_key(entry)!r} carries none of the launch contract "
+                    f"fields {list(_SHORTCUT_FIELDS)}, so the contract this lane exists to compare "
+                    f"was never collected"
                 )
     if verdict.is_void:
         return
@@ -483,6 +508,24 @@ def compare_artifacts(base: dict, head: dict, verdict: Verdict) -> None:
                 f" and not an object on {' and '.join(sides)}, so its evidence could not be read"
             )
             continue
+        # The two entries whose CONTENT is the contract. An empty object on both sides made the
+        # asymmetry check below false and the comparison below that false too, so the loop compared
+        # nothing and the run passed. Symmetric malformed evidence is the likely failure mode here,
+        # because the candidate collector writes both manifests.
+        if name in _CONTENT_CONTRACTS and not before.get("error") and not after.get("error"):
+            absent = [
+                side
+                for side, value in (("base", before), ("head", after))
+                if "content" in value and value.get("content") is not None
+            ]
+            if len(absent) != 2:
+                verdict.void.append(
+                    f"{name!r} is one of the files whose text is the contract, and its content was "
+                    f"not captured on "
+                    f"{' or '.join(s for s in ('base', 'head') if s not in absent)}. Nothing was "
+                    f"compared, and two sides that both captured nothing agree with each other."
+                )
+                continue
         if ("content" in before) != ("content" in after):
             # One side captured the text and the other did not. Skipping quietly, which is what
             # happened before, means the file whose content is the whole reason it is in the
