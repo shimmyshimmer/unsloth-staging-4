@@ -1428,3 +1428,71 @@ def test_an_unrelated_label_does_not_restart_the_two_installs() -> None:
     assert gate.index('[ "$ACTION" = "labeled" ]') < gate.index(
         "grep -q"
     ), "the full label list is consulted before the labeled branch, so the branch cannot help"
+
+
+def test_installer_output_that_looks_like_a_runner_header_survives() -> None:
+    """The normaliser dropped any line beginning with `Run `, and the installers print several.
+
+    `transcript.txt` is the child `powershell.exe` stream teed by the workflow
+    (windows-installer-differential-ci.yml:273-274), so GitHub's `Run `, `shell: ` and `env:` step
+    headers never enter it. The rule therefore removed genuine user-visible guidance from both sides,
+    and changing or dropping one of those lines compared equal.
+    """
+    real = [
+        '       Run install.ps1 without --tauri for custom-root shell installs,',
+        "    Run 'setx HIP_VISIBLE_DEVICES 1' and reopen your terminal",
+        '       Run this manually in an Admin terminal:',
+        '  env: the managed environment is ready',
+        '  shell: powershell is what this install used',
+    ]
+    kept = cmp.normalise_transcript("\n".join(real))
+    assert len(kept) == len(real), f"normalisation dropped installer output: {kept!r}"
+    # And a changed one has to show up as a difference.
+    changed = list(real)
+    changed[0] = changed[0].replace("without --tauri", "with --tauri")
+    assert cmp.normalise_transcript("\n".join(real)) != cmp.normalise_transcript("\n".join(changed))
+    # The control: what the runner really injects, at column 0, still goes.
+    assert cmp.normalise_transcript("##[group]Install\n::endgroup::\n##[debug]x") == []
+
+
+def test_the_lines_this_rule_used_to_eat_are_really_in_the_installers() -> None:
+    """The reason the rule was wrong is a fact about the shipped files, so it is asserted rather
+    than described. If these lines ever stop existing the comment above the rule is stale."""
+    found = 0
+    for name in ("install.ps1", "studio/setup.ps1"):
+        text = (REPO / name).read_text(encoding = "utf-8")
+        for line in text.splitlines():
+            if re.search(r'"\s*Run ', line) and ("Write-StudioLine" in line or "substep" in line):
+                found += 1
+    assert found >= 5, (
+        f"only {found} printed lines start with 'Run '; the normaliser comment cites six and needs "
+        f"updating if that changed"
+    )
+
+
+def test_a_manual_dispatch_compares_against_the_default_branch() -> None:
+    """`HEAD~1` answers a narrower question than the input documents.
+
+    `base_ref` advertises "the PR merge base, or main". For a manual dispatch with no input the
+    resolver picked `HEAD~1`, so on a feature branch with more than one commit an installer change
+    older than one commit sat in both trees and the lane reported PASS without ever comparing it
+    against the default branch.
+    """
+    body = (
+        REPO / ".github" / "workflows" / "windows-installer-differential-ci.yml"
+    ).read_text(encoding = "utf-8")
+    step = body[body.index("name: Pick the two commits"):]
+    step = step[:step.index("- name:", 10)]
+    assert "DEFAULT_BRANCH" in step, "the resolver never looks at the default branch"
+    assert "git merge-base FETCH_HEAD" in step or "merge-base \"origin/$DEFAULT_BRANCH\"" in step, (
+        "the manual-dispatch path does not take a merge base against the default branch"
+    )
+    # HEAD~1 may remain only as a last resort, and only with the difference stated. Keyed on the
+    # command rather than on the string, which also appears in the comment explaining why it was
+    # wrong.
+    if "rev-parse HEAD~1" in step:
+        where = step.index("rev-parse HEAD~1")
+        assert "::warning::" in step[max(0, where - 700):where], (
+            "HEAD~1 is still used without saying that it is the previous commit and not the "
+            "default branch"
+        )

@@ -132,6 +132,7 @@ jobs:
         if: steps.gate.outputs.wanted == '1'
         env:
           BASE_INPUT: ${{ inputs.base_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
@@ -146,7 +147,22 @@ jobs:
             # attributes somebody else's merged change to this PR.
             base="$(git merge-base "$PR_BASE" "$head")"
           else
-            base="$(git rev-parse HEAD~1)"
+            # The default branch's merge base, which is what the base_ref input documents. HEAD~1 was
+            # wrong for the case this branch actually serves: a manual dispatch on a feature branch
+            # with more than one commit, where an installer change from an earlier commit is already
+            # in both HEAD and HEAD~1, so the lane compared two trees that share it and reported PASS
+            # without ever testing it against main.
+            git fetch --no-tags origin "$DEFAULT_BRANCH" 2>/dev/null || true
+            base="$(git merge-base FETCH_HEAD "$head" 2>/dev/null || true)"
+            if [ -z "$base" ]; then
+              base="$(git merge-base "origin/$DEFAULT_BRANCH" "$head" 2>/dev/null || true)"
+            fi
+            if [ -z "$base" ]; then
+              # Said out loud. HEAD~1 answers a narrower question than this lane claims to, and a
+              # reader has to know which one they got.
+              echo "::warning::could not resolve $DEFAULT_BRANCH, so this compares against HEAD~1. That is the previous commit, not the default branch, and an installer change older than one commit is present on both sides."
+              base="$(git rev-parse HEAD~1)"
+            fi
           fi
 
           echo "base_sha=$base" >> "$GITHUB_OUTPUT"

@@ -194,20 +194,22 @@ def normalise_transcript(text: str) -> list[str]:
         line = normalise_line(raw)
         if not line.strip():
             continue
-        # Runner-injected noise. These carry the workflow's own group names and the side's SHA, so
-        # they differ between sides for reasons that have nothing to do with the installer.
-        if line.lstrip().startswith(
-            (
-                "##[group]",
-                "##[endgroup]",
-                "::group::",
-                "::endgroup::",
-                "##[debug]",
-                "Run ",
-                "shell: ",
-                "env:",
-            )
-        ):
+        # Runner-injected noise, and ONLY what the runner injects. These carry the workflow's own
+        # group names and the side's SHA, so they differ between sides for nothing to do with the
+        # installer.
+        #
+        # `Run `, `shell: ` and `env:` were in this list and are now gone, because they were never in
+        # the file. The workflow tees the child powershell.exe stream into transcript.txt
+        # (windows-installer-differential-ci.yml:273-274), so GitHub's step headers never reach it,
+        # while the installers print at least six lines that begin with `Run ` once indentation is
+        # stripped: install.ps1:1518 and studio/setup.ps1:2245, :2526, :3073, :3526, :4506. Every one
+        # of those is user-visible guidance on an exercised path, and this rule deleted them from
+        # both sides, so changing or dropping one of them compared equal. Matching a prose prefix is
+        # the wrong shape for this job; if the capture ever widens to include the step's own output,
+        # the honest fix is to narrow the capture, not to delete lines that might be ours.
+        #
+        # Left anchored at column 0: nothing the installers print starts in column 0 with these.
+        if line.startswith(("##[group]", "##[endgroup]", "::group::", "::endgroup::", "##[debug]")):
             continue
         lines.append(line)
     return lines
