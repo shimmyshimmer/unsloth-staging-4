@@ -1397,3 +1397,29 @@ def test_an_empty_first_run_map_invents_no_phantom_key(tmp_path: Path) -> None:
     every clean run reported it as removed, which fails a lane that should pass."""
     rewritten = _collect(tmp_path, [], {})
     assert not any("removed by the second run" in e for e in rewritten), rewritten
+
+
+def test_an_unrelated_label_does_not_restart_the_two_installs() -> None:
+    """`labeled` fires for every label, and the concurrency group cancels in progress.
+
+    Reading the PR's whole label list meant that adding any label to a PR that already carried
+    `installer-differential` evaluated true and started the lane again, which with
+    `cancel-in-progress: true` cancels a measurement that is already running. The `labeled` event
+    has to look at the label that was just applied; `synchronize` still reads the full list, because
+    there no single label was applied.
+    """
+    body = (
+        REPO / ".github" / "workflows" / "windows-installer-differential-ci.yml"
+    ).read_text(encoding = "utf-8")
+    gate = body[body.index("name: Skip unless the label asked for it"):]
+    gate = gate[:gate.index("name: Pick the two commits")]
+    assert "github.event.label.name" in gate, (
+        "the gate never reads the label that was applied, so any label restarts two clean installs"
+    )
+    assert '[ "$ACTION" = "labeled" ]' in gate, "there is no branch for the labeled event"
+    # And the full-list check has to survive for synchronize, or a labelled PR stops being
+    # re-measured as it is pushed to.
+    assert '"installer-differential"' in gate
+    assert gate.index('[ "$ACTION" = "labeled" ]') < gate.index("grep -q"), (
+        "the full label list is consulted before the labeled branch, so the branch cannot help"
+    )

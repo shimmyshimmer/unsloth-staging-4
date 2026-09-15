@@ -92,11 +92,27 @@ jobs:
         id: gate
         env:
           EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          NEW_LABEL: ${{ github.event.label.name }}
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
           set -euo pipefail
           if [ "$EVENT" != "pull_request" ]; then
             echo "wanted=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # On a `labeled` event, the label that was just applied, not the PR's whole list. With the
+          # full list, adding ANY label to a PR that already carries this one started the lane again,
+          # and the concurrency group has cancel-in-progress, so a measurement already running was
+          # cancelled and restarted by an unrelated label. `synchronize` still reads the full list,
+          # because there no single label was applied and the question is whether the PR has opted in.
+          if [ "$ACTION" = "labeled" ]; then
+            if [ "$NEW_LABEL" = "installer-differential" ]; then
+              echo "wanted=1" >> "$GITHUB_OUTPUT"
+            else
+              echo "wanted=0" >> "$GITHUB_OUTPUT"
+              echo "the label just applied is '$NEW_LABEL', not 'installer-differential'; not restarting two clean installs for it"
+            fi
+            exit 0
           fi
           # Two full installs per run, so a pull_request only opts in by label. `synchronize` is in
           # the trigger list so that a labelled PR keeps being re-measured as it is pushed to;
