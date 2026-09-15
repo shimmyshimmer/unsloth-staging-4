@@ -70,9 +70,16 @@ def _write(
     shortcuts = None,
     artifacts = None,
     run = None,
+    second: str | None = None,
 ) -> Path:
     directory.mkdir(parents = True, exist_ok = True)
     (directory / "transcript.txt").write_text(transcript, encoding = "utf-8")
+    # Defaults to the first-run text. The reinstall prints something different on a real runner, but
+    # what these fixtures need is a second-run transcript that exists and that matches its opposite
+    # side unless a test deliberately changes it.
+    (directory / "transcript-second-run.txt").write_text(
+        transcript if second is None else second, encoding = "utf-8"
+    )
     (directory / "shortcuts.json").write_text(
         json.dumps(SHORTCUTS if shortcuts is None else shortcuts), encoding = "utf-8"
     )
@@ -199,7 +206,7 @@ def test_version_drift_is_normalised_but_still_printed(tmp_path: Path) -> None:
     head = _write(tmp_path / "head", transcript = BASELINE.replace("0.12.1", "0.12.4"))
     result = _run(base, head)
     assert result.returncode == 0
-    assert "version drift in the transcript" in result.stdout and "0.12.4" in result.stdout
+    assert "version drift in the first-run transcript" in result.stdout and "0.12.4" in result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +275,7 @@ def test_the_self_test_can_fail() -> None:
     try:
         import re
 
-        cmp._NORMALISERS = original + ((re.compile(r".*"), "", "everything"),)
+        cmp._NORMALISERS = original + ((re.compile(r".*"), "", "everything", True),)
         failures = cmp.self_test()
         assert failures, "a normaliser that erases every line still passed the controls"
         assert any("too loose" in f for f in failures)
@@ -279,8 +286,12 @@ def test_the_self_test_can_fail() -> None:
 def test_every_normaliser_records_why_it_exists() -> None:
     """A rule with no recorded cause is a rule nobody can argue with, and this list is exactly
     where a future 'just make the lane green' change would land."""
-    for pattern, _replacement, why in cmp._NORMALISERS:
+    for pattern, _replacement, why, in_scripts in cmp._NORMALISERS:
         assert why and len(why) > 8, f"the normaliser {pattern.pattern!r} has no stated reason"
+        assert isinstance(in_scripts, bool), (
+            f"the normaliser {pattern.pattern!r} does not say whether it applies to a generated "
+            f"script, and defaulting that wrong is how a behaviour change gets normalised away"
+        )
 
 
 def test_the_shortcut_fields_compared_include_the_launch_contract() -> None:
@@ -1215,3 +1226,49 @@ def test_generated_scripts_are_not_normalised_like_console_output() -> None:
         same,
     )
     assert not same.differences, f"a scratch name was not normalised: {same.differences}"
+
+
+def test_a_reinstall_only_output_change_is_reported(tmp_path: Path) -> None:
+    """The failure mode the second-run transcript exists to catch.
+
+    The workflow has always captured `transcript-second-run.txt` and the comparer never read it, so
+    a candidate that changes what a REINSTALL prints -- the one population every existing user is in
+    -- left the first-run transcripts identical and the artifacts untouched and the lane said PASS.
+    """
+    base = _write(tmp_path / "base")
+    head = _write(tmp_path / "head", second = BASELINE + "\n  warning        already installed\n")
+    result = _run(base, head)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "second-run transcript" in result.stdout
+    assert "already installed" in result.stdout
+
+
+def test_a_missing_second_run_transcript_is_void_not_a_pass(tmp_path: Path) -> None:
+    base = _write(tmp_path / "base")
+    head = _write(tmp_path / "head")
+    (head / "transcript-second-run.txt").unlink()
+    result = _run(base, head)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "second-run transcript" in result.stdout
+
+
+def test_script_normalisation_does_not_erase_a_changed_port_or_limit(tmp_path: Path) -> None:
+    """The transcript rules are wrong for a generated file.
+
+    `<port>` and `<size>` exist because a console transcript reports the port Studio bound and the
+    bytes a download moved. Inside `launch-studio.ps1` the same text is behaviour, and rewriting
+    both sides to the same token made a retargeted health probe and a changed upload limit compare
+    equal.
+    """
+    before = "$url = 'http://127.0.0.1:8888/api/health'\nset LIMIT=10MB\n"
+    after = "$url = 'http://127.0.0.1:9999/api/health'\nset LIMIT=20MB\n"
+    assert cmp.normalise_script(before) != cmp.normalise_script(after)
+    # And the control: the values that DO vary between two installs of two commits still go, or the
+    # lane would report a difference on every clean run.
+    root = "a" * 64
+    assert cmp.normalise_script(f"$expected = '{root}'") == cmp.normalise_script(
+        "$expected = '" + "b" * 64 + "'"
+    )
+    assert cmp.normalise_script("$p = 'C:\\Temp\\unsloth-probe-0a1b2c3d.tmp'") == (
+        cmp.normalise_script("$p = 'C:\\Temp\\unsloth-probe-9f8e7d6c.tmp'")
+    )

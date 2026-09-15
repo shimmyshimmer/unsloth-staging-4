@@ -45,19 +45,21 @@ from pathlib import Path
 # Each entry is (pattern, replacement, why). The `why` is not decoration: the next person to widen
 # one of these needs to know what it was for, and a rule with no recorded cause is a rule nobody can
 # argue with.
-_NORMALISERS: tuple[tuple[re.Pattern[str], str, str], ...] = (
-    (re.compile(r"\b\d+\.\d+s\b"), "<duration>", "elapsed times, printed by every step"),
-    (re.compile(r"\b\d{1,3}(?:\.\d+)?\s?%"), "<percent>", "download progress"),
+_NORMALISERS: tuple[tuple[re.Pattern[str], str, str, bool], ...] = (
+    (re.compile(r"\b\d+\.\d+s\b"), "<duration>", "elapsed times, printed by every step", False),
+    (re.compile(r"\b\d{1,3}(?:\.\d+)?\s?%"), "<percent>", "download progress", False),
     (
         re.compile(r"\b\d+(?:\.\d+)?\s?(?:[KMGT]i?B|bytes)\b", re.I),
         "<size>",
         "download sizes, which differ with a CDN or a patch release",
+        False,
     ),
-    (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*"), "<timestamp>", "timestamps"),
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*"), "<timestamp>", "timestamps", True),
     (
         re.compile(r"\b[0-9a-f]{40}\b|\b[0-9A-F]{64}\b|\b[0-9a-f]{64}\b"),
         "<hash>",
         "commit SHAs and file digests: the two sides are different commits by construction",
+        True,
     ),
     (
         re.compile(r"(\.?unsloth-[A-Za-z][A-Za-z-]*[.-])[0-9a-fA-F]{8}[0-9a-fA-F-]*"),
@@ -68,20 +70,23 @@ _NORMALISERS: tuple[tuple[re.Pattern[str], str, str], ...] = (
         "this replaces matched any six characters after 'unsloth-', which also erased "
         "unsloth-studio-managed-launcher becoming unsloth-desktop-managed-launcher inside "
         "unsloth.cmd, a file whose text this lane treats as a contract",
+        True,
     ),
-    (re.compile(r"\\Temp\\[A-Za-z0-9._-]{6,}"), r"\\Temp\\<temp>", "Windows temp directory names"),
-    (re.compile(r"\b(pid|PID)[= ]\d+"), r"\1=<pid>", "process ids"),
+    (re.compile(r"\\Temp\\[A-Za-z0-9._-]{6,}"), r"\\Temp\\<temp>", "Windows temp directory names", True),
+    (re.compile(r"\b(pid|PID)[= ]\d+"), r"\1=<pid>", "process ids", False),
     (
         re.compile(r"127\.0\.0\.1:\d+|localhost:\d+"),
         "127.0.0.1:<port>",
         "the port Studio bound, which is chosen from what is free",
+        False,
     ),
     (
         re.compile(r"\x1b\[[0-9;?]*[A-Za-z]"),
         "",
         "ANSI sequences, in case a run was not redirected after all",
+        False,
     ),
-    (re.compile(r"[\r\x08]"), "", "carriage returns and backspaces from progress redraws"),
+    (re.compile(r"[\r\x08]"), "", "carriage returns and backspaces from progress redraws", False),
 )
 
 # Volatile only because the two jobs ran minutes apart. A version drift is not a behaviour change,
@@ -128,7 +133,7 @@ def report_version_drift(base: str, head: str, where: str, verdict: "Verdict") -
 
 def normalise_line(line: str) -> str:
     out = line
-    for pattern, replacement, _why in _NORMALISERS:
+    for pattern, replacement, _why, _in_scripts in _NORMALISERS:
         out = pattern.sub(replacement, out)
     out = _VERSION_PATTERN.sub(lambda m: f"{m.group(1)}/<version>", out)
     # Trailing whitespace only. Leading whitespace is load-bearing: `step` pads its label to exactly
@@ -148,8 +153,9 @@ def normalise_script(text: str) -> list[str]:
     and both sides would still compare equal.
     """
     return [
-        # The scratch names, hashes and version strings still have to go: they differ between the
-        # two sides for reasons that are not behaviour. Nothing else is touched, and the line is
+        # The scratch names, the embedded install ID, temp directories, timestamps and version
+        # strings still have to go: they differ between the two sides for reasons that are not
+        # behaviour. Nothing else is touched -- see `_apply_value_normalisers` -- and the line is
         # kept exactly as it is otherwise, trailing spaces and all.
         _VERSION_PATTERN.sub(
             lambda m: f"{m.group(1)}/<version>",
@@ -160,8 +166,19 @@ def normalise_script(text: str) -> list[str]:
 
 
 def _apply_value_normalisers(line: str) -> str:
+    """Only the rules whose fourth field says the value is per-run volatile in a FILE.
+
+    The other rules exist for captured console output and are content in a generated script. A
+    launcher whose health probe moved from port 8888 to 9999, or a `unsloth.cmd` whose upload limit
+    went from 10MB to 20MB, is a behaviour change, and the transcript rules rewrite both sides to
+    the same token and report PASS. What genuinely differs between two installs of two commits is
+    the embedded studio_root_id, the scratch names, the temp directory and any timestamp, so those
+    four are all that a script is normalised for.
+    """
     out = line
-    for pattern, replacement, _why in _NORMALISERS:
+    for pattern, replacement, _why, in_scripts in _NORMALISERS:
+        if not in_scripts:
+            continue
         out = pattern.sub(replacement, out)
     return out
 
@@ -241,23 +258,23 @@ def _unified(
     return diff
 
 
-def compare_transcripts(base: str, head: str, verdict: Verdict) -> None:
+def compare_transcripts(base: str, head: str, verdict: Verdict, label: str = "transcript") -> None:
     base_lines = normalise_transcript(base)
     head_lines = normalise_transcript(head)
     if not base_lines or not head_lines:
         verdict.void.append(
-            "one side's transcript is empty after normalisation, so there is nothing to compare. "
-            "An installer that printed nothing did not run."
+            f"one side's {label} is empty after normalisation, so there is nothing to compare. "
+            f"An installer that printed nothing did not run."
         )
         return
-    report_version_drift(base, head, "transcript", verdict)
+    report_version_drift(base, head, label, verdict)
 
     if base_lines == head_lines:
-        verdict.notes.append(f"transcript: identical over {len(base_lines)} normalised lines")
+        verdict.notes.append(f"{label}: identical over {len(base_lines)} normalised lines")
         return
     verdict.differences.append(
-        "the installer's user-visible output changed:\n"
-        + "\n".join(_unified(base_lines, head_lines, "transcript"))
+        f"the installer's user-visible output changed in the {label}:\n"
+        + "\n".join(_unified(base_lines, head_lines, label))
     )
 
 
@@ -613,6 +630,18 @@ def compare_directories(
 
     base_transcript = _load(base_dir / "transcript.txt", verdict, "the base transcript")
     head_transcript = _load(head_dir / "transcript.txt", verdict, "the head transcript")
+    # The reinstall output, which the workflow has always captured and this comparer never read. A
+    # candidate that changes what the installer prints only when an installation already exists --
+    # a reinstall warning added or dropped, a "nothing to do" line reworded -- leaves the first-run
+    # transcripts identical and the artifacts untouched, so without this the lane reported PASS on
+    # a user-visible change. Required rather than optional: the step that writes it runs under
+    # `if: always()`, so a side that does not have one did not produce the evidence.
+    base_second = _load(
+        base_dir / "transcript-second-run.txt", verdict, "the base second-run transcript",
+    )
+    head_second = _load(
+        head_dir / "transcript-second-run.txt", verdict, "the head second-run transcript",
+    )
     base_shortcuts = _load(base_dir / "shortcuts.json", verdict, "the base shortcut manifest")
     head_shortcuts = _load(head_dir / "shortcuts.json", verdict, "the head shortcut manifest")
     base_artifacts = _load(base_dir / "artifacts.json", verdict, "the base artifact manifest")
@@ -627,7 +656,8 @@ def compare_directories(
     if verdict.is_void:
         return verdict
 
-    compare_transcripts(base_transcript, head_transcript, verdict)
+    compare_transcripts(base_transcript, head_transcript, verdict, "first-run transcript")
+    compare_transcripts(base_second, head_second, verdict, "second-run transcript")
     # Passed through as loaded, not coerced with `or []` / `or {}`. The coercion turned a manifest
     # of the wrong shape into an empty one of the right shape, and an empty manifest against a
     # populated one reads as "every file disappeared" -- a behaviour difference, reported about
