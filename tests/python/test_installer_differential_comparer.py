@@ -1094,11 +1094,75 @@ def test_a_launcher_that_expects_the_wrong_install_id_is_reported() -> None:
 
     good = cmp.Verdict()
     cmp.compare_artifacts(side("a" * 64, "a" * 64), side("b" * 64, "b" * 64), good)
-    assert not good.differences, (
-        f"two healthy installs with different IDs were reported as a difference: {good.differences}"
-    )
+    assert (
+        not good.differences
+    ), f"two healthy installs with different IDs were reported as a difference: {good.differences}"
 
     verdict = cmp.Verdict()
     cmp.compare_artifacts(side("a" * 64, "a" * 64), side("b" * 64, "c" * 64), verdict)
     assert verdict.differences, "a launcher expecting the wrong install ID was not reported"
     assert any("refuse its own backend" in row for row in verdict.differences), verdict.differences
+
+
+def test_a_malformed_artifact_entry_is_void_not_skipped() -> None:
+    """The same collector runs on both legs, so malformed evidence is malformed symmetrically.
+
+    A non-object entry was skipped, which left both file maps non-empty and their key sets matching
+    while nothing about that contract was compared at all. The run then reported agreement. The
+    shortcut manifest and the top-level manifests are already validated this way; this one was not.
+    """
+    def side(entry) -> dict:
+        return {
+            "studioHome": "X",
+            "files": {
+                "launch-studio.ps1": {
+                    "foundAt": "data/launch-studio.ps1",
+                    "content": "a",
+                    "sha256": "A",
+                    "bom": "utf-8",
+                },
+                "unsloth.cmd": entry,
+            },
+            "rewrittenOnSecondRun": [],
+        }
+
+    ok = cmp.Verdict()
+    cmp.compare_artifacts(
+        side({"foundAt": "home/bin\\unsloth.cmd", "content": "b", "sha256": "B", "bom": "none"}),
+        side({"foundAt": "home/bin\\unsloth.cmd", "content": "b", "sha256": "B", "bom": "none"}),
+        ok,
+    )
+    assert not ok.is_void, f"the control voided for an unrelated reason: {ok.void}"
+
+    verdict = cmp.Verdict()
+    cmp.compare_artifacts(side("not-an-object"), side("not-an-object"), verdict)
+    assert verdict.is_void, "symmetrically malformed artifact evidence was reported as agreement"
+    assert verdict.exit_code() == 3, verdict.void
+
+
+def test_the_trigger_only_lists_files_this_lane_actually_runs() -> None:
+    """A workflow that starts on a file it never reads reports PASS about an untested change.
+
+    `studio/setup.bat` and `scripts/uninstall.ps1` were in the trigger while the measurement only
+    invokes `install.ps1`, which hands off to `studio/setup.ps1`. A PR touching either produced
+    identical evidence on both legs, because neither file was ever read, and a green differential
+    lane that did not exercise the change is worse than no lane at all.
+    """
+    import yaml as _yaml
+
+    repo = Path(__file__).resolve().parents[2]
+    path = repo / ".github" / "workflows" / "windows-installer-differential-ci.yml"
+    workflow = _yaml.safe_load(path.read_text(encoding = "utf-8"))
+    # `on` parses as the boolean True in YAML 1.1, which is what PyYAML implements.
+    triggers = workflow.get("on", workflow.get(True))
+    paths = triggers["pull_request"]["paths"]
+
+    body = path.read_text(encoding = "utf-8")
+    for script in ("studio/setup.bat", "scripts/uninstall.ps1"):
+        if script in paths:
+            # Only legitimate if something in the workflow actually invokes it.
+            assert re.search(re.escape(Path(script).name) + r"[^\n]*(&|Start-Process|cmd|-File)", body), (
+                f"{script} starts this workflow but nothing in it runs the file, so a PR that "
+                f"changes only that script gets a PASS from a lane that never read it"
+            )
+    assert "install.ps1" in paths, "the lane no longer starts on the file it actually measures"

@@ -411,6 +411,19 @@ def compare_artifacts(base: dict, head: dict, verdict: Verdict) -> None:
     for name in sorted(set(base_files) & set(head_files)):
         before, after = base_files[name], head_files[name]
         if not isinstance(before, dict) or not isinstance(after, dict):
+            # VOID, not skipped. The SAME collector runs on both legs, so a malformed entry is
+            # malformed identically on both and skipping it left the maps non-empty, the key sets
+            # matching and nothing compared, which the run then reported as agreement. The shortcut
+            # manifest and the top-level manifests are already validated this way.
+            sides = [
+                side
+                for side, value in (("base", before), ("head", after))
+                if not isinstance(value, dict)
+            ]
+            verdict.void.append(
+                f"{name!r} is a {type(before).__name__ if 'base' in sides else type(after).__name__}"
+                f" and not an object on {' and '.join(sides)}, so its evidence could not be read"
+            )
             continue
         if ("content" in before) != ("content" in after):
             # One side captured the text and the other did not. Skipping quietly, which is what

@@ -42,10 +42,15 @@ on:
   pull_request:
     types: [labeled, synchronize]
     paths:
+      # Only what this lane actually runs. The measurement invokes install.ps1, which hands off to
+      # studio/setup.ps1, and nothing here executes studio/setup.bat or scripts/uninstall.ps1 --
+      # a PR touching either used to start this workflow, produce identical evidence on both legs
+      # because neither file was ever read, and report PASS without having tested the change. A
+      # green lane that did not exercise the thing is worse than no lane, so the trigger now
+      # matches the coverage. studio/setup.bat is covered by tests/studio/test_installer_av_shapes.py
+      # and scripts/uninstall.ps1 by tests/studio/test_uninstall_dual_install_icon.ps1.
       - 'install.ps1'
       - 'studio/setup.ps1'
-      - 'studio/setup.bat'
-      - 'scripts/uninstall.ps1'
       - '.github/scripts/Collect-InstallerEvidence.ps1'
       - '.github/scripts/compare_installer_evidence.py'
       - '.github/workflows/windows-installer-differential-ci.yml'
