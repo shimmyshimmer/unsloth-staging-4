@@ -6166,6 +6166,16 @@ _path_has_dir() {
 }
 
 # fish reads none of the POSIX rc files, so an `export` line is a no-op for a fish user: the next session resolves neither uv nor the shim. conf.d is fish's own drop-in directory and fish_add_path is idempotent by design. ~/.config, not XDG_CONFIG_HOME, because that is where astral's installer put its own fish file.
+# Is a conda environment ACTIVE in this shell? Mirrors Test-ActiveCondaEnvironment in
+# install.ps1, including the second variable: CONDA_PREFIX is what `conda activate` and the
+# Anaconda Prompt export, and CONDA_DEFAULT_ENV is read too because a shell hook that
+# exports only that one still leaves the caller inside conda's PATH ordering. Reading one
+# variable on POSIX and two on Windows would give the same user two different answers on
+# two machines. Parity is asserted in tests/python/test_installer_conda_path_guard.py.
+_unsloth_conda_env_active() {
+    [ -n "${CONDA_PREFIX:-}" ] || [ -n "${CONDA_DEFAULT_ENV:-}" ]
+}
+
 _persist_fish_path_dir() {
     _pfp_dir="$1"; _pfp_label="${2:-$1}"
     [ -n "${HOME:-}" ] || return 0
@@ -6174,19 +6184,25 @@ _persist_fish_path_dir() {
     _pfp_file="$_pfp_dir_conf/unsloth.fish"
     # Single-quoted: an unquoted path with a space is two arguments to fish_add_path and neither exists. Inside fish single quotes only \\ and \' carry meaning.
     _pfp_quoted=$(printf '%s' "$_pfp_dir" | sed "s/\\\\/\\\\\\\\/g; s/'/\\\\'/g")
-    # The exact line we would write, not any occurrence of the directory: /opt/uv-old must not pass for /opt/uv, and fish reads none of the POSIX files that would otherwise cover it.
-    if ! grep -v '^[[:space:]]*#' "$_pfp_file" 2>/dev/null | grep -qxF "fish_add_path '$_pfp_quoted'"; then
+    # fish_add_path PREPENDS, and that ordering outlives the conda activation it was written under, so from the next shell on this directory sits ahead of the active conda environment's own entries and conda resolves out of ours (#5871). -a is the same registration at the back. install.ps1 makes the same choice for the Windows registry.
+    _pfp_line="fish_add_path '$_pfp_quoted'"
+    if _unsloth_conda_env_active; then
+        _pfp_line="fish_add_path -a '$_pfp_quoted'"
+    fi
+    # The exact line we would write, not any occurrence of the directory: /opt/uv-old must not pass for /opt/uv, and fish reads none of the POSIX files that would otherwise cover it. BOTH spellings count as present, or a run outside conda would add a second line for a directory a run inside it already registered.
+    if ! grep -v '^[[:space:]]*#' "$_pfp_file" 2>/dev/null \
+        | grep -qxF -e "fish_add_path '$_pfp_quoted'" -e "fish_add_path -a '$_pfp_quoted'"; then
         # Same single-redirect, warning-not-failure contract as the POSIX arm. 2>/dev/null comes FIRST: redirections apply left to right, so the other order prints the shell's own "Permission denied" before the redirect can silence it.
         if {
             echo "# Added by Unsloth installer"
-            echo "fish_add_path '$_pfp_quoted'"
+            echo "$_pfp_line"
         } 2>/dev/null >> "$_pfp_file"; then
             step "path" "added $_pfp_label to PATH in $_pfp_file"
         else
             step "path" "could not write $_pfp_file; add $_pfp_label to PATH yourself" "$C_WARN"
             substep "Unsloth is installed and works; only the PATH line is missing."
             substep "Add this to your fish config to get 'unsloth' in new shells:"
-            substep "  fish_add_path '$_pfp_quoted'"
+            substep "  $_pfp_line"
         fi
     fi
 }
@@ -6217,6 +6233,11 @@ _persist_login_path_dir() {
         _SHELL_PROFILE="$HOME/.profile"
     fi
     [ -n "$_SHELL_PROFILE" ] || return 0
+    # A persisted PREPEND jumps ahead of an active conda environment's own entries in every later shell, and that ordering outlives the activation, so conda ends up resolving binaries and DLLs out of our directory (#5871). Inside one, write the same line as an APPEND: the grep below matches either spelling, so a later run does not add a second line for the same directory. install.ps1 makes the same choice for the Windows registry.
+    _plp_line="export PATH=\"$_plp_literal:\$PATH\""
+    if _unsloth_conda_env_active; then
+        _plp_line="export PATH=\"\$PATH:$_plp_literal\""
+    fi
     # Comments stripped first, then only lines that actually set PATH: a commented-out old export is not an active entry, and neither is `UV_CACHE=/opt/uv` or `PYTHONPATH=/opt/uv`. The name boundary is what keeps PYTHONPATH out. Taking any of them for a PATH entry leaves the next shell with no uv at all.
     if ! grep -v '^[[:space:]]*#' "$_SHELL_PROFILE" 2>/dev/null \
         | grep -E "$_PATH_LINE_RE" | grep -qE "$_plp_pattern"; then
@@ -6224,14 +6245,14 @@ _persist_login_path_dir() {
         if {
             echo ''
             echo '# Added by Unsloth installer'
-            echo "export PATH=\"$_plp_literal:\$PATH\""
+            echo "$_plp_line"
         } 2>/dev/null >> "$_SHELL_PROFILE"; then
             step "path" "added $_plp_label to PATH in $_SHELL_PROFILE"
         else
             step "path" "could not write $_SHELL_PROFILE; add $_plp_label to PATH yourself" "$C_WARN"
             substep "Unsloth is installed and works; only the PATH line is missing."
             substep "Add this to your shell config to get 'unsloth' in new shells:"
-            substep "  export PATH=\"$_plp_literal:\$PATH\""
+            substep "  $_plp_line"
         fi
     fi
 }
