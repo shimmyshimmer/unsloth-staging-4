@@ -14,6 +14,7 @@ import signal
 from loggers import get_logger
 import multiprocessing as mp
 import queue
+import re
 import threading
 import time
 import uuid
@@ -44,6 +45,69 @@ def __getattr__(name: str):
 
 
 logger = get_logger(__name__)
+
+# An absolute path in any of its three spellings: POSIX, a Windows drive, and a UNC share.
+# Not preceded by a word character, a colon or a slash, so a URL and a ratio like 3/4 are
+# left as they were written.
+_ABSOLUTE_PATH_RE = re.compile(
+    r"(?<![\w:/])(?:\\\\[^\\/\s]+[\\/]|[A-Za-z]:[\\/]|/)(?:[\w.\-+@ ]+[\\/])+[\w.\-+@]*"
+)
+
+
+def _shorten_path(match: "re.Match[str]") -> str:
+    """`.../<last component>`, so a traceback still names the file it failed in."""
+    text = match.group(0)
+    tail = text.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    return f".../{tail}" if tail else "..."
+
+
+# A line written by a logger rather than by a crashing runtime. Content reaches stderr
+# through the logger -- `audio_codecs.decode_bicodec` prints the first 500 characters of
+# generated text that way -- while a native abort or a fatal signal writes a bare line.
+_LOG_RECORD_RE = re.compile(
+    r"""^\s*(?:
+        \d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}   # a leading ISO timestamp
+      | \[?(?:DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL)\b
+      | [\w]+(?:\.[\w]+)+\s*:                     # a dotted logger name before the colon
+    )""",
+    re.VERBOSE,
+)
+
+
+def _looks_like_a_log_record(line: str) -> bool:
+    """Whether this stderr line came from the logging stack.
+
+    Deliberately shaped rather than exhaustive. Getting it wrong in one direction drops a
+    diagnostic line from an error message; in the other it forwards someone else's logged
+    content to a client, so the patterns are the ones a log record has and a traceback,
+    a native abort and a fatal-signal line do not. `RuntimeError: boom` has no dot before
+    its colon and is kept.
+    """
+    return bool(_LOG_RECORD_RE.match(line))
+
+
+def _redact_worker_output(text: str) -> str:
+    """Native paths, credentials and absolute paths out of text that leaves this host.
+
+    Three separate redactors because they cover three separate things and none of them
+    subsumes another: `redact_native_paths` knows the leased paths this process handed out,
+    `scrub_secrets` knows what a token looks like, and the path shortener knows nothing but
+    catches the rest of the filesystem layout.
+    """
+    if not text:
+        return ""
+    redacted = text
+    try:
+        from utils.native_path_leases import redact_native_paths
+        redacted = redact_native_paths(redacted)
+    except Exception:  # noqa: BLE001 -- a redactor that cannot run must not lose the others
+        pass
+    try:
+        from hub.utils.download_registry import scrub_secrets
+        redacted = scrub_secrets(redacted)
+    except Exception:  # noqa: BLE001
+        pass
+    return _ABSOLUTE_PATH_RE.sub(_shorten_path, redacted)
 
 
 class _LoadCancelled(Exception):
@@ -228,6 +292,10 @@ class InferenceOrchestrator:
 
     def __init__(self):
         self._proc: Optional[mp.Process] = None
+        # The file the current worker mirrors its stderr into, so a worker that exits without
+        # answering can still be explained. Retired when the next worker is spawned; read by
+        # _worker_stderr_tail long after _proc has been cleared.
+        self._stderr_capture: Any = None
         self._cmd_queue: Any = None
         self._resp_queue: Any = None
         self._subprocess_shutdown_lock = threading.Lock()
@@ -432,6 +500,18 @@ class InferenceOrchestrator:
             else get_hf_cache_paths().child_env({})
         )
 
+        # One sink per worker. Retired here rather than at shutdown: a crash message can be
+        # produced after _shutdown_subprocess has cleared _proc, and the only thing that makes
+        # the previous worker's stderr worthless is a new worker taking its place.
+        self._retire_stderr_capture()
+        try:
+            from utils.worker_stderr import WorkerStderrCapture
+            self._stderr_capture = WorkerStderrCapture(prefix = "unsloth-inference-worker-")
+        except Exception as exc:
+            # No sink is the old behaviour: an exit status with no cause. Never a failed spawn.
+            logger.debug("Could not open a worker stderr mirror: %s", exc)
+            self._stderr_capture = None
+
         with (
             child_environment_for_spawn(cache_env),
             native_path_secret_removed_for_child_start(),
@@ -447,16 +527,22 @@ class InferenceOrchestrator:
             # rely on from here on: snapshotting it after start() would capture the None
             # and lose the only reference to a live child, which is the orphan this
             # change exists to prevent.
+            _child_kwargs: dict = {
+                "cmd_queue": self._cmd_queue,
+                "resp_queue": self._resp_queue,
+                "cancel_event": self._cancel_event,
+                "drain_event": self._drain_event,
+                "config": config,
+            }
+            if self._stderr_capture is not None:
+                from utils.native_path_leases import STDERR_MIRROR_KWARG
+
+                # Consumed by run_without_native_path_secret; it never reaches the entrypoint.
+                _child_kwargs[STDERR_MIRROR_KWARG] = self._stderr_capture.path
             _spawned_proc = _CTX.Process(
                 target = run_without_native_path_secret,
                 args = ("core.inference.worker", "run_inference_process", cache_env),
-                kwargs = {
-                    "cmd_queue": self._cmd_queue,
-                    "resp_queue": self._resp_queue,
-                    "cancel_event": self._cancel_event,
-                    "drain_event": self._drain_event,
-                    "config": config,
-                },
+                kwargs = _child_kwargs,
                 daemon = True,
             )
             self._proc = _spawned_proc
@@ -748,6 +834,78 @@ class InferenceOrchestrator:
 
     def _cleanup(self):
         self._shutdown_subprocess(timeout = 5.0)
+        self._retire_stderr_capture()
+
+    def _retire_stderr_capture(self) -> None:
+        capture = getattr(self, "_stderr_capture", None)
+        if capture is None:
+            return
+        try:
+            capture.close()
+        except Exception:
+            pass
+        self._stderr_capture = None
+
+    def _public_worker_stderr_tail(self) -> str:
+        """The part of the capture that is safe to hand a client, or "".
+
+        The capture is the last lines of the worker's WHOLE lifetime, not of the request
+        that crashed. On a managed multi-user install this message goes out through
+        `GenStreamError(public = True)`, which returns it verbatim instead of reducing it
+        through `safe_error_detail`, so anything another account's request logged in those
+        lines went out with it. `audio_codecs.decode_bicodec` logging the first 500
+        characters of generated text is the concrete case, and it is not the only logger
+        that prints content.
+
+        Two narrowings, and the first is the one that matters. When the capture holds a
+        traceback, only the LAST one is kept, from its `Traceback (most recent call last):`
+        header to the end: that is the crash being reported, and everything before it
+        belongs to earlier work, possibly another account's.
+
+        A native abort writes no traceback at all -- `terminate called after throwing an
+        instance of 'c10::Error'` is the common one and it is the whole diagnosis -- so
+        those lines cannot simply be dropped. What is dropped instead is every line shaped
+        like a LOGGING RECORD: a leading timestamp, a level word, or a dotted logger name
+        before the colon. That is the shape content takes on its way to stderr, because
+        application code prints through the logger, while a native abort and a fatal signal
+        write bare lines. When nothing survives, the message degrades to the exit status
+        alone, which is what it was before this capture existed.
+
+        What survives is then redacted: registered native paths, bearer and HF tokens, and
+        absolute paths shortened to their last component. A traceback's file names are
+        Unsloth's own modules and are what makes the report useful; the directories above
+        them are the operator's layout.
+
+        The unredacted capture is still written to the server log by the caller, where the
+        person reading it owns the filesystem.
+        """
+        raw = self._worker_stderr_tail()
+        if not raw:
+            return ""
+        lines = raw.splitlines()
+        starts = [
+            index
+            for index, line in enumerate(lines)
+            if line.lstrip().startswith("Traceback (most recent call last):")
+        ]
+        if starts:
+            kept = lines[starts[-1] :]
+        else:
+            kept = [line for line in lines if not _looks_like_a_log_record(line)]
+        block = "\n".join(kept).strip()
+        if not block:
+            return ""
+        return _redact_worker_output(block)
+
+    def _worker_stderr_tail(self) -> str:
+        """The end of what the worker wrote to stderr, or "" when nothing was captured."""
+        capture = getattr(self, "_stderr_capture", None)
+        if capture is None:
+            return ""
+        try:
+            return capture.tail()
+        except Exception:
+            return ""
 
     def _ensure_subprocess_alive(self) -> bool:
         return self._proc is not None and self._proc.is_alive()
@@ -770,6 +928,17 @@ class InferenceOrchestrator:
         if exitcode is None:
             return f"{message} Details: pid={pid}."
 
+        # What the worker itself said before it went. A worker that dies from an unhandled
+        # exception has its traceback printed by multiprocessing onto the inherited stderr,
+        # which never passes through the response queue, so without this the user is shown an
+        # exit status and no cause at all (#7843). Empty when nothing was captured, which is
+        # the case for a worker killed outright and for a host where the mirror could not be
+        # installed, and then the message is exactly what it was before.
+        # The PUBLIC tail: this string is returned to the client verbatim on a managed
+        # install. See _public_worker_stderr_tail for what it drops and why.
+        tail = self._public_worker_stderr_tail()
+        details = f"\n\nWorker error output:\n{tail}" if tail else ""
+
         if exitcode < 0:
             signum = -exitcode
             try:
@@ -783,9 +952,12 @@ class InferenceOrchestrator:
                     " This usually means the system killed it under memory pressure. "
                     "Try a smaller model, lower context length, or close other GPU-heavy apps."
                 )
-            return f"{message}{suffix} Details: pid={pid}, signal={sig_name}, exitcode={exitcode}."
+            return (
+                f"{message}{suffix} Details: pid={pid}, signal={sig_name}, "
+                f"exitcode={exitcode}.{details}"
+            )
 
-        return f"{message} Details: pid={pid}, exitcode={exitcode}."
+        return f"{message} Details: pid={pid}, exitcode={exitcode}.{details}"
 
     def _send_cmd(self, cmd: dict) -> None:
         if self._cmd_queue is None:
