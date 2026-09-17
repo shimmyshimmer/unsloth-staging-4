@@ -433,6 +433,271 @@ def _flex_attention_gpu_is_supported():
         return True
 
 
+# ---------------------------------------------------------------------------------------------
+# head_dim > 128: no flash kernel exists, and torch SDPA silently degrades
+# ---------------------------------------------------------------------------------------------
+# SDPA's FLASH and CUDNN backends refuse head_dim > 128. FlashAttention does reach 256, but not
+# where we need it: FA3 goes to 256 on sm90 while its build targets 8.0/9.0a only, so the hub
+# build refuses Blackwell outright, and FA4 does define a dedicated (256, 256) sm100 kernel with a
+# backward, but it is not loadable today (the kernels-community build's metadata fails to parse,
+# and the source path imports flash_attn_2_cuda). Recheck this when FA4 packaging settles.
+# SDPA therefore falls to memory-efficient, which on Blackwell
+# dispatches an *sm80* CUTLASS kernel: 21.2% of the CUDA step on Qwen3.5-2B, 12.9% on 35B-A3B, and
+# 2.2-4.8x slower than an unconstrained kernel. Flex has no head-dim ceiling, and its BlockMask from
+# masking_utils.flex_attention_mask carries causality, the 2D padding mask and packed-sequence
+# boundaries exactly as sdpa_mask does, so no packing correctness is re-implemented here.
+#
+# Affects Qwen3.5 / 3.6 / Qwen3-Next (head_dim 256) and Gemma 4 (256, 512 on its KV-shared
+# layers); head_dim <= 128 (Llama, Qwen2/3, Mistral, gpt-oss) never enters this path.
+_SDPA_FLASH_MAX_HEAD_DIM = 128
+_FLEX_LARGE_HEAD_DIM_ENV_VAR = "UNSLOTH_FLEX_ATTENTION_FOR_LARGE_HEAD_DIM"
+# head_dim > 128 but keeping SDPA. gemma2 measured SLOWER under flex (14.35 vs 13.19 ms fwd+bwd,
+# 4-layer probe): its 4096-token sliding window already bounds the quadratic term, and its real
+# route is models/gemma2.py. gemma3 never reaches here, it picks flex further up the ladder.
+_FLEX_LARGE_HEAD_DIM_EXCLUDED_MODELS = ("gemma2",)
+# Both markers are required: the first routes attention through the interface flex registers into,
+# the second means the mask is a real BlockMask from create_causal_mask, not a dense 4D tensor.
+_FLEX_INTERFACE_MARKERS = ("ALL_ATTENTION_FUNCTIONS", "create_causal_mask")
+_FLEX_SUPPORT_FORCED = set()
+_ATTN_IMPL_MAPPING_SUPPORTED = []
+
+
+def _text_attention_configs(config):
+    """Only the sub-configs driving the decoder's softmax attention.
+
+    A VLM's vision tower is deliberately excluded: its head dim is small so SDPA already reaches a
+    real flash kernel there, and it attends over one chunk per image at a different length every
+    call, which would make flex recompile per shape.
+    """
+    text_config = None
+    getter = getattr(config, "get_text_config", None)
+    if callable(getter):
+        try:
+            text_config = getter()
+        except Exception:
+            text_config = None
+    if text_config is None:
+        text_config = _config_get(config, "text_config", None)
+    if text_config is None:
+        text_config = config
+    return list(_iter_attention_configs(text_config))
+
+
+def _text_attention_head_dim(config):
+    head_dims = []
+    for attention_config in _text_attention_configs(config):
+        head_dims.extend(_collect_attention_head_dims(attention_config))
+    return max(head_dims) if len(head_dims) != 0 else None
+
+
+def _prefers_flex_for_head_dim(config):
+    """True when the decoder's head dim puts every flash kernel out of reach.
+
+    Decided per model from its own config.json: the decoder head dim, and the
+    model_type, are both read from the config, so a model that needs flex gets it
+    without the caller knowing anything about attention backends.
+
+    ON by default for those models. Measured on Qwen3.5-2B, a B200, 40 steps, cold
+    Inductor cache, per-step wall clock:
+
+        seqlen   sdpa steady   flex steady   speedup   extra compile   break-even
+          2048      184.6 ms      189.7 ms     0.97x         +2.2 s      never
+          4096      207.4 ms      201.5 ms     1.03x         +6.9 s    ~1170 steps
+          8192      432.6 ms      237.1 ms     1.82x         +0.7 s      ~step 5
+
+    The 2048 figure is inside the ~3% run-to-run noise floor, so read it as neutral
+    rather than as a regression; the cost there is the one-off compile, not the step.
+    At 8192 the quadratic term dominates and flex repays that compile by ~step 5,
+    which is why the default favours it: the downside is seconds, the upside is 1.8x.
+
+    One caveat the numbers above do not show, because it is a property of the BATCH and
+    not of the config, so this load-time decision cannot see it. What actually costs SDPA
+    the flash kernel above head_dim 128 is being handed an explicit mask, not the head dim
+    itself. Measured on a B200, torch 2.13, head_dim 256, fwd+bwd:
+
+        seqlen   sdpa + mask   sdpa is_causal   flex
+          2048      4.711 ms        0.671 ms   0.838 ms
+          4096     16.877 ms        1.993 ms   2.161 ms
+          8192     63.114 ms        6.782 ms   7.494 ms
+
+    `create_causal_mask` returns None for an unpadded batch, so SDPA gets is_causal=True
+    and reaches `pytorch_flash::flash_fwd_kernel<...256...>`; a padded or packed batch
+    materialises a mask and drops to `fmha_cutlassF...sm80`. So flex is a large win on
+    padded/packed training, which is the common case, and a ~25% loss on attention for a
+    perfectly uniform-length batch. Set the env var to "0" for that case.
+
+    UNSLOTH_FLEX_ATTENTION_FOR_LARGE_HEAD_DIM overrides the config in either
+    direction, "0" to keep SDPA on a short-sequence or unpadded run, "1" to force flex on
+    a model this would otherwise leave alone.
+    """
+    _override = os.environ.get(_FLEX_LARGE_HEAD_DIM_ENV_VAR)
+    if _override is not None and _override.strip() != "":
+        return _override.strip() != "0"
+    for attention_config in _text_attention_configs(config):
+        if (
+            _config_get(attention_config, "model_type", "").lower()
+            in _FLEX_LARGE_HEAD_DIM_EXCLUDED_MODELS
+        ):
+            return False
+    if _config_get(config, "model_type", "").lower() in _FLEX_LARGE_HEAD_DIM_EXCLUDED_MODELS:
+        return False
+    head_dim = _text_attention_head_dim(config)
+    return head_dim is not None and head_dim > _SDPA_FLASH_MAX_HEAD_DIM
+
+
+def _transformers_supports_attn_impl_mapping():
+    """True when Transformers accepts a per-sub-config `attn_implementation` mapping."""
+    if _ATTN_IMPL_MAPPING_SUPPORTED:
+        return _ATTN_IMPL_MAPPING_SUPPORTED[0]
+    supported = False
+    try:
+        from transformers.modeling_utils import PreTrainedModel
+        source = inspect.getsource(PreTrainedModel.set_attn_implementation)
+        supported = "isinstance(attn_implementation, dict)" in source
+    except Exception:
+        supported = False
+    _ATTN_IMPL_MAPPING_SUPPORTED.append(supported)
+    return supported
+
+
+def _text_sub_config(config):
+    """The separate text sub-config, or None when the config is text-only."""
+    getter = getattr(config, "get_text_config", None)
+    if callable(getter):
+        try:
+            text_config = getter()
+        except Exception:
+            text_config = None
+    else:
+        text_config = None
+    if text_config is None:
+        text_config = _config_get(config, "text_config", None)
+    if text_config is config:
+        return None
+    return text_config
+
+
+def _flex_attn_impl_for(config, other_attn_implementation):
+    """`flex_attention` for the decoder, `other_attn_implementation` for every other sub-config.
+
+    Returns None when flex cannot be offered without also changing a sibling sub-config.
+
+    The mapping form needs Transformers 4.57+. Without it there is only one attention
+    implementation for the whole model, so on a multimodal config the plain string would
+    put flex on the VISION tower too. That is a regression, not a fallback: the tower's
+    head dim is small enough that SDPA already reaches a real fused kernel there, and it
+    attends over one chunk per image at a different length every call, which would make
+    flex recompile per shape. Text-only configs have no sibling to damage, so the plain
+    string is correct for them.
+    """
+    text_config = _text_sub_config(config)
+    if not _transformers_supports_attn_impl_mapping():
+        return "flex_attention" if text_config is None else None
+    if text_config is None:
+        return "flex_attention"
+    for field_name, child_config in _config_items(config):
+        if (
+            isinstance(field_name, str)
+            and field_name.endswith("_config")
+            and child_config is text_config
+        ):
+            return {"": other_attn_implementation, field_name: "flex_attention"}
+    return "flex_attention"
+
+
+def _flex_support_anchor_class(model_class):
+    """The architecture's own PreTrainedModel base, where `_supports_flex_attn` belongs.
+
+    Setting it there (rather than on the task head) also covers the inner text model, which
+    Transformers validates separately when an `attn_implementation` mapping is used.
+    """
+    try:
+        from transformers.modeling_utils import PreTrainedModel
+    except Exception:
+        return model_class
+    module_name = getattr(model_class, "__module__", "")
+    anchor = model_class
+    for klass in getattr(model_class, "__mro__", ()):
+        if klass is PreTrainedModel:
+            break
+        if not isinstance(klass, type) or not issubclass(klass, PreTrainedModel):
+            continue
+        # MRO is derived -> base, so the last same-module match is the arch's own base.
+        if getattr(klass, "__module__", "") == module_name:
+            anchor = klass
+    return anchor
+
+
+def _modeling_module_is_interface_based(model_class):
+    import sys
+
+    module = sys.modules.get(getattr(model_class, "__module__", "") or "", None)
+    if module is None:
+        return False
+    try:
+        source = inspect.getsource(module)
+    except Exception:
+        return False
+    return all(marker in source for marker in _FLEX_INTERFACE_MARKERS)
+
+
+def _declares_flex_support(model_class):
+    """The architecture's OWN `_supports_flex_attn`, or None when it only inherits one.
+
+    Read off `vars(klass)` rather than `getattr`, walking the MRO and stopping at
+    Transformers' generic `PreTrainedModel`, because that base declares
+    `_supports_flex_attn = False` for every model in the library. `getattr` therefore
+    reports False for an architecture that simply never mentioned the flag, which is
+    indistinguishable from one that deliberately turned it off.
+    """
+    try:
+        from transformers.modeling_utils import PreTrainedModel
+    except Exception:
+        return None
+    for klass in getattr(model_class, "__mro__", ()):
+        if klass is PreTrainedModel:
+            break
+        if not isinstance(klass, type):
+            continue
+        if "_supports_flex_attn" in vars(klass):
+            return vars(klass)["_supports_flex_attn"]
+    return None
+
+
+def _enable_flex_attention_support(model_class, model_type = ""):
+    """Opt a brand-new architecture into flex_attention that Transformers has not blessed yet.
+
+    Transformers gates flex behind a per-architecture `_supports_flex_attn` flag and raises outright
+    when it is unset, and qwen3_5 / qwen3_5_moe ship with it unset even though their attention is
+    100% the generic interface. Only flipped when the modeling module dispatches through
+    ALL_ATTENTION_FUNCTIONS *and* builds masks with create_causal_mask, so a model that hand-rolls a
+    dense 4D mask is left alone. Returns True when flex is now permitted.
+    """
+    if model_class is None:
+        return False
+    if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0":
+        return False
+    if _is_flex_excluded(str(model_type).lower()):
+        return False
+    if not _modeling_module_is_interface_based(model_class):
+        return False
+    if _declares_flex_support(model_class) is False:
+        # A deliberate opt-out. PreTrainedModel sets _supports_flex_attn = False for everyone,
+        # so False alone means nothing; what counts is the architecture restating it itself.
+        # qwen3_5 / qwen3_5_moe only inherit the default, which is the case this fixes.
+        # T5Gemma2 does restate it, because its custom masks cannot merge under flex.
+        return False
+    anchor = _flex_support_anchor_class(model_class)
+    key = f"{getattr(anchor, '__module__', '')}.{getattr(anchor, '__name__', '')}"
+    if key not in _FLEX_SUPPORT_FORCED:
+        try:
+            anchor._supports_flex_attn = True
+        except Exception:
+            return False
+        _FLEX_SUPPORT_FORCED.add(key)
+    return True
+
+
 def _supports_flex_attention(model_class, config, model_type):
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0":
         return False
@@ -654,16 +919,29 @@ def _disable_flash_attention_if_needed(
         fallback_attn_implementation = "flex_attention"
     else:
         fallback_attn_implementation = "eager"
+    # With no flash kernel above head_dim 128, flex outranks sdpa as the fallback for those models
+    # only. Scoped to the sdpa fallback, so a model already on flex or eager is unaffected.
+    if (
+        fallback_attn_implementation == "sdpa"
+        and supports_flex_attention
+        and _prefers_flex_for_head_dim(config)
+    ):
+        _flex_fallback = _flex_attn_impl_for(config, "sdpa")
+        # None: unofferable (no mapping support, and a sibling sub-config must not switch).
+        if _flex_fallback is not None:
+            fallback_attn_implementation = _flex_fallback
     if _is_flash_attention_requested(requested_attn_implementation) or would_use_flash_attention:
         logged_attn_implementation = (
             requested_attn_implementation
             if _is_flash_attention_requested(requested_attn_implementation)
             else "flash_attention_2"
         )
+        # A per-sub-config mapping is a dict, which is unhashable and reads badly in the message.
+        fallback_label = _attn_impl_label(fallback_attn_implementation)
         warning_key = (
             model_type,
             logged_attn_implementation,
-            fallback_attn_implementation,
+            fallback_label,
             disable_reason,
         )
         if warning_key not in _FLASH_ATTENTION_DISABLED_WARNED:
@@ -671,17 +949,45 @@ def _disable_flash_attention_if_needed(
             print(
                 f"Unsloth: `{logged_attn_implementation}` is not supported "
                 f"for `{model_type}` because {disable_reason} - "
-                f"defaulting to `{fallback_attn_implementation}`."
+                f"defaulting to `{fallback_label}`."
             )
 
     return _set_attn_impl(config, fallback_attn_implementation)
 
 
+def _attn_impl_label(impl):
+    """A printable, hashable name for an attention implementation, which may be a mapping."""
+    if isinstance(impl, dict):
+        named = [v for k, v in impl.items() if k != ""]
+        if len(set(named)) == 1:
+            return named[0]
+        return ", ".join(f"{k or 'default'}={v}" for k, v in impl.items())
+    return impl
+
+
+def _write_attn_impl(config, impl):
+    _config_set(config, "_attn_implementation", impl)
+    if isinstance(config, dict) or hasattr(config, "attn_implementation"):
+        _config_set(config, "attn_implementation", impl)
+
+
 def _set_attn_impl(config, impl):
-    if config is not None:
-        _config_set(config, "_attn_implementation", impl)
-        if isinstance(config, dict) or hasattr(config, "attn_implementation"):
-            _config_set(config, "attn_implementation", impl)
+    if config is None:
+        return impl
+    if isinstance(impl, dict):
+        # Per-sub-config mapping. `""` is Transformers' key for the top level and every sub-config
+        # not named explicitly, so mirror that when writing it onto the config objects.
+        default_impl = impl.get("")
+        if default_impl is not None:
+            _write_attn_impl(config, default_impl)
+        for field_name, sub_impl in impl.items():
+            if field_name == "":
+                continue
+            sub_config = _config_get(config, field_name, None)
+            if sub_config is not None:
+                _write_attn_impl(sub_config, sub_impl)
+        return impl
+    _write_attn_impl(config, impl)
     return impl
 
 
@@ -822,6 +1128,16 @@ def resolve_attention_implementation(
         and not _is_flash_excluded(model_type)
     )
     supports_flex_attention = _supports_flex_attention(model_class, config, model_type)
+    # A decoder head dim above 128 leaves NO flash kernel reachable (SDPA's FLASH and CUDNN backends
+    # both cap at 128, FA3 has no sm100 build, FA4's sm100 path asserts head_dim <= 128), so SDPA
+    # silently drops to its sm80 CUTLASS memory-efficient kernel. Flex has no such ceiling, so opt
+    # the architecture into it even when Transformers has not blessed it yet -- the flag is unset on
+    # brand-new archs (qwen3_5, qwen3_5_moe) whose attention is nonetheless 100% the generic
+    # interface. Done before the ladder because every branch below reads supports_flex_attention.
+    prefers_flex_for_head_dim = _prefers_flex_for_head_dim(config)
+    if prefers_flex_for_head_dim and not supports_flex_attention:
+        if _enable_flex_attention_support(model_class, model_type):
+            supports_flex_attention = _supports_flex_attention(model_class, config, model_type)
     disable_reason = _get_flash_attention_disable_reason(config)
     float32_is_only_disable_reason = disable_reason is None and dtype is torch.float32
     if float32_is_only_disable_reason:
@@ -855,6 +1171,17 @@ def resolve_attention_implementation(
                 disable_reason = disable_reason,
                 honor_config_attn_implementation = not float32_is_only_disable_reason,
             )
+        elif prefers_flex_for_head_dim and supports_flex_attention:
+            # head_dim > 128: SDPA has no flash kernel here and falls back to the sm80 CUTLASS
+            # memory-efficient one, so flex outranks sdpa. Scoped to the decoder, leaving a VLM's
+            # vision tower (small head dim, variable chunk lengths) on its existing backend.
+            _flex_impl = _flex_attn_impl_for(config, "sdpa" if supports_sdpa else "eager")
+            if _flex_impl is None:
+                # Cannot scope flex to the decoder on this Transformers version without
+                # also moving a sibling sub-config. Stay on the existing backend.
+                attn_impl = _set_attn_impl(config, "sdpa" if supports_sdpa else "eager")
+            else:
+                attn_impl = _set_attn_impl(config, _flex_impl)
         elif supports_sdpa:
             attn_impl = _set_attn_impl(config, "sdpa")
         elif supports_flex_attention:
