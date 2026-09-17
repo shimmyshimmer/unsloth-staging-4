@@ -1,0 +1,138 @@
+name: "studio-11102 browsers ubuntu-latest"
+on:
+  push:
+    branches: ["pr-11102-studiobrowsers-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  studio-browsers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/_studio_home
+      UNSLOTH_SKIP_AUTOSTART: '1'
+      UNSLOTH_NO_TORCH: '1'
+      UNSLOTH_COMPILE_DISABLE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Playwright engines
+        run: |
+          python -m pip install 'playwright<2'
+          python -m playwright install chromium firefox webkit
+      - name: Playwright system deps (Linux only)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: python -m playwright install-deps chromium firefox webkit
+      # `pip install -e .` is NOT an install: `unsloth studio` then exits with "Unsloth Studio
+      # not set up. Run install.sh first." The venv, the frontend build and the launcher under
+      # $UNSLOTH_STUDIO_HOME/bin all come from the installer, which is also the thing a user
+      # actually runs. --no-torch keeps it to the GGUF-only path, which is all a GPU-less
+      # runner can host.
+      - name: Install Studio (install.sh --local)
+        if: runner.os != 'Windows'
+        timeout-minutes: 45
+        run: ./install.sh --local --no-torch
+      - name: Install Studio (install.ps1 -Local)
+        if: runner.os == 'Windows'
+        timeout-minutes: 45
+        shell: pwsh
+        run: ./install.ps1 -Local -NoTorch
+      - name: Launch Studio
+        run: |
+          BIN="$UNSLOTH_STUDIO_HOME/bin/unsloth"
+          [ -x "$BIN" ] || BIN="$UNSLOTH_STUDIO_HOME/bin/unsloth.exe"
+          [ -x "$BIN" ] || BIN="$(command -v unsloth || true)"
+          echo "launcher: $BIN"
+          [ -n "$BIN" ] || { echo "::error::no unsloth launcher after install"; ls -R "$UNSLOTH_STUDIO_HOME" | head -50; exit 1; }
+          # A detached Studio logs every request to stdout, so a pipe whose reader dies makes
+          # logging endpoints 500 on an otherwise healthy server. Redirect to a FILE.
+          nohup "$BIN" studio -H 127.0.0.1 -p 8888 > studio.log 2>&1 &
+          for i in $(seq 1 90); do
+            curl -sf http://127.0.0.1:8888/healthz > /dev/null && break
+            sleep 4
+          done
+          curl -sf http://127.0.0.1:8888/healthz || { echo "::error::studio never came up"; tail -80 studio.log; exit 1; }
+          ls -la "$UNSLOTH_STUDIO_HOME/auth" || true
+      - name: Drive Studio in chromium
+        continue-on-error: true
+        run: |
+          python .github/scripts/studio_browser_drive.py \
+            --base-url http://127.0.0.1:8888 --browser chromium \
+            --out logs/pw --password-file "${{ github.workspace }}/_studio_home/auth/.bootstrap_password"
+      - name: Drive Studio in firefox
+        continue-on-error: true
+        run: |
+          python .github/scripts/studio_browser_drive.py \
+            --base-url http://127.0.0.1:8888 --browser firefox \
+            --out logs/pw --password-file "${{ github.workspace }}/_studio_home/auth/.bootstrap_password"
+      - name: Drive Studio in webkit
+        continue-on-error: true
+        run: |
+          python .github/scripts/studio_browser_drive.py \
+            --base-url http://127.0.0.1:8888 --browser webkit \
+            --out logs/pw --password-file "${{ github.workspace }}/_studio_home/auth/.bootstrap_password"
+      - name: Drive Studio in chrome
+        continue-on-error: true
+        run: |
+          python .github/scripts/studio_browser_drive.py \
+            --base-url http://127.0.0.1:8888 --browser chrome \
+            --out logs/pw --password-file "${{ github.workspace }}/_studio_home/auth/.bootstrap_password"
+      - name: Drive Studio in msedge
+        continue-on-error: true
+        run: |
+          python .github/scripts/studio_browser_drive.py \
+            --base-url http://127.0.0.1:8888 --browser msedge \
+            --out logs/pw --password-file "${{ github.workspace }}/_studio_home/auth/.bootstrap_password"
+      - name: Gate on the collected facts
+        if: always()
+        run: |
+          python - <<'EOF'
+          import json, pathlib, sys
+          strict = "chromium firefox webkit".split()
+          optional = "chrome msedge".split()
+          out = pathlib.Path("logs/pw")
+          bad = []
+          for b in strict + optional:
+              f = out / (b + ".json")
+              if not f.is_file():
+                  (bad if b in strict else []).append(b + ": no facts written")
+                  print(b, "MISSING")
+                  continue
+              d = json.loads(f.read_text())
+              print(b, "ok" if d.get("ok") else "FAILED", json.dumps(
+                  {k: d.get(k) for k in ("browser_version", "ready_selector",
+                                         "home_png_bytes", "chat_png_bytes",
+                                         "typed_into_composer", "authenticated")}))
+              if not d.get("ok") and b in strict:
+                  bad.append(b + ": " + json.dumps(d)[:300])
+          if bad:
+              print("STRICT BROWSERS FAILED:", *bad, sep="\n")
+              sys.exit(1)
+          EOF
+      - name: Studio log tail
+        if: always()
+        run: tail -120 studio.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-browsers-11102-ubuntu-latest
+          path: |
+            logs/pw/**
+            studio.log
