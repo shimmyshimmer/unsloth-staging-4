@@ -200,6 +200,25 @@ def has_secret(credential_kind: str, scope_id: str) -> bool:
     return get_secret(credential_kind, scope_id) is not None
 
 
+def secret_row_exists(credential_kind: str, scope_id: str) -> bool:
+    """Whether a credential is STORED, readable or not. `get_secret` and `has_secret` answer
+    None for an absent row AND an undecryptable one, which callers that AUTHORIZE on the absence
+    of a credential must tell apart."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM credential_secrets
+            WHERE credential_kind = ? AND scope_id = ?
+            """,
+            (credential_kind, scope_id),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None
+
+
 def delete_secret(
     credential_kind: str,
     scope_id: str,
@@ -224,6 +243,11 @@ def delete_secret(
 
 def get_hf_token() -> Optional[str]:
     return get_secret(HF_TOKEN_KIND, HF_TOKEN_SCOPE)
+
+
+def hf_token_row_exists() -> bool:
+    """Whether an HF token is saved, readable or not. See `secret_row_exists`."""
+    return secret_row_exists(HF_TOKEN_KIND, HF_TOKEN_SCOPE)
 
 
 def save_hf_token(token: str) -> None:

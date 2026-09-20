@@ -49,7 +49,7 @@ from hub.utils.paths import (
     normalize_path,
     resolve_dataset_path,
 )
-from hub.utils.hf_tokens import cached_read_refused
+from hub.utils.hf_tokens import cached_read_refused, note_repo_fetched_with_a_request_token
 from utils.datasets.audio_decode import ensure_audio_decoding
 from utils.paths.path_utils import drop_shadowed_appledouble_names
 
@@ -448,6 +448,14 @@ def check_format_response(
                 )
             else:
                 preview_slice = None
+
+                # Here, not above the cache reader: a preview materialises rows in the
+                # datasets cache, possibly under a one-off token saved nowhere, and
+                # unrecorded a later tokenless caller reads "none needed one". A
+                # prefer-local request reaches neither branch below, so recording it
+                # there would relabel an anonymously cached dataset as credentialed and
+                # refuse the offline caller this path exists for.
+                note_repo_fetched_with_a_request_token(hf_token, request.dataset_name, "dataset")
 
                 try:
                     from huggingface_hub import HfApi

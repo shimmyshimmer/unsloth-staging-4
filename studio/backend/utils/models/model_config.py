@@ -18,8 +18,10 @@ from utils.paths import (
     resolve_export_dir,
 )
 from hub.utils.hf_tokens import (
+    note_repo_fetched_with_a_request_token,
     ANONYMOUS_CACHE_IDENTITY,
     cached_read_refused,
+    hub_answered_no,
     qualify_cache_identity,
     HfTokenArg,
     apply_token_to_child_env,
@@ -563,9 +565,26 @@ def load_model_config(
         # `False` is falsy: without this it falls past both branches to the ambient call.
         # Passed as the sentinel rather than via without_hf_auth(), which mutates HF_TOKEN
         # process-wide and would strip a concurrent download's credential.
-        # token=False denies auth, not the cache, so offline it would read a cached private
-        # config.json anyway; with no network this caller gets nothing instead.
-        if local_files_only or _env_offline():
+        # token=False denies auth, not the cache: AutoConfig resolves a cached config.json
+        # without ever consulting the credential, so the read is gated here. The second clause
+        # keeps that narrow: offline or cache-only, the provenance rule decides; online, only an
+        # ANSWERED refusal refuses, since treating a failed probe as one denies a PUBLIC repo
+        # already on disk.
+        if (
+            not is_local_path(model_name)
+            and cached_read_refused(
+                token,
+                repo_id = model_name,
+                is_cached = lambda: _config_json_already_cached(model_name, revision),
+                # The caller's own cache-only contract, as in the explicit-token gate below.
+                offline = bool(local_files_only),
+            )
+            and (
+                local_files_only
+                or _env_offline()
+                or hub_answered_no(token, repo_id = model_name, offline = bool(local_files_only))
+            )
+        ):
             raise OSError(
                 f"config.json for {model_name} is not available to an unauthorized caller"
             )
@@ -595,6 +614,13 @@ def load_model_config(
         raise OSError(f"config.json for {model_name} is not available to an unauthorized caller")
 
     if token:
+        # config.json lands in the hub cache under what may be a one-off token; unrecorded it
+        # reads later as "nothing here needed one". Only when this call can actually fetch it:
+        # AutoConfig resolves an already-cached config without asking the Hub, and recording that
+        # marks a repo the cache may have held anonymously all along, which then withholds it
+        # from the tokenless offline caller this whole path exists for.
+        if not local_files_only and not _config_json_already_cached(model_name, revision):
+            note_repo_fetched_with_a_request_token(token, model_name, "model")
         return AutoConfig.from_pretrained(
             model_name,
             trust_remote_code = trust_remote_code,
@@ -2547,7 +2573,7 @@ def detect_gguf_model(path: str, model_root: Optional[str] = None) -> Optional[s
             is_dir = False  # stat() unavailable in the lock window
         if not is_dir:
             return str(_local_gguf_load_path(p))
-        # Directory named "*.gguf": fall through to the dir scan below.
+    # Directory named "*.gguf": fall through to the dir scan below.
 
     # Case 2: directory containing .gguf files (skip mmproj / MTP drafter)
     if p.is_dir():
