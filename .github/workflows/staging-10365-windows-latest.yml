@@ -32,6 +32,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      # tests/generation-tool-recovery.test.ts imports `typescript` to compile the adapter into a vm,
+      # so the node suite needs the workspace's dev dependencies. Without this the file cannot load
+      # and every test batched with it is reported failed for a reason that is not the code.
+      - name: Install frontend dependencies
+        working-directory: studio/frontend
+        run: npm ci --no-audit --no-fund
       - name: Node tests
         working-directory: studio/frontend
         run: node --experimental-strip-types --test tests/auto-compaction-settings.test.ts tests/chat-continuation.test.ts tests/chat-generation-reconnect.test.ts tests/durable-gate.test.ts tests/generation-tool-recovery-approvals.test.ts tests/generation-tool-recovery.test.ts
