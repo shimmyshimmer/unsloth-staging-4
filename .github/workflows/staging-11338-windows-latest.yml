@@ -1,7 +1,7 @@
 name: "staging-11338 windows-latest"
 on:
   push:
-    branches: ["pr-11338-xplat-ci"]
+    branches: ["pr-11338-basearm-ci"]
     paths-ignore:
       - '**/*.md'
   workflow_dispatch:
