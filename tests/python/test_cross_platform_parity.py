@@ -1516,3 +1516,107 @@ class TestInstallUvCacheRootParity:
         assert "Set-StudioUvCacheForLaunch" in source
         assert "Set-Item -LiteralPath Env:UV_CACHE_DIR -Value $PreviousValue" in source
         assert "Remove-Item -LiteralPath Env:UV_CACHE_DIR" in source
+
+
+class TestOffVolumeCacheNoticeParity:
+    """The notice for a cache that could not be co-located has to name a remedy that exists,
+    and the same one on both installers. A caller's own UV_CACHE_DIR wins in the selector and
+    returns before --isolated-uv-cache is read at all, so naming that flag to a custom-cache
+    user sends them back for a byte-identical run that prints the notice again (#11313)."""
+
+    @pytest.mark.parametrize(
+        "path, mode_test",
+        [
+            (INSTALL_SH, '[ "${_UV_CACHE_MODE:-}" = custom ]'),
+            (INSTALL_PS1, '$script:StudioUvCacheMode -eq "custom"'),
+        ],
+        ids = ["install.sh", "install.ps1"],
+    )
+    def test_custom_cache_is_not_told_to_pass_a_flag_it_ignores(self, path, mode_test):
+        text = path.read_text(encoding = "utf-8")
+        assert mode_test in text, f"{path.name} does not vary the remedy by cache mode"
+        assert (
+            "unset UV_CACHE_DIR" in text
+        ), f"{path.name} does not tell a custom-cache user what would change the answer"
+
+    @pytest.mark.parametrize(
+        "path, flag",
+        [
+            (INSTALL_SH, "_UV_CACHE_OFF_VOLUME"),
+            (INSTALL_PS1, "$script:StudioUvCacheOffVolume"),
+        ],
+        ids = ["install.sh", "install.ps1"],
+    )
+    def test_the_finding_is_recorded_for_the_rollback_warning(self, path, flag):
+        # Keeping the old environment only costs its own size across a filesystem boundary:
+        # within one, uv hardlinks every wheel, so the tree shares its blocks with the cache.
+        text = path.read_text(encoding = "utf-8")
+        assert (
+            text.count(flag) >= 2
+        ), f"{path.name} should set {flag} at the notice and read it at the rollback warning"
+
+
+class TestWindowsMountPointVolumes:
+    """A Windows volume can be mounted at a DIRECTORY rather than a drive letter. GetPathRoot
+    reduces C:\\studio to C:\\, so DriveInfo answers for the host drive and two paths on
+    different mounted volumes compare equal on their root: the rollback-space warning is then
+    suppressed or falsely emitted, and the cross-volume cache notice never fires. Win32_Volume
+    lists mount points by the path they are mounted at. Pinned by text because no host in CI
+    has a directory mount point to exercise (#11313)."""
+
+    def test_free_space_asks_the_mounted_volume_first(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        assert "Win32_Volume" in text, "install.ps1 does not consult the mount-point view"
+        helper = text.split("function Get-StudioFreeSpaceBytes", 1)[1].split(
+            "function Get-StudioTreeSizeBytes", 1
+        )[0]
+        assert "Get-StudioMountedVolume" in helper, (
+            "Get-StudioFreeSpaceBytes falls straight through to the drive root"
+        )
+        assert "DriveInfo" in helper, "the drive-root fallback was dropped"
+
+    def test_same_volume_compares_identity_not_root(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        helper = text.split("function Test-StudioSameVolume", 1)[1].split("\n    }", 1)[0]
+        # DeviceID is the volume GUID. The mount path is not identity: one volume can be
+        # mounted in several places.
+        assert "DeviceID" in helper, "Test-StudioSameVolume still compares only the drive root"
+
+    def test_the_probe_is_gated_on_windows(self):
+        # CimCmdlets ships only on Windows, and this helper is reached on every platform.
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        helper = text.split("function Get-StudioMountedVolume", 1)[1].split("\n    }", 1)[0]
+        assert "$IsWindows" in helper and "Windows_NT" in helper, (
+            "Get-StudioMountedVolume would call Get-CimInstance off Windows"
+        )
+
+
+class TestDiskFullDiagnosisReachesTauri:
+    """The desktop installer and its Repair flow run with --tauri, and there the only thing the
+    UI and its logs ever see is the message handed to the ERROR_DEFAULT marker. A disk-full
+    diagnosis printed beside that message is one the desktop user never reads, which is the
+    scenario #11313 was reported from."""
+
+    def test_shell_folds_the_diagnosis_into_the_marker(self):
+        text = INSTALL_SH.read_text(encoding = "utf-8")
+        assert (
+            'tauri_log "ERROR_DEFAULT" "studio setup failed (exit code $_SETUP_EXIT)$_fail_suffix"'
+            in text
+        ), "install.sh keeps the disk-full diagnosis out of the Tauri message"
+
+    def test_windows_folds_the_diagnosis_into_the_failure_message(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        assert (
+            'Exit-InstallFailure "unsloth studio setup failed (exit code $setupExit)$_failSuffix"'
+            in text
+        ), "install.ps1 keeps the disk-full diagnosis out of the Tauri message"
+
+    def test_windows_measures_in_both_modes(self):
+        # The probe must sit OUTSIDE the non-Tauri console branch, or --tauri never measures.
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        block = text.split("if ($setupExit -ne 0) {", 1)[1].split("Clear-TauriInstallError", 1)[0]
+        probe = block.index("$_failFree = Get-StudioFreeSpaceBytes")
+        guard = block.index("if (-not $TauriMode) {")
+        assert probe < guard, (
+            "the free-space probe runs only in the non-Tauri branch, so --tauri never measures"
+        )
