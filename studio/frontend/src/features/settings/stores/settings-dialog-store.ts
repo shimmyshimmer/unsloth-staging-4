@@ -30,8 +30,8 @@ export type SettingsTab = (typeof SETTINGS_TABS)[number];
 export type SettingsScrollTarget =
   | "about-updates"
   | "appearance-sidebar-nav"
-  | "chat-composer"
-  | "chat-canvas-network";
+  | "chat-canvas-network"
+  | "resources-caches";
 
 /** Which archive the Data tab should open straight into. */
 export type ArchivedShelf = "chats" | "images" | "videos" | "audio";
@@ -118,6 +118,7 @@ const SCROLL_TARGET_TAB: Record<SettingsScrollTarget, SettingsTab> = {
   "about-updates": "about",
   "appearance-sidebar-nav": "appearance",
   "chat-canvas-network": "chat",
+  "resources-caches": "resources",
 };
 
 /**
