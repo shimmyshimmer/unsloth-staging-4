@@ -37,6 +37,11 @@ import {
   withRequestTimeout,
 } from "../lib/debug-log-buffer";
 import { isAbort, isLogSourceGone } from "../lib/debug-log-error";
+import {
+  NO_PENDING_LOG_REQUEST,
+  pendingLogRequestKey,
+  useSettingsDialogStore,
+} from "../stores/settings-dialog-store";
 
 const MODES: RefreshMode[] = ["live", "3s", "manual"];
 
@@ -104,17 +109,43 @@ export function DebuggingTab() {
       try {
         // Bounded like the tail read: the poll loop and its failure recovery
         // both await this, so an unanswered /sources would freeze both.
+        // Sent with the listing so the backend can canonicalise it against the same
+        // realpaths it is about to report; the spellings do not match as strings.
+        const pendingPath =
+          useSettingsDialogStore.getState().logSourcePathRequested;
         const result = await withRequestTimeout(
-          (signal) => loadDebugLogSources(signal),
+          (signal) => loadDebugLogSources(signal, pendingPath),
           REQUEST_TIMEOUT_MS,
           options.signal,
         );
         setSources(result.sources);
         setLogRoot(result.logRoot);
+        // A "View logs" action from a failure names the family that just failed, and
+        // where the diagnostic carried one, the exact file. Prefer the file: a switch
+        // that fails after evicting the previous model is rolled back by performLoad,
+        // and that rollback writes a NEWER log in the same family, so recency alone
+        // opens the attempt that succeeded. Family recency stays the fallback for a
+        // diagnostic with no path in it, or one naming a file no longer listed.
+        const dialog = useSettingsDialogStore.getState();
+        const requested = dialog.logFamilyRequested;
+        const byPath = result.matchedSourceId
+          ? result.sources.find(
+              (source) => source.id === result.matchedSourceId,
+            )
+          : undefined;
+        const fromFailure =
+          byPath ??
+          (requested
+            ? result.sources.find((source) => source.family === requested)
+            : undefined);
+        if (fromFailure)
+          useSettingsDialogStore.getState().consumeLogFamilyRequest();
         setSourceId((current) =>
-          options.reselect
-            ? result.defaultSourceId
-            : (current ?? result.defaultSourceId),
+          fromFailure
+            ? fromFailure.id
+            : options.reselect
+              ? result.defaultSourceId
+              : (current ?? result.defaultSourceId),
         );
       } catch {
         // The log read reports the real reason; this just leaves the picker empty.
@@ -128,6 +159,19 @@ export function DebuggingTab() {
     void refreshSources({ signal: controller.signal });
     return () => controller.abort();
   }, [refreshSources]);
+
+  // A request that arrives while this panel is ALREADY mounted. openLogs only writes the
+  // store, and reopening the tab it is already on does not remount, so the mount effect
+  // above never runs again; in manual refresh mode nothing else rescans either, and the
+  // panel sat on its previous selection indefinitely. Subscribed, so the arrival itself is
+  // what triggers the rescan that consumes it.
+  const pendingLogRequest = useSettingsDialogStore(pendingLogRequestKey);
+  useEffect(() => {
+    if (pendingLogRequest === NO_PENDING_LOG_REQUEST) return;
+    const controller = new AbortController();
+    void refreshSources({ signal: controller.signal });
+    return () => controller.abort();
+  }, [pendingLogRequest, refreshSources]);
 
   const onPollFailed = useCallback(
     async (error: unknown, signal?: AbortSignal) => {
