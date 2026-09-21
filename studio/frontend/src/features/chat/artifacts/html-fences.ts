@@ -11,7 +11,19 @@ export type CodeFence = {
 };
 
 // Matches one fenced block spanning the whole string (one pre-split block).
-export const CODE_FENCE_RE = /^```([^\r\n`]*)\r?\n([\s\S]*?)\r?\n?```$/;
+//
+// THE CLOSE IS THREE OR MORE, NOT EXACTLY THREE. CommonMark wants the closing run to be "at least
+// as many" as the opener, and a model closing a fence whose body holds three backticks writes four.
+// `{3}` matched such a line by its LAST three and handed the surplus to `source` (`x = 1\n\``); a
+// bare lazy `+?` is the other half of the rule and accepts a one- or two-backtick run as a close.
+// The close needs a LINE BREAK before it unless the body is empty, so the alternation is outside
+// the body group: without that, `` ```\nfoo```` `` matched with the run eaten and gave `foo` where
+// CommonMark gives `foo```` `. A fence that closes on the same line it opens has no body at all.
+//
+// Against `micromark`: `{3}` and `+?` each disagreed on 54 of 540 shapes; the shape above was this
+// rule's one regression, found by review and now a row in the test.
+export const CODE_FENCE_RE =
+  /^```([^\r\n`]*)\r?\n(?:([\s\S]*?)\r?\n`{3,}|`{3,})$/;
 
 export type ToolCallPartLike = {
   type?: string;
@@ -47,10 +59,19 @@ export function getCodeFence(blockContent: string): CodeFence | null {
   if (!match) {
     return null;
   }
+  // A block can hold MORE than one fence (a reply with a footnote is one block) and the greedy body
+  // would then span both, prose included. A delimiter-shaped LINE inside the body is ordinary code,
+  // so this rejects only a real close (bare run on its own line) followed by another opener.
+  // A follow-on opener is a run at the start of a line: it MAY carry an info string, and a bare
+  // run (no info string) is still an opener, not a close, because the body continues after it.
+  if (/^ {0,3}`{3,}[\t ]*\r?$[\s\S]*^ {0,3}(?:`{3,}|~{3,})/m.test(match[2])) {
+    return null;
+  }
 
   return {
     language: match[1]?.trim() || null,
-    source: match[2],
+    // Absent only for a fence that closes on the line after it opens.
+    source: match[2] ?? "",
   };
 }
 
