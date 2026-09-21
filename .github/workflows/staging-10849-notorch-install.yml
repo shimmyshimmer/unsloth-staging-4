@@ -1,0 +1,119 @@
+name: "staging-10849 no-torch install (base vs head)"
+on:
+  push:
+    branches: ["pr-10849-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  notorch:
+    # The real GGUF-only step: install.sh:4889 / install_python_stack.py:7740 apply
+    # no-torch-runtime.txt with --no-deps. --only-binary=:all: turns "would build hf-xet
+    # from the maturin sdist" into a hard failure instead of a 10-minute Rust compile.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: report the machine this runner reports
+        run: python -c "import platform,sys;print('platform_machine=',platform.machine(),'sys_platform=',sys.platform,'py=',platform.python_version())"
+      - name: build the base arm requirement file (hf-xet line removed)
+        run: |
+          python - <<'PY'
+          import pathlib, re
+          p = pathlib.Path("studio/backend/requirements/no-torch-runtime.txt")
+          t = p.read_text(encoding="utf-8")
+          base = re.sub(r'^hf-xet.*$\n', '', t, flags=re.M)
+          assert base != t, "no hf-xet line found -- the differential would be void"
+          pathlib.Path("no-torch-base.txt").write_text(base, encoding="utf-8")
+          PY
+      - name: BASE arm -- install without the hf-xet line
+        run: |
+          python -m venv base_env
+          BP=$(ls base_env/bin/python 2>/dev/null || ls base_env/Scripts/python.exe)
+          "$BP" -m pip install -q --upgrade pip
+          "$BP" -m pip install -q pydantic
+          "$BP" -m pip install -q --no-deps --only-binary=:all: -r no-torch-base.txt
+          "$BP" - <<'PY'
+          from importlib.metadata import version, PackageNotFoundError
+          from huggingface_hub.utils._runtime import is_xet_available
+          try: v = version("hf-xet")
+          except PackageNotFoundError: v = "ABSENT"
+          print(f"BASE hf-xet={v} is_xet_available={is_xet_available()}")
+          assert v == "ABSENT", "base arm already has hf-xet; the differential is VOID"
+          assert is_xet_available() is False
+          PY
+      - name: HEAD arm -- install the PR's file, source builds forbidden
+        run: |
+          python -m venv head_env
+          HP=$(ls head_env/bin/python 2>/dev/null || ls head_env/Scripts/python.exe)
+          "$HP" -m pip install -q --upgrade pip
+          "$HP" -m pip install -q pydantic
+          "$HP" -m pip install -q --no-deps --only-binary=:all: -r studio/backend/requirements/no-torch-runtime.txt
+          "$HP" - <<'PY'
+          import platform
+          from importlib.metadata import version, PackageNotFoundError
+          from huggingface_hub.utils._runtime import is_xet_available
+          try: v = version("hf-xet")
+          except PackageNotFoundError: v = "ABSENT"
+          print(f"HEAD hf-xet={v} is_xet_available={is_xet_available()} machine={platform.machine()}")
+          # Every machine GitHub gives us is one hf-xet ships a wheel for, so the marker must select it.
+          assert v != "ABSENT", "hf-xet was not installed on a machine that has a wheel"
+          import hf_xet  # the native extension, not just the dist-info
+          assert is_xet_available() is True
+          PY
+      - name: the guard from issue #10840, on each arm
+        run: |
+          BP=$(ls base_env/bin/python 2>/dev/null || ls base_env/Scripts/python.exe)
+          HP=$(ls head_env/bin/python 2>/dev/null || ls head_env/Scripts/python.exe)
+          cat > route.py <<'PY'
+          import pathlib, tempfile
+          from unittest.mock import patch
+          from importlib.metadata import version, PackageNotFoundError
+          import huggingface_hub.file_download as fd
+          from huggingface_hub.utils._xet import XetFileData
+          try: v = version("hf-xet")
+          except PackageNotFoundError: v = "ABSENT"
+          calls = []
+          def fake_xet_get(**kw): calls.append("xet_get")
+          real_http = fd.http_get
+          def fake_http_get(*a, **kw): calls.append("http_get"); return real_http(*a, **kw)
+          with tempfile.TemporaryDirectory() as d:
+              d = pathlib.Path(d)
+              with patch.object(fd, "xet_get", fake_xet_get), patch.object(fd, "http_get", fake_http_get), \
+                   patch.object(fd, "_check_disk_space", lambda *a, **k: None):
+                  try:
+                      fd._download_to_tmp_and_move(
+                          incomplete_path = d / "b.incomplete", destination_path = d / "b",
+                          url_to_download = "https://example.invalid/model-Q5_K_XL.gguf", headers = {},
+                          expected_size = 60 * 1000 * 1000 * 1000, filename = "model-Q5_K_XL.gguf",
+                          force_download = False, etag = "deadbeef",
+                          xet_file_data = XetFileData(file_hash = "0" * 64,
+                                                      refresh_route = "https://example.invalid/xet"))
+                      outcome = "completed"
+                  except ValueError as e:
+                      outcome = "ValueError: " + " ".join(str(e).split())
+          print(f"hf-xet={v} transport={calls} outcome={outcome}")
+          import sys
+          if v == "ABSENT":
+              sys.exit(0 if calls == ["http_get"] and "too large" in outcome else 1)
+          sys.exit(0 if calls == ["xet_get"] and outcome == "completed" else 1)
+          PY
+          echo "--- base ---"; "$BP" route.py
+          echo "--- head ---"; "$HP" route.py
