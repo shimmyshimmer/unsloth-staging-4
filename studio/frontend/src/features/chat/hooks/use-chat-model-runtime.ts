@@ -36,6 +36,11 @@ import { loadModelMemorySettings } from "@/features/settings/api/model-memory";
 import { loadVramBudgetSettings } from "@/features/settings/api/vram-budget";
 import { loadOpenAIAutoSwitchSettings } from "@/features/settings";
 import {
+  failureLogPath,
+  loadFailureLogFamily,
+  viewLogsAction,
+} from "@/features/settings/lib/view-logs-action";
+import {
   confirmTransformersUpgradeIfNeeded,
   useTransformersUpgradeDialogStore,
 } from "@/features/transformers-upgrade";
@@ -872,6 +877,10 @@ export function useChatModelRuntime() {
         typeof selection === "string" ? undefined : selection.isGguf;
       let isDiffusion =
         typeof selection === "string" ? undefined : selection.isDiffusion;
+      // Whether the load request actually went out. Preflight failures -- a rejected
+      // staged-metadata read, a cancelled token prompt -- reach the same catch before any
+      // runner was started, so there is no runner log for their reason to be in.
+      let loadRequestIssued = false;
       const restorePreviousConfig = () => {
         if (typeof selection !== "string" && selection.previousConfig) {
           applyPerModelConfigToRuntime(selection.previousConfig, {
@@ -1847,6 +1856,15 @@ export function useChatModelRuntime() {
               force_cancel_active: forceCancelActive,
 
               force_reload: forceReload,
+            }, {
+              // loadModel prepares the HF token and checks the abort signal BEFORE it
+              // calls this, and only then sends the request, so this is the first point
+              // at which a runner may have written a log of its own. Setting the flag
+              // before the call counted a cancelled token prompt as an attempt and
+              // offered the newest unrelated runner log for it.
+              onRequestStart: () => {
+                loadRequestIssued = true;
+              },
             });
             cpuFallbackReason = loadResponse.cpu_fallback_reason ?? null;
             mmprojFallbackReason = loadResponse.mmproj_fallback_reason ?? null;
@@ -2657,12 +2675,32 @@ export function useChatModelRuntime() {
           if (!abortCtrl.signal.aborted) {
             const message =
               err instanceof Error ? err.message : "Failed to load model";
+            // The backend sends a real diagnostic here: a summary, the llama-server
+            // tail, and the path of the file it came from. It arrived intact and was
+            // shown as an 8s toast title, so the reader got a wall of prose and no way
+            // back to it. First line as the title, the rest as the description, and an
+            // action that opens the runner's own log.
+            const [summary, ...rest] = message.split("\n");
+            const detail = rest.join("\n").trim();
+            // Which file holds the reason depends on who was loading: only a GGUF load
+            // goes through a runner that writes its own file per attempt, and a
+            // Transformers or MLX load reaches this same catch with its reason in the
+            // backend's current server log instead. The path, when the diagnostic carries
+            // one, pins the exact attempt regardless of a rollback load landing after it.
+            const logsAction = viewLogsAction(
+              loadFailureLogFamily(isGguf, isDiffusion, loadRequestIssued),
+              failureLogPath(message),
+            );
             if (loadToastDismissedRef.current) {
-              toast.error(message);
+              toast.error(summary, {
+                description: detail || undefined,
+                action: logsAction,
+              });
             } else {
-              toast.error(message, {
+              toast.error(summary, {
                 id: toastId,
-                description: undefined,
+                description: detail || undefined,
+                action: logsAction,
                 cancel: undefined,
                 classNames: undefined,
                 closeButton: true,
