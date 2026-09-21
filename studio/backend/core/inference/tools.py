@@ -442,11 +442,29 @@ _QUOTED_REDIRECT_MARK = "\x02"
 _EXPANSION_CHARS = frozenset("$`")
 _QUOTED_EXPANSION_MARK = "\x04"
 # The characters punctuation_chars glues into one token. A run like `|&` matches no _SHELL_SEPARATORS entry, so the
-# sed screen read past the end of the command. `{`/`}` are absent so find's `{}` stays an ordinary word.
-_OPERATOR_TOKEN_CHARS = frozenset(";&|()`")
+# sed screen read past the end of the command. `{`/`}` are absent so find's `{}` stays an ordinary word. A newline
+# only reaches a token stream that asked for it (_COMMAND_POSITION_PUNCTUATION), where `;\n` arrives glued.
+_OPERATOR_TOKEN_CHARS = frozenset(";&|()`\n")
+# The operators the blocklist walk needs split off into tokens of their own. The newline is there because bash starts
+# a new command at a line break, where shlex sees only whitespace.
+_COMMAND_POSITION_PUNCTUATION = ";&|()`\n"
 # One shell redirection as the lexer hands it over. The target may be glued on (`2>/dev/null`) or be the next token;
 # `&` splits off under punctuation_chars, so `2>&1` arrives as three.
 _REDIRECTION_RE = re.compile(r"^(?:\d+|&)?(?:<<<|<<-|<<|<>|>>|>\||<&|>&|<|>)")
+
+
+def _punctuation_lexer(text: str, punctuation: str) -> "shlex.shlex":
+    """A word lexer that hands back every one of ``punctuation`` as its own token.
+
+    shlex counts a newline as whitespace, so asking for it in punctuation_chars alone yields
+    nothing: it has to leave the whitespace set as well, or the separator bash sees at a line break
+    never appears in the token stream.
+    """
+    lexer = shlex.shlex(text, posix = True, punctuation_chars = punctuation)
+    lexer.whitespace_split = True
+    if "\n" in punctuation:
+        lexer.whitespace = lexer.whitespace.replace("\n", "")
+    return lexer
 
 
 def _looks_like_separator(token: str) -> bool:
@@ -1033,9 +1051,7 @@ def _quoted_separator_indexes(text: str, tokens: "list[str]", punctuation: str) 
     if _QUOTED_SEPARATOR_MARK not in masked:
         return frozenset()  # every separator character was bare
     try:
-        lexer = shlex.shlex(masked, posix = True, punctuation_chars = punctuation)
-        lexer.whitespace_split = True
-        marked = list(lexer)
+        marked = list(_punctuation_lexer(masked, punctuation))
     except ValueError:
         return frozenset()
     if len(marked) != len(tokens):
@@ -1061,9 +1077,7 @@ def _masked_tokens(
         mark if char in chars and states[index] else char for index, char in enumerate(text)
     )
     try:
-        lexer = shlex.shlex(masked, posix = True, punctuation_chars = punctuation)
-        lexer.whitespace_split = True
-        marked = list(lexer)
+        marked = list(_punctuation_lexer(masked, punctuation))
     except ValueError:
         return None
     return marked if len(marked) == len(tokens) else None
@@ -1104,9 +1118,7 @@ def _unquoted_expansion_indexes(
         for index, char in enumerate(text)
     )
     try:
-        lexer = shlex.shlex(masked, posix = True, punctuation_chars = punctuation)
-        lexer.whitespace_split = True
-        marked = list(lexer)
+        marked = list(_punctuation_lexer(masked, punctuation))
     except ValueError:
         return frozenset()
     if len(marked) != len(tokens):
@@ -1132,9 +1144,7 @@ def _unquoted_glob_indexes(text: str, tokens: "list[str]", punctuation: str) -> 
         for index, char in enumerate(text)
     )
     try:
-        lexer = shlex.shlex(masked, posix = True, punctuation_chars = punctuation)
-        lexer.whitespace_split = True
-        marked = list(lexer)
+        marked = list(_punctuation_lexer(masked, punctuation))
     except ValueError:
         return frozenset()
     if len(marked) != len(tokens):
@@ -1354,6 +1364,11 @@ _BLOCKED_WORD_RE = (
         # No `coproc` alternative here, deliberately: with no quoting or command-position context this pass refused
         # `grep coproc rm file`. The token scan above knows where a command starts and handles the keyword.
         r"(?:^|[;&|`\n(]\s*|[$]\(\s*|<\(\s*)"
+        # Assignment prefixes sit between the separator and the command word bash runs, and this
+        # backstop is all that is left when the lex raises and the token walk never happens. A
+        # quoted value may hold the rest of the line (`p='1e rm -f victim'`), which is a binding
+        # the sed screen resolves, so those are deliberately not stepped over here.
+        r"(?:[A-Za-z_]\w*=[^\s'\"]*\s+)*"
         r"(?:[\w./\\-]*/|[a-zA-Z]:[/\\][\w./\\-]*)?"
         r"(" + "|".join(re.escape(w) for w in sorted(_BLOCKED_COMMANDS)) + r")"
         r"(?:\.(?:exe|com|bat|cmd))?\b"
@@ -1378,16 +1393,15 @@ def _find_blocked_commands(command: str) -> set[str]:
     command = _decode_ansi_c(command, keep_one_word = True)
 
     # punctuation_chars splits separators into their own tokens, so command position is detected even in `echo done;
-    # rm -rf x`. Keyed to the shell that will actually run this, not to the OS: on a Windows host with bash the
-    # non-posix lexer never split on `;`, so `if true; then rm -rf x; fi` came back with nothing blocked.
+    # rm -rf x` and at a line break. Keyed to the shell that will actually run this, not to the OS: on a Windows host
+    # with bash the non-posix lexer never split on `;`, so `if true; then rm -rf x; fi` came back with nothing
+    # blocked.
     lexed_posix = _shell_is_posix()
     try:
         if not lexed_posix:
             tokens = shlex.split(command, posix = False)
         else:
-            lexer = shlex.shlex(command, posix = True, punctuation_chars = ";&|()`")
-            lexer.whitespace_split = True
-            tokens = list(lexer)
+            tokens = list(_punctuation_lexer(command, _COMMAND_POSITION_PUNCTUATION))
     except ValueError:
         tokens = command.split()
         lexed_posix = False
@@ -1395,10 +1409,14 @@ def _find_blocked_commands(command: str) -> set[str]:
     # the quote marks and the split() fallback has no quoting model, so both report nothing and reach the same
     # verdict.
     quoted_separators = (
-        _quoted_separator_indexes(command, tokens, ";&|()`") if lexed_posix else frozenset()
+        _quoted_separator_indexes(command, tokens, _COMMAND_POSITION_PUNCTUATION)
+        if lexed_posix
+        else frozenset()
     )
     quoted_redirects = (
-        _quoted_redirection_indexes(command, tokens, ";&|()`") if lexed_posix else frozenset()
+        _quoted_redirection_indexes(command, tokens, _COMMAND_POSITION_PUNCTUATION)
+        if lexed_posix
+        else frozenset()
     )
     exec_flag_indexes, invocation_stops, redirect_indexes = _exec_scan_layout(
         tokens, quoted_separators, quoted_redirects
@@ -1792,7 +1810,9 @@ def _find_blocked_commands(command: str) -> set[str]:
         # never blocked.
         if glob_indexes is None:
             glob_indexes = (
-                _unquoted_glob_indexes(command, tokens, ";&|()`") if lexed_posix else frozenset()
+                _unquoted_glob_indexes(command, tokens, _COMMAND_POSITION_PUNCTUATION)
+                if lexed_posix
+                else frozenset()
             )
         alternatives, scan_overflowed, _live = _sed_invocation(
             tokens, i, sed_limit, invocation_stops, redirect_indexes, glob_indexes
@@ -15889,8 +15909,9 @@ def _check_signal_escape_patterns(code: str):
     if visitor.imports_signal and not signal_tampering:
         warnings.append("Code imports 'signal' module - review manually for safety")
 
-    # Static host policy: block metadata hosts and any literal host outside the trusted allowlist; uploads blocked
-    # regardless of host. Dynamic hosts are caught by the bash blocklist.
+    # Static host policy: block metadata hosts and any host outside the trusted allowlist; uploads blocked regardless
+    # of host. A host this screen cannot read is treated as untrusted, since nothing downstream screens python-tool
+    # code again.
     network_calls: list[dict] = []
     sensitive_file_reads: list[dict] = []
     _NETWORK_FQ_PREFIXES = (
@@ -15919,6 +15940,42 @@ def _check_signal_escape_patterns(code: str):
         "httpx.Client",
         "httpx.AsyncClient",
         "aiohttp.ClientSession",
+    )
+    # The modules an alias is resolved back to, so `import urllib.request as u` and `from urllib.request import
+    # urlopen` reach the prefixes above exactly as the spelled-out call does.
+    _NETWORK_MODULES = frozenset(
+        {
+            "socket",
+            "urllib.request",
+            "urllib3",
+            "http.client",
+            "requests",
+            "httpx",
+            "aiohttp",
+        }
+    )
+    # Calls whose FIRST positional argument is the host or the URL. `socket.socket(AF_INET, ...)` and the
+    # session/client constructors take neither, so an unreadable first argument says nothing about them.
+    _NETWORK_URL_ARG0_FQ = frozenset(
+        {
+            "socket.create_connection",
+            "socket.getaddrinfo",
+            "urllib.request.urlopen",
+            "urllib.request.urlretrieve",
+            "requests.get",
+            "requests.post",
+            "requests.put",
+            "requests.delete",
+            "requests.patch",
+            "requests.head",
+            "http.client.HTTPConnection",
+            "http.client.HTTPSConnection",
+            "httpx.get",
+            "httpx.post",
+            "httpx.put",
+            "httpx.patch",
+            "httpx.delete",
+        }
     )
     _UPLOAD_HTTP_METHODS = (
         "requests.post",
@@ -16363,7 +16420,207 @@ def _check_signal_escape_patterns(code: str):
             return _HF_UPLOAD_PATH_VIOLATION
         return None
 
+    # Past this many candidate values for one expression, stop enumerating and treat the
+    # destination as unreadable: a screen that fans out without bound is a way to stall it.
+    _LITERAL_CANDIDATE_CAP = 8
+
+    def _stored_names(targets) -> "list[str]":
+        return [
+            n.id for t in targets if t is not None for n in ast.walk(t) if isinstance(n, ast.Name)
+        ]
+
+    def _binding_names(node) -> "list[str]":
+        """Every name a node binds, in whatever form: assignment, unpacking, walrus, import, def,
+        class, parameter, for target, `as` clause, del. One definition of "this name now means
+        something else", used both to invalidate module aliases and to collect literal values."""
+        if isinstance(node, (ast.Assign, ast.Delete)):
+            return _stored_names(node.targets)
+        if isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            return _stored_names([node.target])
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            return _stored_names([node.target])
+        if isinstance(node, ast.withitem):
+            return _stored_names([node.optional_vars])
+        if isinstance(node, ast.ExceptHandler):
+            return [node.name] if node.name else []
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            return [node.name] if node.name else []
+        if isinstance(node, ast.MatchMapping):
+            return [node.rest] if node.rest else []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            args = getattr(node, "args", None)
+            slots = (
+                []
+                if args is None
+                else list(args.posonlyargs)
+                + list(args.args)
+                + list(args.kwonlyargs)
+                + [args.vararg, args.kwarg]
+            )
+            bound = [a.arg for a in slots if a is not None]
+            return ([node.name] if getattr(node, "name", None) else []) + bound
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return [
+                (alias.asname or alias.name.split(".")[0])
+                for alias in node.names
+                if (alias.asname or alias.name) != "*"
+            ]
+        return []
+
+    def _collect_literal_names(tree) -> "dict[str, frozenset[str] | None]":
+        """Name -> every string literal it is bound to anywhere in the tree, or None once any
+        binding is something this screen cannot read. Order and scope are ignored on purpose: the
+        call site is then checked against EVERY value the name can hold, which stays sound without
+        reasoning about which branch ran or which loop iteration this is. Reading only the newest
+        binding would allow `if f: url = evil` / `else: url = allowed` / `get(url)`."""
+        values: "dict[str, set[str] | None]" = {}
+
+        def bind(name: str, literal: "str | None") -> None:
+            current = values[name] if name in values else set()
+            if current is None or literal is None:
+                values[name] = None
+                return
+            current.add(literal)
+            values[name] = None if len(current) > _LITERAL_CANDIDATE_CAP else current
+
+        for node in ast.walk(tree):
+            literal_targets: list[str] = []
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                value = getattr(node, "value", None)
+                literal = value.value if isinstance(value, ast.Constant) else None
+                if isinstance(literal, str):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    # `a, b = "..."` gives neither name the string, so only a bare Name counts.
+                    literal_targets = [t.id for t in targets if isinstance(t, ast.Name)]
+            for name in _binding_names(node):
+                bind(name, literal if name in literal_targets else None)
+        return {k: (None if v is None else frozenset(v)) for k, v in values.items()}
+
+    def _literal_str_prefixes(node, names) -> "list[tuple[str, bool]]":
+        """Every text a string expression is statically known to START with, one entry per value its
+        names can hold, each with whether that text is the whole value. The head is what decides the
+        destination: a URL's scheme and host sit in front of whatever a concatenation or an f-string
+        appends at runtime. `("", False)` means unreadable, so a caller can fail closed on it."""
+        if isinstance(node, ast.Constant):
+            return [(node.value, True)] if isinstance(node.value, str) else [("", False)]
+        if isinstance(node, ast.Name):
+            bound = names.get(node.id)
+            return [(v, True) for v in sorted(bound)] if bound else [("", False)]
+        if isinstance(node, ast.NamedExpr):
+            return _literal_str_prefixes(node.value, names)  # get(url := "...") passes the value on
+        if isinstance(node, ast.JoinedStr):
+            text = ""
+            for part in node.values:
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    text += part.value
+                    continue
+                return [(text, False)]
+            return [(text, True)]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            out: "list[tuple[str, bool]]" = []
+            for left, left_whole in _literal_str_prefixes(node.left, names):
+                if not left_whole:
+                    out.append((left, False))
+                    continue
+                out.extend(
+                    (left + right, right_whole)
+                    for right, right_whole in _literal_str_prefixes(node.right, names)
+                )
+                if len(out) > _LITERAL_CANDIDATE_CAP:
+                    return [("", False)]
+            return out or [("", False)]
+        return [("", False)]
+
+    def _unwrapped_url_arg(node: ast.AST) -> ast.AST:
+        """`urlopen(Request(url))` carries the destination one call further in, so read it there."""
+        if isinstance(node, ast.Call) and node.args:
+            f = node.func
+            name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+            if name == "Request":
+                return node.args[0]
+        return node
+
     class NetworkAndIoVisitor(ast.NodeVisitor):
+        def __init__(self):
+            # Alias -> the module it binds, and bare name -> the network function it binds. The shell-exec half of
+            # this analyzer already resolves both; without them `import urllib.request as u; u.urlopen(...)` matched
+            # no prefix and a hardcoded attacker host passed the screen untouched.
+            self.module_aliases: dict[str, str] = {}
+            self.func_aliases: dict[str, str] = {}
+            # Name -> every string literal it can hold, None when unreadable. `url =
+            # "https://huggingface.co/x"; requests.get(url)` is still a host this screen can read.
+            self.literal_names = _collect_literal_names(tree)
+            # Network modules star-imported, and the names rebound since. `from requests import *`
+            # binds `get` under no name this file can enumerate, so the callee is resolved against
+            # the star modules instead; without it one character (`*` for `get`) turned the screen
+            # off, since a bare `get(...)` matched no network prefix.
+            self.star_modules: set[str] = set()
+            self.shadowed: set[str] = set()
+
+        def visit(self, node):
+            # Rebinding a name drops the alias it carried. `import socket as requests; import
+            # requests` runs the real `requests.get`, and a kept entry rewrote the call to
+            # `socket.get`, which matches no network prefix and so went unscreened.
+            for name in _binding_names(node):
+                self.module_aliases.pop(name, None)
+                self.func_aliases.pop(name, None)
+                self.shadowed.add(name)
+            super().visit(node)
+
+        def _star_imported_fq(self, name: str) -> "str | None":
+            if name in self.shadowed:
+                return None  # a local def or assignment of that name is not the module's function
+            for module in sorted(self.star_modules):
+                fq = f"{module}.{name}"
+                if any(fq.startswith(p) for p in _NETWORK_FQ_PREFIXES):
+                    return fq
+            return None
+
+        def visit_Import(self, node):
+            for alias in node.names:
+                if alias.asname and alias.name in _NETWORK_MODULES:
+                    self.module_aliases[alias.asname] = alias.name
+            self.generic_visit(node)
+
+        def visit_ImportFrom(self, node):
+            module = node.module or ""
+            for alias in node.names:
+                if alias.name == "*":
+                    if module in _NETWORK_MODULES:
+                        self.star_modules.add(module)
+                    continue
+                bound = alias.asname or alias.name
+                fq = f"{module}.{alias.name}"
+                if fq in _NETWORK_MODULES:
+                    self.module_aliases[bound] = fq  # from urllib import request
+                elif module in _NETWORK_MODULES:
+                    self.func_aliases[bound] = fq  # from urllib.request import urlopen
+            self.generic_visit(node)
+
+        def _module_named_by(self, value) -> "str | None":
+            """The network module a value names, following aliases, so `r = requests` keeps
+            `r.get(...)` screened instead of letting the assignment shed the module."""
+            parts: list[str] = []
+            cur = value
+            while isinstance(cur, ast.Attribute):
+                parts.insert(0, cur.attr)
+                cur = cur.value
+            if not isinstance(cur, ast.Name):
+                return None
+            parts.insert(0, cur.id)
+            if parts[0] in self.module_aliases:
+                parts = self.module_aliases[parts[0]].split(".") + parts[1:]
+            fq = ".".join(parts)
+            return fq if fq in _NETWORK_MODULES else None
+
+        def visit_Assign(self, node):
+            carried = self._module_named_by(node.value)
+            if carried:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self.module_aliases[target.id] = carried
+            self.generic_visit(node)
+
         def visit_Call(self, node):
             parts: list[str] = []
             cur = node.func
@@ -16373,6 +16630,12 @@ def _check_signal_escape_patterns(code: str):
             if isinstance(cur, ast.Name):
                 parts.insert(0, cur.id)
             fq = ".".join(parts) if parts else ""
+            if len(parts) > 1 and parts[0] in self.module_aliases:
+                fq = ".".join([self.module_aliases[parts[0]]] + parts[1:])
+            elif len(parts) == 1 and parts[0] in self.func_aliases:
+                fq = self.func_aliases[parts[0]]
+            elif len(parts) == 1 and self.star_modules:
+                fq = self._star_imported_fq(parts[0]) or fq
 
             hf_upload_name = _method_call_hf_upload_name(node)
             if hf_upload_name is not None:
@@ -16428,42 +16691,70 @@ def _check_signal_escape_patterns(code: str):
                         }
                     )
 
-                # 2) Extract literal host (URL string or (host, port) tuple).
-                host_arg = None
-                url_arg = None
+                # 2) Extract the host (URL string or (host, port) tuple) from the first argument,
+                # once per value that argument can hold: a name reused for two destinations is read
+                # as both, so one allowlisted spelling never vouches for the other.
+                hosts: list[str] = []
+                unreadable = False
                 if node.args:
-                    a0 = node.args[0]
-                    if isinstance(a0, ast.Constant) and isinstance(a0.value, str):
-                        url_arg = a0.value
-                    elif isinstance(a0, ast.Tuple) and a0.elts:
-                        e0 = a0.elts[0]
-                        if isinstance(e0, ast.Constant) and isinstance(e0.value, str):
-                            host_arg = e0.value
-                if url_arg and host_arg is None:
-                    m = re.match(r"^\w+://([^/?#]+)", url_arg)
-                    if m:
-                        host_arg = m.group(1)
+                    a0 = _unwrapped_url_arg(node.args[0])
+                    is_tuple = isinstance(a0, ast.Tuple)
+                    read = None if is_tuple and not a0.elts else (a0.elts[0] if is_tuple else a0)
+                    candidates = (
+                        [("", False)]
+                        if read is None
+                        else _literal_str_prefixes(read, self.literal_names)
+                    )
+                    for head, whole in candidates:
+                        host = None
+                        if is_tuple:
+                            if whole and head:
+                                host = head
+                        else:
+                            m = re.match(r"^\w+://([^/?#]+)", head)
+                            # The host ends at the first `/?#`, so a literal truncated past that point
+                            # still names it in full; one truncated inside it does not
+                            # (`"http://evil." + tld`).
+                            if m and (whole or head[m.end(1) :]):
+                                host = m.group(1)
+                        if host is None:
+                            unreadable = unreadable or not whole
+                        else:
+                            hosts.append(host)
 
-                if host_arg:
-                    if _is_metadata_host(host_arg):
-                        network_calls.append(
-                            {
-                                "type": "metadata_host_blocked",
-                                "line": getattr(node, "lineno", -1),
-                                "description": "Blocked: cloud-metadata host",
-                            }
-                        )
-                    elif not _is_trusted_host(host_arg):
-                        network_calls.append(
-                            {
-                                "type": "untrusted_host_blocked",
-                                "line": getattr(node, "lineno", -1),
-                                "description": (
-                                    "Blocked: host not in sandbox allowlist; "
-                                    "use an allowed informational source"
-                                ),
-                            }
-                        )
+                # 3) A recognised egress call whose host cannot be read is untrusted, not absent.
+                # `urlopen("http://" + h)` reaches the attacker's host exactly as the spelled-out literal
+                # does, and no later screen sees python-tool code.
+                if unreadable and node.args and fq in _NETWORK_URL_ARG0_FQ:
+                    network_calls.append(
+                        {
+                            "type": "unreadable_host_blocked",
+                            "line": getattr(node, "lineno", -1),
+                            "description": (
+                                "Blocked: network destination is not a literal the sandbox "
+                                "can check; write the allowed host out in full"
+                            ),
+                        }
+                    )
+                if any(_is_metadata_host(h) for h in hosts):
+                    network_calls.append(
+                        {
+                            "type": "metadata_host_blocked",
+                            "line": getattr(node, "lineno", -1),
+                            "description": "Blocked: cloud-metadata host",
+                        }
+                    )
+                elif any(not _is_trusted_host(h) for h in hosts):
+                    network_calls.append(
+                        {
+                            "type": "untrusted_host_blocked",
+                            "line": getattr(node, "lineno", -1),
+                            "description": (
+                                "Blocked: host not in sandbox allowlist; "
+                                "use an allowed informational source"
+                            ),
+                        }
+                    )
 
             is_open_call = (
                 (isinstance(node.func, ast.Name) and node.func.id == "open")
