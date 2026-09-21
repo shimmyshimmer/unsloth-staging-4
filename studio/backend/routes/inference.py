@@ -39031,7 +39031,10 @@ async def generate_diffusion_image(
             raise HTTPException(status_code = 500, detail = _generate_failure_detail(msg))
         except Exception as exc:
             logger.error("diffusion.generate_failed: %s", exc, exc_info = True)
-            raise HTTPException(status_code = 500, detail = "Image generation failed.")
+            # Classified like the RuntimeError branch above: this one caught an OOM as a bare
+            # Exception and answered with the fallback, so the same failure named its cause or
+            # not depending on which class torch happened to raise.
+            raise HTTPException(status_code = 500, detail = _generate_failure_detail(str(exc)))
 
     # Persist each image with its full recipe. BOTH engines batch with a distinct seed per image, returned in ``seeds``, so each is individually reproducible.
     created_at = time.time()
@@ -39539,6 +39542,14 @@ async def diffusion_generate_progress(current_subject: str = Depends(get_current
         return account_access.hidden_generate_progress_response(DiffusionGenerateProgressResponse)
 
     progress = get_active_diffusion_engine().generate_progress()
+    # Classified HERE, where every other client-visible generation message is built: the
+    # engine retains its own raw text so this stays the only place that decides what a
+    # caller may see, and engine text with its local paths and argv never escapes.
+    raw_error = progress.get("error")
+    progress = {
+        **progress,
+        "error": _generate_failure_detail(raw_error) if raw_error else None,
+    }
     log_media_generation_progress("image", progress)
     # A finished generation still persisting its gallery record counts as active, so a reload probe keeps polling.
     if _diffusion_persist_active > 0 and not progress["active"]:
@@ -39839,7 +39850,7 @@ async def _generate_openai_images(
                     detail = openai_error_body(str(exc), status = 400, param = "size"),
                 )
             logger.error("openai_images.generate_failed: %s", exc)
-            raise HTTPException(status_code = 500, detail = "Image generation failed.")
+            raise HTTPException(status_code = 500, detail = _generate_failure_detail(str(exc)))
 
     # A local-directory load puts the host path in repo_id and the monitor row goes out over
     # the tunnel, so the label gets the same path-free treatment as active_model.
