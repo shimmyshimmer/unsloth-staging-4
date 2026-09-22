@@ -207,6 +207,46 @@ def _loaded_skip_modules(model_config):
     )
 
 
+def _config_uses_remote_code(config):
+    """Whether this config resolves to model code that lives outside transformers.
+
+    `trust_remote_code = True` only matters when the checkpoint ships its own
+    modeling files: an `auto_map` on the config (or one of its sub-configs), or a
+    config class loaded out of `transformers_modules`. Passing the flag for an
+    architecture transformers itself ships (a habit, and what most notebooks do)
+    changes nothing about where the code comes from, so the compiler can still
+    read and rewrite it. Skipping the compiler in that case silently drops the
+    fast LoRA forward, the fused loss and the compiled norms, which is where the
+    speed is. Unknown (no config) keeps the old, conservative answer.
+    """
+    if config is None:
+        return True
+
+    def _remote(cfg):
+        if (getattr(type(cfg), "__module__", "") or "").startswith("transformers_modules"):
+            return True
+        auto_map = getattr(cfg, "auto_map", None)
+        if isinstance(cfg, dict):
+            auto_map = cfg.get("auto_map", auto_map)
+        if not auto_map:
+            return False
+        # Only model or config classes are code the compiler would have to
+        # trace. A checkpoint can ship a custom tokenizer, processor or feature
+        # extractor through auto_map while its model is a native architecture;
+        # that must not switch the optimizations off.
+        return any(str(k).startswith(("AutoModel", "AutoConfig")) for k in auto_map)
+
+    if _remote(config):
+        return True
+    for sub in ("text_config", "vision_config", "audio_config"):
+        cfg = getattr(config, sub, None)
+        if cfg is None and isinstance(config, dict):
+            cfg = config.get(sub)
+        if cfg is not None and _remote(cfg):
+            return True
+    return False
+
+
 def _config_diff(config):
     if isinstance(config, dict):
         return config
@@ -1800,7 +1840,9 @@ class FastModel(FastBaseModel):
                 import_from_cache = False,
                 disable = False,
                 return_logits = return_logits,
-                trust_remote_code = trust_remote_code,
+                # Only real remote code is untraceable. A native architecture loaded
+                # with trust_remote_code = True keeps every optimization.
+                trust_remote_code = trust_remote_code and _config_uses_remote_code(model_config),
                 unsloth_force_compile = unsloth_force_compile,
             )
         for model_type in DISABLE_SDPA_MODEL_NAMES:
