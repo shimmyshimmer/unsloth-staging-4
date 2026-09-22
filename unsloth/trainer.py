@@ -19,8 +19,10 @@ from types import SimpleNamespace
 from typing import Optional, List
 from functools import wraps
 
-import trl
+import importlib
 import inspect
+
+import trl
 from trl import SFTTrainer
 
 # Bypass the partially-initialised unsloth namespace during the _gpu_init load.
@@ -282,6 +284,196 @@ _HYBRID_CONFIG_MARKERS = (
     "linear_value_head_dim",
     "full_attention_interval",
 )
+
+
+def _delegating_module_wrappers():
+    """Wrappers whose forward is variadic over a real model, and the attribute holding it.
+
+    The whole family, not one entry per report: a `forward(*args, **kwargs)`
+    answers yes for anything it holds, so reading it says nothing about the
+    checkpoint. What makes these safe to follow, and `PreTrainedModel.base_model`
+    not, is that the attribute below IS the checkpoint rather than an inner
+    decoder. Resolved tolerantly, because FSDP and dynamo have both moved between
+    torch versions and a missing name must not turn the gate into an error.
+    """
+    found = []
+    for module_path, name, attribute in (
+        ("torch.nn.parallel", "DataParallel", "module"),
+        ("torch.nn.parallel", "DistributedDataParallel", "module"),
+        ("torch.distributed.fsdp", "FullyShardedDataParallel", "module"),
+        ("torch._dynamo.eval_frame", "OptimizedModule", "_orig_mod"),
+    ):
+        try:
+            found.append((getattr(importlib.import_module(module_path), name), attribute))
+        except Exception:
+            continue
+    return tuple(found)
+
+
+_DELEGATING_MODULE_WRAPPERS = _delegating_module_wrappers()
+
+
+def _forward_accepts_packing_kwargs(model) -> bool:
+    """Can this model's forward be handed the packing metadata at all?
+
+    Padding-free batching flattens the batch and passes `packed_seq_lengths`
+    down to the model. A forward that neither names it nor collects **kwargs
+    raises TypeError on the first step, well after the trainer was built, so
+    ask the signature instead of the model name.
+    microsoft/Phi-4-reasoning-vision-15B is one such checkpoint:
+    Phi4ForCausalLMV.forward() got an unexpected keyword argument
+    'packed_seq_lengths'.
+
+    Answers True when the model cannot be inspected: refusing on an unreadable
+    signature would silently turn padding-free off for models that support it.
+    """
+    if model is None or isinstance(model, str):
+        return True
+    # Unwrap the adapter wrappers only. A PeftModel forwards **kwargs straight
+    # through, so asking the wrapper always answers yes while the checkpoint
+    # underneath is the one that raises. Stop at the checkpoint: descending
+    # further would reach the inner decoder, whose own forward may take
+    # **kwargs and answer for a model that does not.
+    target = model
+    for _ in range(4):
+        # Delegating wrappers (DataParallel, DDP, FSDP, torch.compile) first: their
+        # forward is variadic, so they answer yes for whatever they hold. The
+        # isinstance is exact, so nothing else carrying the same attribute name is
+        # followed.
+        inner = next(
+            (
+                held
+                for wrapper, attribute in _DELEGATING_MODULE_WRAPPERS
+                if isinstance(target, wrapper)
+                for held in (getattr(target, attribute, None),)
+                if held is not None and held is not target
+            ),
+            None,
+        )
+        if inner is not None:
+            target = inner
+            continue
+        # PEFT's own unwrap only. `PreTrainedModel.base_model` is a property
+        # returning the inner decoder, whose forward usually does take
+        # **kwargs, so following it would answer for the wrong module.
+        unwrap = getattr(target, "get_base_model", None)
+        if not callable(unwrap):
+            break
+        try:
+            unwrapped = unwrap()
+        except Exception:
+            break
+        if unwrapped is None or unwrapped is target:
+            break
+        target = unwrapped
+
+    return _forward_signature_accepts_packing(getattr(target, "forward", None))
+
+
+def _forward_signature_accepts_packing(forward) -> bool:
+    """The signature question alone, so a class can be asked it as well as an instance.
+
+    Shared rather than duplicated because the two callers must agree: a string
+    `model=` is answered from the class before `__init__`, the object from the
+    instance, and a disagreement between them would show up as padding-free
+    turning on for one spelling of the same checkpoint and off for the other.
+    """
+    if forward is None:
+        return True
+    try:
+        parameters = inspect.signature(forward).parameters
+    except (TypeError, ValueError):
+        return True
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return True
+    return "packed_seq_lengths" in parameters
+
+
+def _resolve_string_model_class(model_name, model_config, config_arg):
+    """The class TRL is about to build, resolved from the config and no weights.
+
+    A string `model=` has no forward to read, so without this the gate can only
+    fail open and then refuse after `__init__`, once the collator and the
+    transformed datasets make turning padding-free back off unsafe. The class
+    carries the same `forward` the instance will, and reaching it costs at most
+    the modeling module: `from_pretrained` is never called, so no checkpoint is
+    downloaded or materialised.
+
+    Best-effort by construction. Returns None when the class cannot be named or
+    imported, which leaves the existing post-init check as the backstop rather
+    than guessing.
+    """
+    if not isinstance(model_name, str) or model_config is None:
+        return None
+
+    init_kwargs = getattr(config_arg, "model_init_kwargs", None) or {}
+    trust_remote_code = init_kwargs.get("trust_remote_code")
+    if trust_remote_code is None:
+        trust_remote_code = getattr(config_arg, "trust_remote_code", None)
+
+    # Remote code first. `auto_map` is the only place a checkpoint outside the
+    # transformers tree names its own class, and that is exactly the population
+    # this gate exists for -- an in-tree class reachable below would have taken
+    # **kwargs anyway. Only with trust_remote_code already granted: the config
+    # load that produced `model_config` needed it too, so this imports nothing
+    # the user has not already allowed, and nothing TRL is not about to import.
+    auto_map = getattr(model_config, "auto_map", None) or {}
+    if trust_remote_code and isinstance(auto_map, dict):
+        forward = {
+            key: init_kwargs[key]
+            for key in ("revision", "subfolder", "token", "cache_dir", "code_revision")
+            if key in init_kwargs
+        }
+        for auto_class in (
+            "AutoModelForCausalLM",
+            "AutoModelForImageTextToText",
+            "AutoModelForVision2Seq",
+            "AutoModelForSeq2SeqLM",
+            "AutoModel",
+        ):
+            reference = auto_map.get(auto_class)
+            if not isinstance(reference, str):
+                continue
+            try:
+                from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+                return get_class_from_dynamic_module(reference, model_name, **forward)
+            except Exception:
+                continue
+
+    # In-tree, by the name the checkpoint records.
+    for architecture in getattr(model_config, "architectures", None) or ():
+        try:
+            import transformers
+
+            resolved = getattr(transformers, architecture, None)
+        except Exception:
+            resolved = None
+        if isinstance(resolved, type):
+            return resolved
+
+    # Last, the auto mappings keyed by config class. Lazy, so this imports the
+    # modeling module and nothing else.
+    try:
+        from transformers.models.auto import modeling_auto
+    except Exception:
+        return None
+    for mapping_name in (
+        "MODEL_FOR_CAUSAL_LM_MAPPING",
+        "MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING",
+        "MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING",
+        "MODEL_MAPPING",
+    ):
+        mapping = getattr(modeling_auto, mapping_name, None)
+        if mapping is None:
+            continue
+        try:
+            resolved = mapping[type(model_config)]
+        except Exception:
+            continue
+        if isinstance(resolved, type):
+            return resolved
+    return None
 
 
 def _is_hybrid_linear_attention_model(model) -> bool:
@@ -929,6 +1121,7 @@ def _patch_sft_trainer_auto_packing(trl_module):
             config_arg = kwargs.get("args")
 
         model = args[0] if len(args) >= 1 else kwargs.get("model")
+        model_config = None
         is_vlm = False
         is_unsupported_model = False
         is_hybrid = False
@@ -980,6 +1173,25 @@ def _patch_sft_trainer_auto_packing(trl_module):
         )
 
         # Disable padding-free for VLMs / custom collators / blocklisted models
+        forward_rejects_packing = not _forward_accepts_packing_kwargs(model)
+        # The signature question the line above could not answer yet; re-asked after init.
+        _packing_gate_deferred = model is None or isinstance(model, str)
+        # A string names a class, and the class carries the forward the instance will, so
+        # resolve it from the config that was already loaded above. Answering here turns
+        # the string case back into an ordinary silent block, like every other reason:
+        # after __init__ the only honest move left is to refuse, because the collator and
+        # the transformed datasets have been built from the flags by then.
+        _resolved_class = None
+        if _packing_gate_deferred and isinstance(model, str):
+            try:
+                _resolved_class = _resolve_string_model_class(model, model_config, config_arg)
+            except Exception:
+                _resolved_class = None
+            if _resolved_class is not None:
+                forward_rejects_packing = not _forward_signature_accepts_packing(
+                    getattr(_resolved_class, "forward", None)
+                )
+                _packing_gate_deferred = False
         blocked = (
             (data_collator is not None)
             or is_processor
@@ -989,6 +1201,7 @@ def _patch_sft_trainer_auto_packing(trl_module):
             or is_encoder_decoder
             or (is_hybrid and not hybrid_varlen_active)
             or (os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1")
+            or forward_rejects_packing
         )
         requested_pack = bool(getattr(config_arg, "packing", False))
         if blocked:
@@ -1011,6 +1224,17 @@ def _patch_sft_trainer_auto_packing(trl_module):
                 reason = "hybrid linear-attention model"
             elif is_unsupported_model:
                 reason = f"unsupported model type(s): {', '.join(model_types)}"
+            elif forward_rejects_packing:
+                # Name the real blocker: otherwise this falls through to the
+                # UNSLOTH_RETURN_LOGITS branch and points at an unset flag. For a
+                # string `model=` the blocker is the class that was resolved from it,
+                # not `str`, which would name the spelling instead of the checkpoint.
+                blocker = (
+                    _resolved_class.__name__
+                    if _resolved_class is not None
+                    else type(model).__name__
+                )
+                reason = f"{blocker}.forward() does not accept packed_seq_lengths"
             elif data_collator is None:
                 # compute_metrics, preprocess_logits_for_metrics, for_inference() and the user can all set it, so
                 # name the flag and not a setter.
@@ -1058,6 +1282,35 @@ def _patch_sft_trainer_auto_packing(trl_module):
                 original_init(self, *args, **kwargs)
             else:
                 raise
+
+        # The backstop, for the deferred cases the gate above could not settle: a `model_init=`
+        # builds the model inside `__init__`, and a string whose class could not be resolved
+        # from its config leaves nothing to read either. `self.model` exists now, so ask for
+        # real -- and say so, rather than trying to undo it.
+        #
+        # Undoing it is what does not work here. By this point TRL has built its collator from
+        # `padding_free=True` and, under packing, already transformed the train and eval
+        # datasets, so clearing the config flags leaves batches arriving flattened while the
+        # wrapper that names the sequence boundaries is skipped: attention and loss then cross
+        # example boundaries with nothing raising, which is worse than the TypeError this gate
+        # exists to prevent. Re-running `__init__` would rebuild them, but with a string it also
+        # materializes the checkpoint a second time while the first is still reachable through
+        # `self.model`, so the fallback for a large model would OOM in exactly the case it is
+        # for. Raising costs nothing and names the remedy; passing the model object instead of
+        # its name lets the gate above handle it silently and automatically.
+        if _packing_gate_deferred and not _forward_accepts_packing_kwargs(
+            getattr(self, "model", None)
+        ):
+            if packing_active or getattr(config_arg, "padding_free", False):
+                raise ValueError(
+                    f"Unsloth: {type(getattr(self, 'model', None)).__name__}.forward cannot "
+                    "take `packed_seq_lengths`, which packing and padding-free both pass, so "
+                    "training would fail on the first step. This could not be detected before "
+                    "the trainer was built because `model` was not given as a model and its "
+                    "class could not be resolved from its config. Either load it first and pass "
+                    "the model itself, and Unsloth will turn the two off for you, or set "
+                    "`packing = False` and `padding_free = False` on the config."
+                )
 
         trainer_args = getattr(self, "args", None)
         trainer_packing = bool(trainer_args and getattr(trainer_args, "packing", False))
