@@ -24,6 +24,7 @@ from .import_fixes import (
     fix_message_factory_issue,
     patch_torch_missing_attribute_error,
     check_triton_py_ssize_t_clean,
+    check_transformers_prequantized_vlm_quant_state,
     fix_torch_check_is_size,
     fix_torchao_torch_symbol_skew,
     propagate_torchao_fix_to_subprocesses,
@@ -103,6 +104,16 @@ torchvision_compatibility_check()
 disable_torchaudio_if_cuda_mismatched()
 fix_diffusers_warnings()
 fix_huggingface_hub()
+# Warn, do not raise: a run that loads no pre-quantized multimodal checkpoint never fails.
+# Below `disable_torchaudio_if_cuda_mismatched` and not up with the other version checks,
+# because this one is the only check here that IMPORTS transformers rather than reading its
+# metadata: `from transformers import conversion_mapping` pulls in 271 transformers
+# submodules, and putting that ahead of the torchaudio guard would be the exact ordering
+# that guard exists to prevent. Measured on transformers 5.17.0, the probe's import does
+# not itself reach transformers.processing_utils, transformers.audio_utils or torchaudio,
+# but nothing holds that true for the next release, and this check has no reason to run
+# early.
+check_transformers_prequantized_vlm_quant_state()
 del configure_amdgpu_asic_id_table_path
 del fix_bitsandbytes_rocm_arch_detection
 del disable_broken_causal_conv1d
@@ -244,6 +255,7 @@ from .device_type import arch_lacks_bf16, hip_visible_archs
 
 from .import_fixes import (
     fix_transformers5_bare_annotation_configs,
+    fix_transformers_composite_prefix_renaming,
     fix_transformers_fully_masked_rows,
     fix_transformers_rope_scaling_drops_theta,
     fix_xformers_performance_issue,
@@ -287,6 +299,16 @@ fix_transformers5_bare_annotation_configs()
 # nothing. Ordered here, before anything imports a model, so a plain transformers.generate in the
 # same process is covered too (#9708).
 fix_transformers_fully_masked_rows()
+# Probe-gated: no-ops unless this transformers merges a submodule's own prefix renaming into a
+# composite model's conversion mapping. Ordered here, before anything loads a checkpoint, so a
+# plain transformers.from_pretrained in the same process keeps its bitsandbytes quant_state too.
+fix_transformers_composite_prefix_renaming()
+# After the repair above, never before it: on exactly the releases that repair covers, warning
+# first would tell users to downgrade or upgrade away from a version that now works. The check
+# reads the live attribute, so a repair that declined to install still warns.
+# A run that loads no pre-quantized multimodal checkpoint never fails either way.
+check_transformers_prequantized_vlm_quant_state()
+del check_transformers_prequantized_vlm_quant_state
 # Probe-gated: no-ops unless replacing config.rope_scaling on this transformers really loses the
 # RoPE base frequency. Ordered here, before any config is built, so the object-style delegation
 # retry in models/llama.py sees a config that kept its base (#2405).
