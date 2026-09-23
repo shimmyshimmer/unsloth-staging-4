@@ -1,0 +1,74 @@
+name: "staging-11625 hub floor"
+on:
+  push:
+    branches: ["pr-11625-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  # An env carrying huggingface_hub 1.30 forward, then the pinned Diffusers main build installed the
+  # way the installer does it (UV_OVERRIDE set to the bundled file on Apple Silicon). base = main's
+  # requirement files, head = the PR's. The import is the verdict.
+  pin:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+        state: [base, head]
+        python: ['3.10', '3.13']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v6
+      - name: Requirement files for this state
+        run: |
+          mkdir -p req
+          ref=HEAD
+          if [ "${{ matrix.state }}" = base ]; then ref=origin/main; fi
+          for f in studio.txt single-env/overrides-darwin-arm64.txt diffusers-main.txt; do
+            git show "$ref:studio/backend/requirements/$f" > "req/$(basename "$f")"
+          done
+          git show "$ref:pyproject.toml" | grep -n "huggingface" || true
+          grep -n "huggingface" req/*.txt || true
+      - name: Old env, then the pinned build
+        run: |
+          uv venv --python "${{ matrix.python }}" venv
+          if [ -x venv/bin/python ]; then PY=venv/bin/python; else PY=venv/Scripts/python.exe; fi
+          echo "PY=$PY" >> "$GITHUB_ENV"
+          uv pip install --python "$PY" torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --python "$PY" "huggingface_hub==1.30.0"
+          uv pip install --python "$PY" -r req/studio.txt
+          if [ "$(uname -s)-$(uname -m)" = "Darwin-arm64" ]; then
+            export UV_OVERRIDE="$PWD/req/overrides-darwin-arm64.txt"
+            echo "UV_OVERRIDE=$UV_OVERRIDE"
+          fi
+          spec=$(grep -E '^diffusers @' req/diffusers-main.txt | sed -E 's#git\+https://github.com/huggingface/diffusers.git@([0-9a-f]+)#https://github.com/huggingface/diffusers/archive/\1.zip#')
+          echo "spec: $spec"
+          uv pip install --python "$PY" "$spec"
+          uv pip show --python "$PY" huggingface_hub diffusers | grep -E "^(Name|Version)"
+      - name: Import the pinned build
+        run: |
+          "$PY" - <<'EOF'
+          import huggingface_hub, diffusers
+          from diffusers import QwenImage21Pipeline  # noqa: F401
+          print("hub", huggingface_hub.__version__, "diffusers", diffusers.__version__, "import OK")
+          EOF
+      - name: Install requirement tests
+        if: matrix.state == 'head' && matrix.python == '3.13'
+        run: |
+          "$PY" -m ensurepip >/dev/null 2>&1 || true
+          uv pip install --python "$PY" pytest
+          "$PY" -m pytest -q tests/studio/install/test_diffusers_pin.py tests/studio/install/test_base_requirements_reach_install.py
