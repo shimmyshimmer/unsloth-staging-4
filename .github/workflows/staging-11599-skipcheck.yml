@@ -1,0 +1,27 @@
+name: "staging-11599 shared-blob tests verbose"
+on:
+  push:
+    branches: ["pr-11599-xplat-ci"]
+    paths: [".github/workflows/staging-11599-skipcheck.yml"]
+permissions:
+  contents: read
+jobs:
+  verbose:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart "huggingface_hub>=1.32.0"
+      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/hub/tests/test_model_services.py -v -rs -p no:cacheprovider -k "shared_xet or another_form or signature" 2>&1 | grep -E "PASSED|FAILED|SKIPPED|ERROR|passed|failed"; exit ${PIPESTATUS[0]}
