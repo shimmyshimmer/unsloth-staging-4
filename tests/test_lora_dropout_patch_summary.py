@@ -23,6 +23,9 @@ import textwrap
 
 import pytest
 import unsloth  # noqa: F401
+from real_accelerator import (
+    has_real_accelerator,
+)  # tests/_shared, on sys.path via tests/conftest.py
 
 from real_accelerator import has_real_accelerator
 from unsloth.models import llama as llama_module

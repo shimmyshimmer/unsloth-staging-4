@@ -35,6 +35,9 @@ import pathlib
 import pytest
 import torch
 import unsloth  # noqa: F401
+from real_accelerator import (
+    has_real_cuda,
+)  # tests/_shared, on sys.path via tests/conftest.py
 
 from real_accelerator import has_real_cuda
 from unsloth.models import llama as llama_module
