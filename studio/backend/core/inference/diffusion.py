@@ -1031,6 +1031,38 @@ def _account_owned_load(method):
     return wrapped
 
 
+def _release_render_on_unload(method):
+    """Return the pipeline's VRAM when an unload (or replacing load) lands mid-render.
+
+    A cancelled generate() raises out of _generation_slot, and the traceback keeps its frame, and with
+    it ``state`` and ``pipe``, alive after the slot is released. The unload waiting on that slot then
+    tears down while the pipeline is still referenced, so its clear_gpu_cache() frees nothing and the
+    weights end up reserved in the CUDA caching allocator once the exception is dropped, several GiB
+    until the next load. Clear those frames here and empty the cache after the last reference is gone.
+    """
+
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        token, teardowns = self._load_token, self._teardown_epoch
+        try:
+            return method(self, *args, **kwargs)
+        except BaseException as exc:
+            _clear_exception_frames(exc)
+            raise
+        finally:
+            # A replacing load whose begin_load bumped the token before this render began cancels it
+            # without moving the token again, and may finish its teardown before this runs, so any
+            # teardown reserved since entry counts too.
+            if self._load_token != token or self._teardown_epoch != teardowns:
+                try:
+                    clear_gpu_cache()
+                except Exception as exc:
+                    # Never mask the render's own outcome; the teardown reports a sticky fault anyway.
+                    logger.debug("diffusion.generate: cache release after unload failed: %s", exc)
+
+    return wrapped
+
+
 @dataclass
 class _GenState:
     """An in-flight generation, updated per denoising step for the progress bar."""
@@ -1532,6 +1564,8 @@ class DiffusionBackend:
         self._transition_owns_slot = False
         # Teardowns waiting to free this pipeline; a count supports concurrent reservations.
         self._teardown_waiters = 0
+        # Only ever grows: every teardown reserved, so a render can tell one ran under it after the fact.
+        self._teardown_epoch = 0
         # Set when no teardown is reserved; an Event keeps waiting independent of _lock.
         self._teardown_drained = threading.Event()
         self._teardown_drained.set()
@@ -1597,6 +1631,7 @@ class DiffusionBackend:
         """Fence queued generations off the pipeline this teardown is about to free. Call only while
         holding ``_lock``, so the count and the gate move together."""
         self._teardown_waiters += 1
+        self._teardown_epoch += 1
         self._teardown_drained.clear()
 
     def _release_teardown_locked(self) -> None:
@@ -6963,6 +6998,7 @@ class DiffusionBackend:
             attention_engaged or "native",
         )
 
+    @_release_render_on_unload
     def generate(
         self,
         *,
