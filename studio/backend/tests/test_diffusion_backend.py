@@ -10566,6 +10566,239 @@ def test_generate_guard_env_override(fake_runtime, tmp_path, monkeypatch):
     assert len(backend.generate(prompt = "a sloth", width = 1088, height = 1920, steps = 4)["images"]) == 1
 
 
+class _TilingVae:
+    """A VAE that can tile, like every diffusers AutoencoderKL*: records its saver calls."""
+
+    tile_sample_min_height = 256
+    tile_sample_min_width = 256
+
+    def __init__(self) -> None:
+        self.use_tiling = False
+        self.use_slicing = False
+        self.calls: list = []
+
+    def enable_tiling(self):
+        self.calls.append("enable_tiling")
+        self.use_tiling = True
+
+    def disable_tiling(self):
+        self.calls.append("disable_tiling")
+        self.use_tiling = False
+
+    def enable_slicing(self):
+        self.calls.append("enable_slicing")
+        self.use_slicing = True
+
+    def disable_slicing(self):
+        self.calls.append("disable_slicing")
+        self.use_slicing = False
+
+
+def _upscale_with_tiling_vae(backend, monkeypatch, **kw):
+    """Run a 1024 -> 2048 Upscale whose img2img pipe shares a tiling VAE; returns (vae, tiled_during_call)."""
+    from core.inference import diffusion as dmod
+
+    vae = _TilingVae()
+    monkeypatch.setattr(_FakeImg2ImgPipe, "vae", vae, raising = False)
+    # The fixture target is CPU; answer the attention probe as a fused-kernel GPU would.
+    monkeypatch.setattr(dmod, "_quadratic_attention", lambda target, backend = None: False)
+    seen = {}
+    real_call = _FakeImg2ImgPipe.__call__
+
+    def _spy(self, **kwargs):
+        seen["tiled"] = vae.use_tiling
+        seen["sliced"] = vae.use_slicing
+        return real_call(self, **kwargs)
+
+    monkeypatch.setattr(_FakeImg2ImgPipe, "__call__", _spy)
+    out = backend.generate(
+        prompt = "a sloth", steps = 4, seed = 1, init_image = _png_b64(1024), upscale = 2.0, **kw
+    )
+    return out, vae, seen
+
+
+def test_generate_upscale_that_was_refused_runs_with_the_vae_tiled(
+    fake_runtime, tmp_path, monkeypatch
+):
+    # Reported from Unsloth Desktop: a 2x Upscale refused as too big for the card while ComfyUI ran
+    # it on the same GPU. The untiled estimate for the 2048x2048 result is ~32 GB, but that is almost
+    # all full-frame VAE decode; tiled, the peak is the denoiser (measured 1.5 GiB on Qwen-Image).
+    backend = _loaded_backend_on_a_16g_card(tmp_path, monkeypatch)
+    # Before: a pipe whose VAE cannot tile gets the same refusal as ever.
+    with pytest.raises(ValueError, match = "2048x2048"):
+        backend.generate(prompt = "a sloth", steps = 4, seed = 1, init_image = _png_b64(1024), upscale = 2.0)
+    out, vae, seen = _upscale_with_tiling_vae(backend, monkeypatch)
+    assert len(out["images"]) == 1
+    assert _FakeImg2ImgPipe.last_kwargs["image"].size == (2048, 2048)
+    # Tiled and sliced for THIS call, and put back afterwards so later decodes are unchanged.
+    assert seen == {"tiled": True, "sliced": True}
+    assert not vae.use_tiling and not vae.use_slicing
+    assert vae.calls == ["enable_tiling", "enable_slicing", "disable_tiling", "disable_slicing"]
+
+
+def test_generate_upscale_that_fits_is_not_tiled(fake_runtime, tmp_path, monkeypatch):
+    # 512 -> 1024 is what the load budgeted: nothing is tiled, so the decode stays bit-identical.
+    backend = _loaded_backend_on_a_16g_card(tmp_path, monkeypatch)
+    from core.inference import diffusion as dmod
+
+    vae = _TilingVae()
+    monkeypatch.setattr(_FakeImg2ImgPipe, "vae", vae, raising = False)
+    monkeypatch.setattr(dmod, "_quadratic_attention", lambda target, backend = None: False)
+    backend.generate(prompt = "a sloth", steps = 4, seed = 1, init_image = _png_b64(512), upscale = 2.0)
+    assert vae.calls == []
+
+
+def test_generate_upscale_restores_the_vae_when_the_render_fails(
+    fake_runtime, tmp_path, monkeypatch
+):
+    backend = _loaded_backend_on_a_16g_card(tmp_path, monkeypatch)
+    from core.inference import diffusion as dmod
+
+    vae = _TilingVae()
+    monkeypatch.setattr(_FakeImg2ImgPipe, "vae", vae, raising = False)
+    monkeypatch.setattr(dmod, "_quadratic_attention", lambda target, backend = None: False)
+
+    def _boom(self, **kwargs):
+        raise RuntimeError("decode failed")
+
+    monkeypatch.setattr(_FakeImg2ImgPipe, "__call__", _boom)
+    with pytest.raises(RuntimeError, match = "decode failed"):
+        backend.generate(prompt = "a sloth", steps = 4, seed = 1, init_image = _png_b64(1024), upscale = 2.0)
+    assert not vae.use_tiling and not vae.use_slicing
+
+
+def test_generate_upscale_on_math_only_attention_still_refuses(fake_runtime, tmp_path, monkeypatch):
+    # The SDPA math fallback grows with the square of the tokens, so tiling the VAE is no way out.
+    from core.inference import diffusion as dmod
+
+    backend = _loaded_backend_on_a_16g_card(tmp_path, monkeypatch)
+    monkeypatch.setattr(_FakeImg2ImgPipe, "vae", _TilingVae(), raising = False)
+    monkeypatch.setattr(dmod, "_quadratic_attention", lambda target, backend = None: True)
+    with pytest.raises(ValueError) as excinfo:
+        backend.generate(prompt = "a sloth", steps = 4, seed = 1, init_image = _png_b64(1024), upscale = 2.0)
+    message = str(excinfo.value)
+    assert "Upload a smaller source image" in message
+    assert "Allow oversized generations" in message
+
+
+class _UnslicedTilingVae(_TilingVae):
+    """Tiles at 1024 (AutoencoderKL) but its enable_slicing() leaves slicing off."""
+
+    tile_sample_min_height = 1024
+    tile_sample_min_width = 1024
+
+    def enable_slicing(self):
+        self.calls.append("enable_slicing")
+
+
+@pytest.mark.parametrize("vae_cls", [_TilingVae, _UnslicedTilingVae])
+def test_generate_windows_batch_prices_tiles_at_the_batch_without_slicing(
+    fake_runtime, tmp_path, monkeypatch, vae_cls
+):
+    # Without slicing every VAE tile carries the whole batch, so the one-image tile price that let
+    # this Windows batch through must be re-checked once slicing turns out not to engage.
+    from core.inference import diffusion as dmod
+
+    backend = _loaded_backend_on_a_16g_card(tmp_path, monkeypatch)
+    vae = vae_cls()
+    monkeypatch.setattr(_FakeImg2ImgPipe, "vae", vae, raising = False)
+    monkeypatch.setattr(dmod, "_quadratic_attention", lambda target, backend = None: False)
+    monkeypatch.setattr(dmod.sys, "platform", "win32")
+    kw = dict(prompt = "a sloth", steps = 4, init_image = _png_b64(1024), upscale = 2.0, seeds = [1, 2])
+    if vae_cls is _TilingVae:
+        assert len(backend.generate(**kw)["images"]) == 2
+    else:
+        with pytest.raises(ValueError, match = "2048x2048 at a batch of 2"):
+            backend.generate(**kw)
+    assert not vae.use_tiling and not vae.use_slicing
+
+
+class _BrokenTilingVae(_TilingVae):
+    """A VAE that claims to tile but whose enable_tiling() raises."""
+
+    def enable_tiling(self):
+        self.calls.append("enable_tiling")
+        raise RuntimeError("tiling unsupported")
+
+
+def test_generate_upscale_refuses_when_the_vae_tiling_does_not_engage(
+    fake_runtime, tmp_path, monkeypatch
+):
+    # The size only passed because the decode would be tiled; if tiling cannot be turned on, the
+    # full-frame decode the guard priced as too big must not run.
+    from core.inference import diffusion as dmod
+
+    backend = _loaded_backend_on_a_16g_card(tmp_path, monkeypatch)
+    vae = _BrokenTilingVae()
+    monkeypatch.setattr(_FakeImg2ImgPipe, "vae", vae, raising = False)
+    monkeypatch.setattr(dmod, "_quadratic_attention", lambda target, backend = None: False)
+    calls = []
+    real_call = _FakeImg2ImgPipe.__call__
+
+    def _spy(self, **kwargs):
+        calls.append(kwargs)
+        return real_call(self, **kwargs)
+
+    monkeypatch.setattr(_FakeImg2ImgPipe, "__call__", _spy)
+    with pytest.raises(ValueError) as excinfo:
+        backend.generate(prompt = "a sloth", steps = 4, seed = 1, init_image = _png_b64(1024), upscale = 2.0)
+    assert "2048x2048" in str(excinfo.value)
+    assert "even with tiled VAE decoding" not in str(excinfo.value)
+    assert calls == []
+    # The slicing it did engage is put back.
+    assert not vae.use_slicing and not vae.use_tiling
+    # The caller's own override still runs it.
+    out = backend.generate(
+        prompt = "a sloth",
+        steps = 4,
+        seed = 1,
+        init_image = _png_b64(1024),
+        upscale = 2.0,
+        allow_oversized = True,
+    )
+    assert len(out["images"]) == 1
+
+
+def test_quadratic_attention_follows_the_engaged_backend(monkeypatch):
+    # A math-only SDPA device (#8225, ROCm gfx1200) that engaged AITER at load does not run the
+    # quadratic kernel, so the tiled look applies; left at native it does not.
+    from core.inference import diffusion as dmod
+
+    monkeypatch.setattr(dmod, "sdpa_math_only", lambda target: True)
+    assert dmod._quadratic_attention(object()) is True
+    assert dmod._quadratic_attention(object(), None) is True
+    assert dmod._quadratic_attention(object(), "native") is True
+    for engaged in ("aiter", "sage", "xformers", "_native_cudnn", "flash"):
+        assert dmod._quadratic_attention(object(), engaged) is False
+
+
+def test_generate_upscale_with_an_engaged_backend_on_a_math_only_device_runs_tiled(
+    fake_runtime, tmp_path, monkeypatch
+):
+    from core.inference import diffusion as dmod
+
+    backend = _loaded_backend_on_a_16g_card(tmp_path, monkeypatch)
+    monkeypatch.setattr(dmod, "sdpa_math_only", lambda target: True)
+    vae = _TilingVae()
+    monkeypatch.setattr(_FakeImg2ImgPipe, "vae", vae, raising = False)
+    # Left at native, the math fallback keeps the refusal.
+    with pytest.raises(ValueError, match = "2048x2048"):
+        backend.generate(prompt = "a sloth", steps = 4, seed = 1, init_image = _png_b64(1024), upscale = 2.0)
+    object.__setattr__(backend._state, "attention_backend", "aiter")
+    out = backend.generate(
+        prompt = "a sloth", steps = 4, seed = 1, init_image = _png_b64(1024), upscale = 2.0
+    )
+    assert len(out["images"]) == 1
+    assert vae.calls[:2] == ["enable_tiling", "enable_slicing"]
+
+
+def test_generate_allow_oversized_runs_a_refused_request(fake_runtime, tmp_path, monkeypatch):
+    # The per-request override the Images page sends: no env var, no terminal.
+    backend = _loaded_backend_on_a_16g_card(tmp_path, monkeypatch)
+    out = backend.generate(prompt = "a sloth", width = 1088, height = 1920, steps = 4, allow_oversized = True)
+    assert len(out["images"]) == 1
+
+
 def test_generate_guard_leaves_a_large_batch_to_the_oom_backoff(
     fake_runtime, tmp_path, monkeypatch
 ):
