@@ -250,6 +250,31 @@ def planner_quantization_kwargs(
     return kwargs
 
 
+def planner_accepts_prepared_config():
+    """Whether this unsloth_zoo's planner takes a `config` object in place of rebuilding one from the model name. Read off the signature rather than a version, since the worktree a developer runs from has no version bump."""
+    try:
+        import inspect
+        from unsloth_zoo.device_map_planner import build_meta_model
+        return "config" in inspect.signature(build_meta_model).parameters
+    except Exception:
+        return False
+
+
+def compressed_tensors_prepared_config(model_config):
+    """`model_config` when `check_and_disable_bitsandbytes_loading` armed the on-the-fly re-quantization of a compressed-tensors packed checkpoint on it, else None. The planner has to size that load from this object: the checkpoint's own quantization config is gone from it and bitsandbytes 4-bit is what the load applies."""
+    if model_config is None:
+        return None
+    try:
+        from .compressed_tensors_bnb import UNSLOTH_COMPRESSED_TENSORS_ATTR
+    except Exception:
+        return None
+    return (
+        model_config
+        if getattr(model_config, UNSLOTH_COMPRESSED_TENSORS_ATTR, None) is not None
+        else None
+    )
+
+
 def planner_model_class(config, trust_remote_code = False):
     """The model class the planner's own rules pick for `config`, or None if unknown. The planner never sees the auto class the load chose: `config` is whatever the caller passed, while the planner rebuilds the repo's from `model_name`, and the two can disagree."""
     try:
@@ -312,6 +337,7 @@ def resolve_unsloth_device_map(
     full_finetuning = False,
     planner_kwargs = None,
     skip_reason = None,
+    prepared_config = None,
     **config_kwargs,
 ):
     """Plan a head-aware multi-GPU map for `device_map = "unsloth"`, else return as-is. Opt-in only, so nothing an existing caller passes changes meaning, and the plan is built on the meta device: no GPU memory, no weight download. Falls back to "sequential" wherever a plan cannot apply, since a model that loads the old way beats one that refuses to load at all; `DeviceMapInfeasible` is the exception, raised rather than spilling a bitsandbytes model to CPU, and swallowing it would hand the user an OOM instead of a diagnosis. `skip_reason` is the caller's veto, for when only the caller can tell the planner would describe a different model than the load builds."""
@@ -382,6 +408,15 @@ def resolve_unsloth_device_map(
                 # Under what is actually free: they may know of reservations we cannot measure, but planning above free is how a plan OOMs on dispatch.
                 budgets[device] = budget if measured is None else min(measured, budget)
         max_memory = budgets
+
+    # `prepared_config` is the config object this load will really use when it no longer matches the repo's config.json: a compressed-tensors packed INT4 checkpoint re-quantized to bitsandbytes on the fly has had its own quantization config dropped, and the planner rebuilding from the name would put it back and refuse the bitsandbytes runtime config. Only a planner that takes `config` gets it; an older unsloth_zoo declines the plan the way it always did.
+    if prepared_config is not None:
+        if planner_accepts_prepared_config():
+            config_kwargs = dict(config_kwargs, config = prepared_config)
+        else:
+            return _fallback(
+                "this unsloth_zoo cannot plan from the prepared config of a re-quantized checkpoint"
+            )
 
     try:
         plan = plan_device_map_for_pretrained(
@@ -1404,17 +1439,178 @@ def _restore_dropped_fp8_scales(
         return (0, 0)
 
 
+def _forward_calls_checkpointing(cls):
+    """True when a backbone's own `forward` hands its layers to a checkpoint function."""
+    import inspect
+
+    try:
+        source = inspect.getsource(cls.forward)
+    except Exception:
+        return True  # cannot read it: assume it does and change nothing
+    return "_gradient_checkpointing_func" in source or "checkpoint(" in source
+
+
+def _checkpointed_layer_forward(original):
+    @functools.wraps(original)
+    def forward(self, *args, **kwargs):
+        holder = self.__dict__.get("_unsloth_gradient_checkpointing_holder")
+        holder = holder() if holder is not None else None
+        if (
+            not self.training
+            or holder is None
+            or not getattr(holder, "gradient_checkpointing", False)
+            or not torch.is_grad_enabled()
+            # A cache would be written a second time by the recompute.
+            or kwargs.get("past_key_value") is not None
+            or kwargs.get("past_key_values") is not None
+        ):
+            return original(self, *args, **kwargs)
+        if not args and "hidden_states" in kwargs:
+            # A reentrant checkpoint only tracks gradients through positional tensors.
+            args = (kwargs.pop("hidden_states"),)
+        # Any other keyword tensor that needs a gradient (Kimi-K3's block_residual, carried from
+        # layer to layer) goes positional too: held by closure it stays tied to the previous
+        # layers' graph, so every recompute re-ran their backward inside its own.
+        grad_keys = [k for k, v in kwargs.items() if torch.is_tensor(v) and v.requires_grad]
+        n_args = len(args)
+        grad_values = tuple(kwargs.pop(k) for k in grad_keys)
+
+        def run(*inputs):
+            return original(
+                self, *inputs[:n_args], **kwargs, **dict(zip(grad_keys, inputs[n_args:]))
+            )
+
+        # The function gradient_checkpointing_enable() installed, so Unsloth's offloaded
+        # checkpoint and the caller's use_reentrant choice apply here too.
+        checkpoint = getattr(holder, "_gradient_checkpointing_func", None)
+        if checkpoint is None:
+            return torch.utils.checkpoint.checkpoint(run, *args, *grad_values, use_reentrant = False)
+        return checkpoint(run, *args, *grad_values)
+
+    forward._unsloth_manual_checkpoint = True
+    return forward
+
+
+def install_remote_gradient_checkpointing(model, verbose = True):
+    """Remote-code backbones (the DeepSeek-V3 port Kimi-K2.7 ships) carry a
+    `self.gradient_checkpointing` flag their decoder loop never reads, so
+    `gradient_checkpointing_enable()` sets a flag nothing acts on and every activation is
+    still kept. Wrap the decoder layers of such a backbone so the flag really checkpoints.
+    Only remote-code backbones are touched, never a layer that is already a transformers
+    `GradientCheckpointingLayer`, and the wrapper is inert while the flag is False.
+    Returns the class names wrapped."""
+    import types
+    import weakref
+
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except Exception:
+        GradientCheckpointingLayer = ()
+    wrapped = []
+    for _, holder in model.named_modules():
+        holder_cls = type(holder)
+        if "transformers_modules" not in (getattr(holder_cls, "__module__", "") or ""):
+            continue
+        if not hasattr(holder, "gradient_checkpointing"):
+            continue
+        layers = getattr(holder, "layers", None)
+        if not isinstance(layers, torch.nn.ModuleList) or len(layers) == 0:
+            continue
+        if _forward_calls_checkpointing(holder_cls):
+            continue
+        for layer in layers:
+            cls = type(layer)
+            if GradientCheckpointingLayer and isinstance(layer, GradientCheckpointingLayer):
+                continue
+            layer.__dict__["_unsloth_gradient_checkpointing_holder"] = weakref.ref(holder)
+            if not getattr(cls.__dict__.get("forward"), "_unsloth_manual_checkpoint", False):
+                cls.forward = _checkpointed_layer_forward(cls.forward)
+                wrapped.append(cls.__name__)
+            # A device_map load wraps `forward` in an accelerate hook that keeps the bound
+            # original as `_old_forward`; point it at the wrapper or the patch is never reached.
+            if "_old_forward" in vars(layer):
+                layer._old_forward = types.MethodType(cls.forward, layer)
+    wrapped = sorted(set(wrapped))
+    if wrapped and verbose:
+        print(
+            "Unsloth: the remote modeling code never calls a checkpoint function; wrapping "
+            + ", ".join(wrapped)
+            + " so gradient checkpointing actually saves activations."
+        )
+    return wrapped
+
+
+def enable_composite_gradient_checkpointing(model, verbose = True):
+    """A remote-code composition (Kimi-K2.7: `KimiK25ForConditionalGeneration` holding a
+    `DeepseekV3ForCausalLM`) often leaves `supports_gradient_checkpointing` at its False
+    default on the outer class while the language model inside supports it. transformers'
+    `gradient_checkpointing_enable` refuses on the outer flag alone, although the enable
+    itself walks every submodule. When an inner PreTrainedModel supports checkpointing, mark
+    the outer class as supporting it too. Returns True when the flag was set."""
+    try:
+        from transformers import PreTrainedModel
+    except Exception:
+        return False
+    if not isinstance(model, PreTrainedModel):
+        return False
+    # For every remote-code model, including one whose outer class already declares support:
+    # the flag is what transformers checks, the wrapper is what makes it do anything.
+    install_remote_gradient_checkpointing(model, verbose = verbose)
+    if getattr(type(model), "supports_gradient_checkpointing", False):
+        return False
+    inner = [
+        type(m).__name__
+        for name, m in model.named_modules()
+        if name
+        and isinstance(m, PreTrainedModel)
+        and getattr(type(m), "supports_gradient_checkpointing", False)
+    ]
+    if not inner:
+        return False
+    type(model).supports_gradient_checkpointing = True
+    if verbose:
+        print(
+            f"Unsloth: {type(model).__name__} did not declare gradient checkpointing support but its "
+            f"{inner[0]} does; enabling it on the outer model."
+        )
+    return True
+
+
 def check_and_disable_bitsandbytes_loading(
     model_config,
     load_in_4bit = True,
     load_in_8bit = False,
     verbose = True,
+    requantize_packed = True,
 ):
-    """Disable bitsandbytes loading (load_in_4bit/load_in_8bit) when the model already carries a non-bitsandbytes quantization config. Returns ``(load_in_4bit, load_in_8bit, quant_method)``, with both flags False if they were disabled and quant_method the detected method or None."""
+    """Disable bitsandbytes loading (load_in_4bit/load_in_8bit) when the model already carries a non-bitsandbytes quantization config. Returns ``(load_in_4bit, load_in_8bit, quant_method)``, with both flags False if they were disabled and quant_method the detected method or None.
+
+    ``requantize_packed`` lets a compressed-tensors packed INT4/INT8 checkpoint be re-quantized to bitsandbytes 4-bit on the fly. Pass False when the weights are not going through the transformers loader as 4-bit at all (``fast_inference``, where vLLM reads the packed checkpoint itself, and ``full_finetuning``, which turns 4-bit off after this call): arming there would strip the checkpoint's own quantization config with nothing left to consume the plan."""
     quant_method = get_quant_type(model_config)
 
     if quant_method is None or quant_method == "bitsandbytes":
         return load_in_4bit, load_in_8bit, quant_method
+
+    if str(quant_method).lower() in ("compressed-tensors", "compressed_tensors", "sparseml"):
+        # An MXFP4 checkpoint stays MXFP4 on every compressed-tensors route, not only the
+        # bitsandbytes one below, whichever spelling its config uses.
+        from .mxfp4_compressed_linear import install_compressed_tensors_keep_packed
+        install_compressed_tensors_keep_packed()
+
+    # A compressed-tensors packed INT4 / INT8 weight-only checkpoint (W4A16, W8A16) can be
+    # decompressed one tensor at a time while it streams in and re-quantized to bitsandbytes
+    # 4-bit, which is the only form PEFT can attach a LoRA to. When that applies the
+    # checkpoint's own quantization config is dropped from `model_config` here and
+    # `load_in_4bit` stays on.
+    if (
+        requantize_packed
+        and load_in_4bit
+        and not load_in_8bit
+        and str(quant_method).lower() in ("compressed-tensors", "compressed_tensors", "sparseml")
+    ):
+        from .compressed_tensors_bnb import arm_compressed_tensors_bnb_loading
+        if arm_compressed_tensors_bnb_loading(model_config, verbose = verbose) is not None:
+            return True, False, None
 
     # A non-bitsandbytes quantization config (compressed-tensors, gptq, awq) means BOTH bitsandbytes loading flags must be disabled to avoid config conflicts.
     if load_in_4bit or load_in_8bit:
@@ -1427,6 +1623,25 @@ def check_and_disable_bitsandbytes_loading(
         load_in_8bit = False
 
     return load_in_4bit, load_in_8bit, quant_method
+
+
+def quantization_config_selects_bnb_4bit(quantization_config):
+    """True when an explicit ``quantization_config`` (None, a dict or a config object) leaves the load on bitsandbytes 4-bit.
+
+    The packed compressed-tensors re-quantization hands its plan to the bitsandbytes 4-bit quantizer, so a caller who
+    passes any other quantizer (8-bit bitsandbytes, GPTQ, AWQ) must not have the checkpoint's own config stripped."""
+    if quantization_config is None:
+        return True
+    if isinstance(quantization_config, dict):
+        get = quantization_config.get
+    else:
+        get = lambda key, default = None: getattr(quantization_config, key, default)
+    method = get("quant_method", "") or ""
+    # BitsAndBytesConfig stores a QuantizationMethod enum, whose str() is the member name on some Pythons.
+    method = str(getattr(method, "value", method)).lower()
+    if "bitsandbytes" not in method:
+        return False
+    return bool(get("load_in_4bit", False)) and not bool(get("load_in_8bit", False))
 
 
 def sync_unsloth_model_name_bnb_flags(load_in_4bit, load_in_8bit):
