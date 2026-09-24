@@ -18,6 +18,10 @@ import pytest
 from fastapi import HTTPException
 
 import routes.inference as inference_route
+
+# Probe keys carry the acting account, since a negative answer is only negative for the
+# account whose private scan roots it was taken under.
+KEY = lambda path: inference_route._alias_probe_key(path)  # noqa: E731
 from models.inference import LoadRequest
 from core.inference import local_model_resolver as resolver
 from utils import openai_auto_switch_settings as settings
@@ -266,12 +270,14 @@ class _LoadRecorder:
         self.backend._gguf_path = request.model_path
         self.backend.is_loaded = True
         # Mirror _load_model_impl: a load advertises its own id until the
-        # auto-switch caller overwrites it with the repo id.
-        self.backend._openai_advertised_id = None
+        # auto-switch caller overwrites it with the repo id. Same helper the route
+        # calls, so the probe marker is dropped here exactly as it is in production.
+        inference_route._clear_advertised_alias(self.backend)
         self.backend._openai_gguf_companion_roots = tuple(request._gguf_companion_roots)
         self.backend._openai_gguf_companion_state = resolver.local_gguf_companion_state(
             tuple(request._gguf_companion_roots)
         )
+        from core.inference import llama_keepwarm as kw
 
         kw.note_model_loaded(self.backend)
         return None
@@ -3071,6 +3077,202 @@ def test_already_serving_requested_by_path_records_advertised_alias(monkeypatch)
         resolver, "resolve_local_gguf", lambda _m, **_kw: pytest.fail("resolver re-entered")
     )
     _run_hook(path)
+
+
+def test_a_load_path_no_scan_root_indexes_is_only_resolved_once(monkeypatch):
+    # The deferral above costs a rebuild, and is only worth it while there is an alias
+    # to record. A model loaded from outside every scan root has none, so it must not
+    # pay for the attempt on every message.
+    path = "/elsewhere/unscanned-model.gguf"
+    backend = _FakeBackend(path)
+    rec = _LoadRecorder(backend)
+    monkeypatch.setattr(settings, "get_openai_auto_switch_enabled", lambda: True)
+    monkeypatch.setattr(inference_route, "get_llama_cpp_backend", lambda: backend)
+    monkeypatch.setattr(inference_route, "_load_model_impl", rec)
+    monkeypatch.setattr(inference_route, "_auto_switch_waiters", {})
+    monkeypatch.setattr(inference_route, "_alias_probed_load_paths", set())
+    monkeypatch.setattr(inference_route, "_alias_probe_inflight", {})
+    scans = []
+    monkeypatch.setattr(resolver, "_build_index", lambda: scans.append(1) or {})
+    # The warmer's daemon thread also calls _build_index, so counting it here would read a
+    # background rebuild as a second request-path probe.
+    monkeypatch.setattr(resolver, "warm_index_soon", lambda *a, **k: None)
+    # A lapsed TTL, which is how it actually lapses: _snapshot_is_trusted compares the
+    # snapshot age against _CACHE_TTL_S. NOT invalidate_index(), which additionally means
+    # the scan roots may have changed and so deliberately re-opens the probe.
+    monkeypatch.setattr(resolver, "_CACHE_TTL_S", 0)
+    for _ in range(4):
+        _run_hook(path)
+    assert rec.calls == []
+    assert len(scans) == 1, f"resolved {len(scans)} times, expected one probe"
+
+
+def test_a_scan_root_change_reopens_the_alias_probe(monkeypatch):
+    # The probe is a NEGATIVE answer -- this path has no alias -- and it is only true of
+    # the scan roots it was taken under. Add the model's parent as a scan folder and the
+    # alias exists, so a probe that outlived the change would keep the shortcut answering
+    # and /v1/models would report the filename for the rest of the load.
+    path = "/elsewhere/unscanned-model.gguf"
+    backend = _FakeBackend(path)
+    rec = _LoadRecorder(backend)
+    monkeypatch.setattr(settings, "get_openai_auto_switch_enabled", lambda: True)
+    monkeypatch.setattr(inference_route, "get_llama_cpp_backend", lambda: backend)
+    monkeypatch.setattr(inference_route, "_load_model_impl", rec)
+    monkeypatch.setattr(inference_route, "_auto_switch_waiters", {})
+    monkeypatch.setattr(inference_route, "_alias_probed_load_paths", set())
+    monkeypatch.setattr(inference_route, "_alias_probe_inflight", {})
+    monkeypatch.setattr(inference_route, "_alias_probe_generation", -1)
+    scans = []
+    monkeypatch.setattr(resolver, "_build_index", lambda: scans.append(1) or {})
+    monkeypatch.setattr(resolver, "warm_index_soon", lambda *a, **k: None)
+    monkeypatch.setattr(resolver, "_CACHE_TTL_S", 0)
+
+    _run_hook(path)
+    _run_hook(path)
+    assert len(scans) == 1, "the second message must reuse the probe, not re-scan"
+
+    # What add_scan_folder_endpoint / remove_scan_folder_endpoint call on every change.
+    resolver.invalidate_index()
+    _run_hook(path)
+    assert len(scans) == 2, (
+        f"resolved {len(scans)} times: a scan-root change must re-open the probe so the "
+        "alias can be recorded"
+    )
+    assert rec.calls == []
+
+
+def test_a_cancelled_generation_gives_the_probe_back(monkeypatch):
+    # _resolve_and_switch raises out of its first _raise_if_generation_cancelled(), before
+    # either resolver is called. Settling there would mark the path answered though nothing
+    # looked, and every later request would shortcut to the filename for the rest of the
+    # load. An unanswered claim goes back instead.
+    path = "/elsewhere/unscanned-model.gguf"
+    backend = _FakeBackend(path)
+    rec = _LoadRecorder(backend)
+    monkeypatch.setattr(settings, "get_openai_auto_switch_enabled", lambda: True)
+    monkeypatch.setattr(inference_route, "get_llama_cpp_backend", lambda: backend)
+    monkeypatch.setattr(inference_route, "_load_model_impl", rec)
+    monkeypatch.setattr(inference_route, "_auto_switch_waiters", {})
+    monkeypatch.setattr(inference_route, "_alias_probed_load_paths", set())
+    monkeypatch.setattr(inference_route, "_alias_probe_inflight", {})
+    monkeypatch.setattr(inference_route, "_alias_probe_generation", -1)
+    scans = []
+    monkeypatch.setattr(resolver, "_build_index", lambda: scans.append(1) or {})
+    monkeypatch.setattr(resolver, "warm_index_soon", lambda *a, **k: None)
+    monkeypatch.setattr(resolver, "_CACHE_TTL_S", 0)
+
+    # Cancelled the way a stopped generation cancels: the event on request.state, which is
+    # the only thing _raise_if_generation_cancelled reads. The claim is taken before that
+    # check (_loaded_identity_satisfies runs first), so the real finally has to give it back.
+    cancelled = threading.Event()
+    cancelled.set()
+    request = SimpleNamespace(
+        state = SimpleNamespace(generation_cancel_event = cancelled),
+    )
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(inference_route._maybe_auto_switch_model(path, request, "tester"))
+    assert excinfo.value.status_code == 409
+    assert scans == [], "cancelled above both resolvers, so nothing looked for an alias"
+    assert (
+        inference_route._alias_probed_load_paths == set()
+    ), "a pass that never started was recorded as answered"
+    assert inference_route._alias_probe_inflight == {}, "the claim was not given back"
+
+    # And so the next request still reaches the resolver, rather than shortcutting to the
+    # filename for the rest of the load.
+    _run_hook(path)
+    assert len(scans) == 1, f"resolved {len(scans)} times, expected the probe to reopen"
+
+
+def test_a_concurrent_request_waits_for_a_probe_still_in_flight(monkeypatch):
+    # The first request CLAIMS the probe and then runs the slow scan. A second naming the
+    # same path while that is in flight must also reach the resolver: taking the shortcut
+    # there answers with _openai_advertised_id still None, so the response reports the
+    # filename even though the first request is about to record the alias.
+    path = "/elsewhere/unscanned-model.gguf"
+    backend = _FakeBackend(path)
+    monkeypatch.setattr(inference_route, "get_llama_cpp_backend", lambda: backend)
+    monkeypatch.setattr(inference_route, "_alias_probed_load_paths", set())
+    monkeypatch.setattr(inference_route, "_alias_probe_inflight", {})
+    monkeypatch.setattr(inference_route, "_alias_probe_generation", -1)
+
+    first = inference_route._loaded_identity_satisfies(path)
+    second = inference_route._loaded_identity_satisfies(path)
+    assert first is False, "the first request must reach the resolver"
+    assert second is False, (
+        "the second request shortcut while the probe was still in flight, so its response "
+        "would carry the filename rather than the alias"
+    )
+    assert backend._openai_advertised_id is None
+
+    # Once a pass completes the answer is settled and the shortcut is correct.
+    inference_route._alias_probe_settle(path)
+    assert inference_route._loaded_identity_satisfies(path) is True
+
+
+def test_a_request_for_another_model_does_not_spend_the_probe(monkeypatch):
+    # The probe exists so the request that names the load path reaches the resolver and
+    # the alias gets recorded. A request naming something else resolves elsewhere, so it
+    # records nothing for the resident model; spending the single probe on it would leave
+    # the path answered from the shortcut forever, reported by its filename.
+    path = "/models/lmstudio/TheBloke/weights-file-01.gguf"
+    backend = _FakeBackend(path)
+    rec = _LoadRecorder(backend)
+    monkeypatch.setattr(settings, "get_openai_auto_switch_enabled", lambda: True)
+    monkeypatch.setattr(inference_route, "get_llama_cpp_backend", lambda: backend)
+    monkeypatch.setattr(inference_route, "_load_model_impl", rec)
+    monkeypatch.setattr(inference_route, "_auto_switch_waiters", {})
+    monkeypatch.setattr(inference_route, "_alias_probed_load_paths", set())
+    monkeypatch.setattr(
+        resolver,
+        "resolve_local_gguf",
+        lambda m, **_kw: (path, None, "Qwen3-4B-Instruct-GGUF") if m == path else None,
+    )
+
+    _run_hook("org/Not-Here-GGUF")  # a resolver miss: nothing loads, the path stays resident
+    assert rec.calls == []
+    assert backend._openai_advertised_id is None
+
+    _run_hook(path)
+    assert rec.calls == []  # already serving -> no reload
+    assert backend._openai_advertised_id == "Qwen3-4B-Instruct-GGUF"
+
+
+def test_a_reload_of_the_same_path_probes_for_the_alias_again(monkeypatch):
+    # Every load clears the advertised id, so the alias has to be recorded again. A
+    # marker held over from the previous load would send the next request straight to
+    # the resident shortcut, and /v1/models and responses would revert to the filename.
+    path = "/models/lmstudio/TheBloke/weights-file-01.gguf"
+    backend = _FakeBackend(path)
+    rec = _LoadRecorder(backend)
+    _wire(
+        monkeypatch,
+        enabled = True,
+        resolves_to = (path, None, "Qwen3-4B-Instruct-GGUF"),
+        backend = backend,
+        recorder = rec,
+    )
+    monkeypatch.setattr(inference_route, "_alias_probed_load_paths", set())
+    _run_hook(path)
+    assert backend._openai_advertised_id == "Qwen3-4B-Instruct-GGUF"
+
+    # What the load route does to the advertised id, by the same call it makes.
+    inference_route._clear_advertised_alias(backend)
+    _run_hook(path)
+    assert rec.calls == []  # still serving the same weights -> no reload
+    assert backend._openai_advertised_id == "Qwen3-4B-Instruct-GGUF"
+
+
+def test_the_load_route_clears_the_probe_with_the_advertised_id():
+    # The reset above is only correct where the load happens, so keep the two together.
+    import inspect
+
+    src = inspect.getsource(inference_route._load_model_impl)
+    assert "_clear_advertised_alias(llama_backend)" in src
+    # Scoped to the GGUF path's backend name. The transformers path clears the alias
+    # before its load for a different reason, off `backend`, and restores it if the
+    # load fails, so a bare reset there is correct and must stay allowed.
+    assert "llama_backend._openai_advertised_id = None" not in src
 
 
 def test_streaming_responses_uses_advertised_id_helper():
@@ -9613,7 +9815,7 @@ def test_count_tokens_does_not_own_an_independent_load(monkeypatch):
     identity_checked = threading.Event()
     independent_load_done = threading.Event()
 
-    def loaded_identity_satisfies(_requested):
+    def loaded_identity_satisfies(_requested, _claimed = None):
         identity_checked.set()
         assert independent_load_done.wait(timeout = 2)
         return True
@@ -11617,3 +11819,286 @@ def test_preset_reasoning_budget_rejects_booleans():
     with pytest.raises(ValueError, match = "Expected a number, got a boolean"):
         ChatPresetLoadConfig(reasoningBudget = True)
     assert ChatPresetLoadConfig(reasoningBudget = 0).reasoningBudget == 0
+
+
+def test_an_unrelated_request_cannot_settle_someone_elses_claim(monkeypatch):
+    # Every request runs a resolver pass, but only the one NAMING the load path claims the
+    # probe. Settling the whole in-flight set let an unrelated model's request answer that
+    # claim before the switch it belongs to had recorded its alias, and the next request for
+    # the path then shortcut with _openai_advertised_id still None -- the filename, for the
+    # rest of the load.
+    path = "/elsewhere/unscanned-model.gguf"
+    backend = _FakeBackend(path)
+    rec = _LoadRecorder(backend)
+    monkeypatch.setattr(settings, "get_openai_auto_switch_enabled", lambda: True)
+    monkeypatch.setattr(inference_route, "get_llama_cpp_backend", lambda: backend)
+    monkeypatch.setattr(inference_route, "_load_model_impl", rec)
+    monkeypatch.setattr(inference_route, "_auto_switch_waiters", {})
+    monkeypatch.setattr(inference_route, "_alias_probed_load_paths", set())
+    monkeypatch.setattr(inference_route, "_alias_probe_inflight", {})
+    monkeypatch.setattr(inference_route, "_alias_probe_generation", -1)
+    monkeypatch.setattr(resolver, "_build_index", lambda: {})
+    monkeypatch.setattr(resolver, "warm_index_soon", lambda *a, **k: None)
+    monkeypatch.setattr(resolver, "_CACHE_TTL_S", 0)
+
+    # The owner claims the path and is still mid-pass, so the claim is outstanding.
+    assert inference_route._loaded_identity_satisfies(path) is False
+    assert inference_route._alias_probe_inflight == {KEY(path): 1}
+
+    # A request for a different model runs its own full pass, start to finish.
+    _run_hook("unsloth/something-else-GGUF")
+    assert inference_route._alias_probed_load_paths == set(), (
+        "an unrelated request settled a claim it never took"
+    )
+    assert inference_route._alias_probe_inflight == {KEY(path): 1}, "still in flight"
+    # So the owner's path still reaches the resolver rather than answering from the shortcut.
+    assert inference_route._loaded_identity_satisfies(path) is False
+
+    # The owner's own completed pass is what settles it.
+    inference_route._alias_probe_settle(path)
+    assert inference_route._loaded_identity_satisfies(path) is True
+
+
+def test_a_failed_index_scan_does_not_count_as_a_confirmed_absence(monkeypatch):
+    # resolve_local_gguf swallows a scan failure and returns None, which at the route looks
+    # exactly like "no such model". Settling on it marked the path answered from a scan that
+    # never landed, so the shortcut stayed wrong for the whole load even after the scanner
+    # recovered. A published stamp is the difference: _build_index raising never reaches
+    # _publish.
+    path = "/elsewhere/unscanned-model.gguf"
+    backend = _FakeBackend(path)
+    rec = _LoadRecorder(backend)
+    monkeypatch.setattr(settings, "get_openai_auto_switch_enabled", lambda: True)
+    monkeypatch.setattr(inference_route, "get_llama_cpp_backend", lambda: backend)
+    monkeypatch.setattr(inference_route, "_load_model_impl", rec)
+    monkeypatch.setattr(inference_route, "_auto_switch_waiters", {})
+    monkeypatch.setattr(inference_route, "_alias_probed_load_paths", set())
+    monkeypatch.setattr(inference_route, "_alias_probe_inflight", {})
+    monkeypatch.setattr(inference_route, "_alias_probe_generation", -1)
+    monkeypatch.setattr(resolver, "warm_index_soon", lambda *a, **k: None)
+    monkeypatch.setattr(resolver, "_CACHE_TTL_S", 0)
+
+    attempts = []
+
+    def failing_build():
+        attempts.append(1)
+        raise OSError("transient: scan root disappeared")
+
+    monkeypatch.setattr(resolver, "_build_index", failing_build)
+    _run_hook(path)
+    assert attempts, "the scan must have been attempted at all"
+    assert inference_route._alias_probed_load_paths == set(), (
+        "a scan that failed was recorded as a confirmed absence"
+    )
+    assert inference_route._alias_probe_inflight == {}, "and the claim was not given back"
+
+    # Once the scanner recovers, the next request probes again and THAT settles.
+    monkeypatch.setattr(resolver, "_build_index", lambda: {})
+    _run_hook(path)
+    assert inference_route._alias_probed_load_paths == {KEY(path)}, (
+        "a recovered scan must settle the probe, or the index rebuilds forever"
+    )
+
+
+def test_a_positive_resolution_that_aborts_does_not_settle_the_probe(monkeypatch):
+    # The marker means "this load path has no alias to record". A POSITIVE resolution is
+    # the opposite claim, and the switch behind it can still abort before recording
+    # anything -- a resident directory asked for at a different quant is not already
+    # serving, so it goes on to the arbiter and the load, either of which can refuse.
+    # Settling there left the path answered from the shortcut with _openai_advertised_id
+    # never set, so /v1/models and every response kept reporting the filename.
+    path = "/models/lmstudio/TheBloke/weights-file-01.gguf"
+    # Resident at Q4_K_M; the request names the same path at Q8_0, which is what makes
+    # _already_serving false without inventing a state the route cannot reach.
+    backend = _FakeBackend(path, hf_variant = "Q4_K_M")
+    rec = _LoadRecorder(backend, fail = True)
+    monkeypatch.setattr(settings, "get_openai_auto_switch_enabled", lambda: True)
+    monkeypatch.setattr(inference_route, "get_llama_cpp_backend", lambda: backend)
+    monkeypatch.setattr(inference_route, "_load_model_impl", rec)
+    monkeypatch.setattr(inference_route, "_auto_switch_waiters", {})
+    monkeypatch.setattr(inference_route, "_alias_probed_load_paths", set())
+    monkeypatch.setattr(inference_route, "_alias_probe_inflight", {})
+    monkeypatch.setattr(inference_route, "_alias_probe_generation", -1)
+    monkeypatch.setattr(resolver, "warm_index_soon", lambda *a, **k: None)
+    monkeypatch.setattr(
+        resolver,
+        "resolve_local_gguf",
+        lambda m, **_kw: (path, "Q8_0", "Qwen3-4B-Instruct-GGUF"),
+    )
+    # The index is trustworthy, so the ONLY thing standing between this pass and a settle
+    # is that it resolved POSITIVELY. Left at whatever the process happens to hold, the
+    # assertions below pass for the wrong reason and the case discriminates nothing.
+    monkeypatch.setattr(resolver, "index_answer_is_trustworthy", lambda: True)
+
+    try:
+        _run_hook(f"{path}:Q8_0")
+    except Exception:
+        pass
+    assert rec.calls, "the switch must have been attempted for this case to mean anything"
+    assert backend._openai_advertised_id is None, (
+        "the alias was never recorded, which is the premise of this case"
+    )
+    assert inference_route._alias_probed_load_paths == set(), (
+        "a resolution that aborted before recording its alias settled the probe"
+    )
+    assert inference_route._alias_probe_inflight == {}, "and the claim was not given back"
+    # So the next request reaches the resolver again and the alias can still be recorded.
+    monkeypatch.setattr(inference_route, "_load_model_impl", _LoadRecorder(backend))
+    _run_hook(path)
+    assert backend._openai_advertised_id == "Qwen3-4B-Instruct-GGUF"
+
+
+def test_one_accounts_negative_probe_does_not_answer_for_another(monkeypatch):
+    # The resolver keeps a snapshot PER managed account because their scan roots are
+    # private (local_model_resolver._managed_scans). A negative answer is therefore only
+    # negative for the account that took it: another account whose roots do index that
+    # path has an alias to record, and inheriting the marker would send it straight to the
+    # resident shortcut with _openai_advertised_id still None -- the filename, on /v1/models
+    # and in every response, for the rest of the load.
+    from utils.account_context import AccountContext, run_as
+
+    path = "/elsewhere/unscanned-model.gguf"
+    backend = _FakeBackend(path)
+    monkeypatch.setattr(inference_route, "get_llama_cpp_backend", lambda: backend)
+    monkeypatch.setattr(inference_route, "_alias_probed_load_paths", set())
+    monkeypatch.setattr(inference_route, "_alias_probe_inflight", {})
+    monkeypatch.setattr(inference_route, "_alias_probe_generation", -1)
+
+    tenant = AccountContext("acct-a", "ada")
+    other = AccountContext("acct-b", "bo")
+
+    # Tenant A probes and completes a pass finding no alias under ITS roots.
+    assert run_as(tenant, inference_route._loaded_identity_satisfies, path) is False
+    run_as(tenant, inference_route._alias_probe_settle, path)
+    assert run_as(tenant, inference_route._loaded_identity_satisfies, path) is True
+
+    # Tenant B has never probed, so it must still reach the resolver.
+    assert run_as(other, inference_route._loaded_identity_satisfies, path) is False, (
+        "a second account inherited the first account's negative probe"
+    )
+    # And the owner too, whose snapshot is a third one again.
+    assert inference_route._loaded_identity_satisfies(path) is False
+
+    keys = inference_route._alias_probed_load_paths | set(inference_route._alias_probe_inflight)
+    assert len(keys) == 3, f"probe state is not per account: {keys}"
+
+
+def test_a_released_claim_does_not_take_a_concurrent_one_with_it(monkeypatch):
+    # Two requests can name the same unaliased path at once, and both are told to go to the
+    # resolver. If the first is cancelled and its release dropped the whole entry, the
+    # second's completed pass would have nothing to settle, so the next request would pay
+    # for the multi-root scan all over again -- which is the cost this marker exists to
+    # avoid.
+    path = "/elsewhere/unscanned-model.gguf"
+    backend = _FakeBackend(path)
+    monkeypatch.setattr(inference_route, "get_llama_cpp_backend", lambda: backend)
+    monkeypatch.setattr(inference_route, "_alias_probed_load_paths", set())
+    monkeypatch.setattr(inference_route, "_alias_probe_inflight", {})
+    monkeypatch.setattr(inference_route, "_alias_probe_generation", -1)
+
+    assert inference_route._loaded_identity_satisfies(path) is False
+    assert inference_route._loaded_identity_satisfies(path) is False
+    assert inference_route._alias_probe_inflight == {KEY(path): 2}, "both claims must be held"
+
+    # The first is cancelled.
+    inference_route._alias_probe_release(path)
+    assert inference_route._alias_probe_inflight == {KEY(path): 1}, (
+        "a cancelled request took a concurrent request's claim with it"
+    )
+    # The second's pass completes, and THAT is what memoizes the answer.
+    inference_route._alias_probe_settle(path)
+    assert inference_route._alias_probed_load_paths == {KEY(path)}
+    assert inference_route._loaded_identity_satisfies(path) is True
+
+    # Both released and nothing settled leaves the path open, not stuck claimed.
+    monkeypatch.setattr(inference_route, "_alias_probed_load_paths", set())
+    monkeypatch.setattr(inference_route, "_alias_probe_inflight", {})
+    inference_route._loaded_identity_satisfies(path)
+    inference_route._loaded_identity_satisfies(path)
+    inference_route._alias_probe_release(path)
+    inference_route._alias_probe_release(path)
+    assert inference_route._alias_probe_inflight == {}
+    assert inference_route._alias_probed_load_paths == set()
+
+
+def test_a_miss_from_a_partial_scan_is_not_a_confirmed_absence(monkeypatch):
+    # Every source in _build_index is guarded on its own, so one bad root drops that source
+    # and the index is still published, fresh. A miss read from that snapshot is only what
+    # the pass could SEE: memoizing it left the resident shortcut answering with the
+    # filename after the failing source recovered, with nothing to reopen the probe short of
+    # an explicit invalidation or a reload.
+    path = "/elsewhere/unscanned-model.gguf"
+    backend = _FakeBackend(path)
+    rec = _LoadRecorder(backend)
+    monkeypatch.setattr(settings, "get_openai_auto_switch_enabled", lambda: True)
+    monkeypatch.setattr(inference_route, "get_llama_cpp_backend", lambda: backend)
+    monkeypatch.setattr(inference_route, "_load_model_impl", rec)
+    monkeypatch.setattr(inference_route, "_auto_switch_waiters", {})
+    monkeypatch.setattr(inference_route, "_alias_probed_load_paths", set())
+    monkeypatch.setattr(inference_route, "_alias_probe_inflight", {})
+    monkeypatch.setattr(inference_route, "_alias_probe_generation", -1)
+    monkeypatch.setattr(resolver, "warm_index_soon", lambda *a, **k: None)
+    monkeypatch.setattr(resolver, "_CACHE_TTL_S", 0)
+
+    # A scan that publishes a real snapshot having skipped a source, exactly as a transient
+    # LM Studio or scan-folder failure does.
+    def partial_build():
+        resolver._note_scan_source_skipped()
+        return {}
+
+    monkeypatch.setattr(resolver, "_build_index", partial_build)
+    _run_hook(path)
+    assert resolver.index_last_scan_was_complete() is False, (
+        "the harness did not actually produce a partial scan"
+    )
+    assert inference_route._alias_probed_load_paths == set(), (
+        "a miss from a partial scan was memoized as a confirmed absence"
+    )
+    assert inference_route._alias_probe_inflight == {}, "and the claim was not given back"
+
+    # The source recovers, and THAT pass is what settles the probe.
+    monkeypatch.setattr(resolver, "_build_index", lambda: {})
+    _run_hook(path)
+    assert resolver.index_last_scan_was_complete() is True
+    assert inference_route._alias_probed_load_paths == {KEY(path)}, (
+        "a complete scan must still settle, or the index rebuilds for every message"
+    )
+
+
+def test_the_completeness_verdict_belongs_to_the_scan_that_published(monkeypatch):
+    """Reset per pass and set only after the build returns.
+
+    Left over from a previous pass it would either condemn a good scan or bless a partial
+    one, and a build that RAISES publishes nothing, so the snapshot a later caller reads was
+    not produced by that attempt at all.
+    """
+    monkeypatch.setattr(resolver, "_CACHE_TTL_S", 0)
+
+    monkeypatch.setattr(resolver, "_build_index", lambda: {})
+    resolver._index()
+    assert resolver.index_last_scan_was_complete() is True
+
+    def partial():
+        resolver._note_scan_source_skipped()
+        return {}
+
+    monkeypatch.setattr(resolver, "_build_index", partial)
+    resolver._index()
+    assert resolver.index_last_scan_was_complete() is False, "a partial pass read as complete"
+
+    # And back again: the count does not accumulate across passes.
+    monkeypatch.setattr(resolver, "_build_index", lambda: {})
+    resolver._index()
+    assert resolver.index_last_scan_was_complete() is True, "the skip count leaked into the next pass"
+
+    # A build that raises leaves no verdict claiming otherwise.
+    def boom():
+        resolver._note_scan_source_skipped()
+        raise OSError("scan root vanished")
+
+    monkeypatch.setattr(resolver, "_build_index", boom)
+    with pytest.raises(OSError):
+        resolver._index()
+    assert resolver.index_last_scan_was_complete() is True, (
+        "a raising build must not rewrite the verdict of the snapshot still published"
+    )
