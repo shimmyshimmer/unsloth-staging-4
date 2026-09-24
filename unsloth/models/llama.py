@@ -38,6 +38,7 @@ from .loader_utils import (
     planner_class_mismatch_reason,
     planner_model_class,
     planner_config_overrides,
+    compressed_tensors_prepared_config,
     planner_hub_kwargs,
     planner_kwargs_with_max_memory,
     planner_quantization_kwargs,
@@ -103,6 +104,7 @@ from unsloth.models._attn_mask_compat import (
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
 from ..kernels import *
+from ..kernels.utils import has_mxfp4_base
 from ..tokenizer_utils import *
 from .vision import FastBaseModel
 
@@ -2592,6 +2594,7 @@ class FastLlamaModel:
 
         from .loader_utils import (
             check_and_disable_bitsandbytes_loading,
+            quantization_config_selects_bnb_4bit,
             sync_unsloth_model_name_bnb_flags,
         )
         from unsloth_zoo.utils import get_quant_type
@@ -2599,9 +2602,26 @@ class FastLlamaModel:
         load_in_8bit = kwargs.get("load_in_8bit", False)
 
         # Disable bitsandbytes loading if the model has non-bitsandbytes quantization.
-        load_in_4bit, load_in_8bit, _ckpt_quant_method = check_and_disable_bitsandbytes_loading(
-            model_config, load_in_4bit = load_in_4bit, load_in_8bit = load_in_8bit
+        # The loader forwards load_in_4bit = False when an explicit quantization_config owns the
+        # precision, so a bitsandbytes 4-bit config is the 4-bit request here.
+        _user_quantization_config = kwargs.get("quantization_config", None)
+        _explicit_bnb_4bit = _user_quantization_config is not None and (
+            quantization_config_selects_bnb_4bit(_user_quantization_config)
         )
+        _checked_4bit, _checked_8bit, _ckpt_quant_method = check_and_disable_bitsandbytes_loading(
+            model_config,
+            load_in_4bit = load_in_4bit or _explicit_bnb_4bit,
+            load_in_8bit = load_in_8bit,
+            # vLLM reads a packed compressed-tensors checkpoint itself; only the transformers 4-bit load
+            # re-quantizes it. A num_labels load stays in-process even with fast_inference.
+            requantize_packed = not _vllm_will_load_weights(fast_inference, num_labels)
+            # A caller's own quantizer must stay authoritative: only a bitsandbytes 4-bit one consumes the plan.
+            and quantization_config_selects_bnb_4bit(_user_quantization_config),
+        )
+        # Only an explicit bitsandbytes 4-bit config keeps the caller's flags (the loader passed
+        # False for it); any other quantizer clears them as on the plain path.
+        if not _explicit_bnb_4bit:
+            load_in_4bit, load_in_8bit = _checked_4bit, _checked_8bit
         # Correct UNSLOTH_MODEL_NAME's bnb tokens now the effective bnb state is known (the per-load env
         # was built before remap/disable). gpt-oss only.
         sync_unsloth_model_name_bnb_flags(load_in_4bit, load_in_8bit)
@@ -2650,6 +2670,8 @@ class FastLlamaModel:
             fast_inference = fast_inference,
             planner_kwargs = planner_kwargs_with_max_memory(device_map_planner_kwargs, kwargs),
             skip_reason = _planner_skip_reason,
+            # The config this load uses once a compressed-tensors packed checkpoint is re-quantized to bitsandbytes on the fly; the repo's config.json would size it as compressed-tensors and refuse the bitsandbytes flags.
+            prepared_config = compressed_tensors_prepared_config(model_config),
             **planner_config_overrides(kwargs),
             token = token,
             trust_remote_code = trust_remote_code,
@@ -2709,7 +2731,9 @@ class FastLlamaModel:
         kwargs.pop("attn_implementation", None)  # No need since we auto call it
 
         # Cannot be None, since HF now checks for the config.
-        if load_in_4bit:
+        # A caller's own BitsAndBytesConfig (fast_inference forwards load_in_4bit = True with it)
+        # stays authoritative: its quant type, double quant and skip list are theirs.
+        if load_in_4bit and not _explicit_bnb_4bit:
             kwargs["quantization_config"] = bnb_config
 
         kwargs = add_dtype_kwargs(dtype, kwargs)
@@ -2780,7 +2804,15 @@ class FastLlamaModel:
                     variant = kwargs.get("variant"),
                 )
             elif not fast_inference:
-                if user_config is not None:
+                # A packed compressed-tensors checkpoint being re-quantized to bitsandbytes on the fly
+                # had its own quantization config dropped from `model_config`; the load must use that
+                # object rather than re-read config.json.
+                from .compressed_tensors_bnb import UNSLOTH_COMPRESSED_TENSORS_ATTR
+
+                _ct_requant = (
+                    getattr(model_config, UNSLOTH_COMPRESSED_TENSORS_ATTR, None) is not None
+                )
+                if user_config is not None or _ct_requant:
                     # Transformers 5.x @strict model init rejects extra kwargs next to config=, so set the override
                     # on the config and pass the single config object through.
                     if max_position_embeddings is not None:
@@ -3517,6 +3549,12 @@ class FastLlamaModel:
                 target_modules,
                 moe_module_targets = _moe_module_targets,
             )
+            from .remote_moe_shims import packed_expert_target_parameters
+            target_parameters = packed_expert_target_parameters(
+                model,
+                target_parameters,
+                target_modules if isinstance(target_modules, (list, tuple, str)) else None,
+            )
 
         if _moe_module_targets:
             _added = [t for t in _moe_module_targets if t not in final_modules]
@@ -3814,6 +3852,7 @@ class FastLlamaModel:
                         and (len(getattr(gate_proj, "lora_magnitude_vector", []) or []) == 0)
                         and (len(getattr(up_proj, "lora_magnitude_vector", []) or []) == 0)
                         and (len(getattr(down_proj, "lora_magnitude_vector", []) or []) == 0)
+                        and not has_mxfp4_base(gate_proj, up_proj, down_proj)
                     ):
                         # See stackoverflow.com/questions/50599045 on replacing a function within a class of a module.
                         if hasattr(mlp_module, "_unsloth_forward"):
@@ -3843,6 +3882,7 @@ class FastLlamaModel:
                     and (len(getattr(q_proj, "lora_magnitude_vector", []) or []) == 0)
                     and (len(getattr(k_proj, "lora_magnitude_vector", []) or []) == 0)
                     and (len(getattr(v_proj, "lora_magnitude_vector", []) or []) == 0)
+                    and not has_mxfp4_base(q_proj, k_proj, v_proj)
                 ):
                     layer.self_attn.apply_qkv = apply_lora_qkv
                     n_qkv += 1
@@ -3860,6 +3900,7 @@ class FastLlamaModel:
                     hasattr(o_proj, "lora_A")
                     and (getattr(o_proj, "base_layer", o_proj).bias is None)
                     and (len(getattr(o_proj, "lora_magnitude_vector", []) or []) == 0)
+                    and not has_mxfp4_base(o_proj)
                 ):
                     layer.self_attn.apply_o = apply_lora_o
                     n_o += 1
