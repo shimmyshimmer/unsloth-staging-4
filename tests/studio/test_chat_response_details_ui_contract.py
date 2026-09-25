@@ -8,8 +8,13 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
+from _en_catalog import en_string
+
 REPO = Path(__file__).resolve().parents[2]
 THREAD_TSX = REPO / "studio/frontend/src/components/assistant-ui/thread.tsx"
+MESSAGE_MENU_TIME_TSX = REPO / "studio/frontend/src/components/assistant-ui/message-menu-time.tsx"
 DETAILS_TSX = (
     REPO / "studio/frontend/src/components/assistant-ui/message-response-details-sheet.tsx"
 )
@@ -349,11 +354,137 @@ def _without_comments(tag: str) -> str:
     return re.sub(r"/\*.*?\*/", " ", "\n".join(kept), flags = re.S)
 
 
+def _prop_value(tag: str, name: str) -> str | None:
+    """The expression inside `name={...}` on an opening tag, brace-aware, wherever it sits."""
+    at = re.search(rf"(?:^|[\s{{]){re.escape(name)}=\{{", tag)
+    if at is None:
+        return None
+    depth, index = 1, at.end()
+    while index < len(tag) and depth:
+        depth += {"{": 1, "}": -1}.get(tag[index], 0)
+        index += 1
+    return tag[at.end() : index - 1] if depth == 0 else None
+
+
+def _definition_body(name: str, source: str) -> str | None:
+    """The text of `const|let|var name = ...;` or `function name(...) {...}`, brace-aware.
+
+    A regex up to the first semicolon stopped inside a multi-statement body
+    (`() => { track(); setDetailsOpen(true); }`) and missed the call.
+    """
+    at = re.search(
+        rf"(?:\b(?:const|let|var)\s+{re.escape(name)}\s*=|\bfunction\s+{re.escape(name)}\s*\()",
+        source,
+    )
+    if at is None:
+        return None
+    is_function = at.group(0).startswith("function")
+    # A function match ends on the `(` of its parameters, so it starts one level in.
+    depth, index = (1 if is_function else 0), at.end()
+    while index < len(source):
+        char = source[index]
+        if char in "({[":
+            depth += 1
+        elif char in ")}]":
+            depth -= 1
+            if depth < 0 or (is_function and char == "}" and depth == 0):
+                return source[at.end() : index + 1]
+        elif char == ";" and depth == 0 and not is_function:
+            return source[at.end() : index]
+        index += 1
+    return source[at.end() :]
+
+
+def _opens_details(value: str, source: str) -> bool:
+    """Whether a callback opens the sheet: inline, or the name of one this file defines."""
+    if re.search(r"\bsetDetailsOpen\(\s*true\s*\)", value):
+        return True
+    name = re.fullmatch(r"\s*([A-Za-z_$][\w$]*)\s*", value)
+    if name is None:
+        return False
+    body = _definition_body(name.group(1), source)
+    return body is not None and bool(re.search(r"\bsetDetailsOpen\(\s*true\s*\)", body))
+
+
+def _calls_show_details(menu: str) -> bool:
+    """Whether some `onSelect` hands over `onShowDetails` or calls it.
+
+    `onSelect={() => onShowDetails}` mentions the name without calling it, so a bare mention
+    inside a larger expression does not count.
+    """
+    for at in re.finditer(r"\bonSelect=\{", menu):
+        value = _prop_value(menu[at.start() :], "onSelect")
+        if value is None:
+            continue
+        if re.fullmatch(r"\s*onShowDetails\s*", value) or re.search(
+            r"\bonShowDetails\s*(?:\?\.)?\(", value
+        ):
+            return True
+    return False
+
+
 def test_assistant_more_menu_exposes_response_details_action():
-    src = THREAD_TSX.read_text(encoding = "utf-8")
+    """The More menu still opens the details sheet. Since #11928 the item that does it lives in
+    MessageMenuTime, beside the response's timestamp, so the action is followed through the prop
+    the thread hands it rather than looked for in thread.tsx itself. Comments are removed first,
+    so a commented-out element or handler does not count, and the prop is read wherever it sits
+    and however the callback is spelled."""
+    src = _without_block_comments(THREAD_TSX.read_text(encoding = "utf-8"))
     assert "MessageResponseDetailsSheet" in src
-    assert "See response details" in src
-    assert "setDetailsOpen(true)" in src
+    tags = _opening_tags(src, "<MessageMenuTime")
+    assert tags, "thread.tsx no longer renders MessageMenuTime"
+    callbacks = [_prop_value(tag, "onShowDetails") for tag in tags]
+    assert any(
+        value is not None and _opens_details(value, src) for value in callbacks
+    ), f"no MessageMenuTime is handed a callback that opens the details sheet: {callbacks}"
+    menu = _without_block_comments(MESSAGE_MENU_TIME_TSX.read_text(encoding = "utf-8"))
+    assert "See response details" in menu
+    assert _calls_show_details(menu), "the item no longer calls onShowDetails"
+
+
+@pytest.mark.parametrize(
+    "value, source, opens",
+    [
+        ("() => setDetailsOpen(true)", "", True),
+        ("showDetails", "const showDetails = () => setDetailsOpen(true);", True),
+        (
+            "showDetails",
+            "const showDetails = () => {\n  track();\n  setDetailsOpen(true);\n};",
+            True,
+        ),
+        (
+            "showDetails",
+            "const showDetails = useCallback(() => {\n  track();\n  setDetailsOpen(true);\n}, []);",
+            True,
+        ),
+        ("showDetails", "function showDetails() {\n  track();\n  setDetailsOpen(true);\n}", True),
+        (
+            "showDetails",
+            "const showDetails = () => {\n  track();\n};\nsetDetailsOpen(true);",
+            False,
+        ),
+        ("showDetails", "function showDetails() {\n  track();\n}\nsetDetailsOpen(true);", False),
+        ("showDetails", "const showDetails = () => setDetailsOpen(false);", False),
+        ("missing", "const showDetails = () => setDetailsOpen(true);", False),
+    ],
+)
+def test_the_callback_reader_follows_a_named_callback_to_its_end(value, source, opens):
+    assert _opens_details(value, source) is opens
+
+
+@pytest.mark.parametrize(
+    "menu, calls",
+    [
+        ("<Item onSelect={onShowDetails}>", True),
+        ("<Item onSelect={() => onShowDetails()}>", True),
+        ("<Item onSelect={() => { track(); onShowDetails?.(); }}>", True),
+        ("<Item onSelect={() => onShowDetails}>", False),
+        ("<Item onSelect={() => track(onShowDetails)}>", False),
+        ("<Item onClick={onShowDetails}>", False),
+    ],
+)
+def test_the_menu_item_must_call_on_show_details_not_just_name_it(menu, calls):
+    assert _calls_show_details(menu) is calls
 
 
 def test_response_details_sheet_uses_unsloth_sheet_and_key_sections():
@@ -422,7 +553,8 @@ def test_response_model_badge_is_user_configurable_and_rendered_once_per_message
     assert "showResponseModel: false" in prefs_src
     assert "showResponseModel: saved?.showResponseModel ?? false" in prefs_src
     # The visible label lives in the locale file; the tab holds only the key that resolves to it.
-    assert 'showResponseModel: "Show response model"' in EN_LOCALE_TS.read_text(encoding = "utf-8")
+    # Read by key, not by wording: #11924 rewrote this label without changing where it lives.
+    assert en_string("settings.chat.showResponseModel", EN_LOCALE_TS)
     assert 't("settings.chat.showResponseModel")' in chat_tab_src
     assert "setShowResponseModel" in chat_tab_src
     details_src = DETAILS_TSX.read_text(encoding = "utf-8")
