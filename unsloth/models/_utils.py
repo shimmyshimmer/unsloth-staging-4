@@ -1402,6 +1402,24 @@ def _cast_text_only_prequantized_params(model, dtype):
     return n_cast
 
 
+@functools.cache
+def _transformers_honors_legacy_flash_attn_2_flag():
+    # 5.4+ dispatch reads only _supports_flash_attn, so 4.x remote code (Ling-2.6-flash) raises at init.
+    from transformers import PreTrainedModel
+
+    if "_supports_flash_attn_2" in vars(PreTrainedModel):
+        return True
+    for name in ("_flash_attn_2_can_dispatch", "_flash_attn_can_dispatch"):
+        check = getattr(PreTrainedModel, name, None)
+        if check is None:
+            continue
+        try:
+            return "_supports_flash_attn_2" in inspect.getsource(check)
+        except Exception:
+            return True
+    return True
+
+
 def resolve_attention_implementation(
     model_class,
     config,
@@ -1418,8 +1436,11 @@ def resolve_attention_implementation(
     supports_flash_attention = (
         model_class is not None
         and (
-            getattr(model_class, "_supports_flash_attn_2", False)
-            or getattr(model_class, "_supports_flash_attn", False)
+            getattr(model_class, "_supports_flash_attn", False)
+            or (
+                getattr(model_class, "_supports_flash_attn_2", False)
+                and _transformers_honors_legacy_flash_attn_2_flag()
+            )
         )
         and not _is_flash_excluded(model_type)
     )
