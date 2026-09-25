@@ -306,15 +306,11 @@ _OMNI_AUTO_CLASS_NAMES = (
 )
 
 
-def _config_has_native_class(auto_class, config):
-    """True when transformers itself maps ``type(config)`` in ``auto_class`` (no repo code needed)."""
-    try:
-        return auto_class is not None and type(config) in auto_class._model_mapping
-    except Exception:
-        return False
-
-
-def _resolve_omni_auto_model(model_config):
+def _resolve_omni_auto_model(
+    model_config,
+    trust_remote_code = None,
+    **hub_kwargs,
+):
     """A multimodal auto class that really maps this config, or None.
 
     Qwen3-Omni names Qwen3OmniMoeForConditionalGeneration so it reads as a VLM,
@@ -329,7 +325,12 @@ def _resolve_omni_auto_model(model_config):
         if auto_class is None:
             continue
         try:
-            if resolve_model_class(auto_class, model_config) is not None:
+            if (
+                resolve_model_class(
+                    auto_class, model_config, trust_remote_code = trust_remote_code, **hub_kwargs
+                )
+                is not None
+            ):
                 return auto_class
         except Exception:
             continue
@@ -1945,12 +1946,25 @@ class FastModel(FastBaseModel):
         is_vlm = any(x.endswith("ForConditionalGeneration") for x in architectures)
         is_vlm = is_vlm or hasattr(model_config, "vision_config")
         load_text_only = text_only and auto_model is None
+        # Class probes below fetch remote modeling code exactly as the load will.
+        _probe_hub_kwargs = dict(
+            trust_remote_code = trust_remote_code,
+            revision = base_revision if not is_peft else None,
+            code_revision = kwargs.get("code_revision", None),
+            token = token,
+            cache_dir = kwargs.get("cache_dir", None),
+            local_files_only = local_files_only,
+            force_download = kwargs.get("force_download", None),
+            proxies = kwargs.get("proxies", None),
+        )
         text_only_decoder = False
         if load_text_only:
             if hasattr(model_config, "vision_config"):
                 text_config = _get_text_only_config(model_config, old_model_name)
                 # Skip the vision tower only for families with their own text decoder (Gemma 3); others would load random weights, so keep the full model.
-                text_class = resolve_model_class(AutoModelForCausalLM, text_config)
+                text_class = resolve_model_class(
+                    AutoModelForCausalLM, text_config, **_probe_hub_kwargs
+                )
                 if text_class is None or not _is_family_text_decoder(
                     getattr(model_config, "model_type", ""),
                     getattr(text_config, "model_type", ""),
@@ -2007,8 +2021,11 @@ class FastModel(FastBaseModel):
                     auto_model = AutoModelForVision2Seq
                     # Only when the image-text class has no mapping, so anything that
                     # resolves today keeps the class it resolves to now.
-                    if resolve_model_class(auto_model, model_config) is None:
-                        auto_model = _resolve_omni_auto_model(model_config) or auto_model
+                    if resolve_model_class(auto_model, model_config, **_probe_hub_kwargs) is None:
+                        auto_model = (
+                            _resolve_omni_auto_model(model_config, **_probe_hub_kwargs)
+                            or auto_model
+                        )
             else:
                 auto_model = AutoModelForCausalLM
 
@@ -2067,6 +2084,7 @@ class FastModel(FastBaseModel):
             disable_log_stats = disable_log_stats,
             load_in_fp8 = load_in_fp8,
             text_only = load_text_only,
+            text_intent = bool(text_only),
             text_only_decoder = text_only_decoder,
             *args,
             **kwargs,
