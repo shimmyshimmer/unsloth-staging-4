@@ -3081,18 +3081,32 @@ def test_kv_quant_probe_reports_what_the_runtime_would_really_do(monkeypatch):
     pytest.importorskip("mlx_lm")
     from mlx_lm.models import cache as lm_cache
 
-    def elig(factory, dim = 128):
+    def elig(
+        factory,
+        dim = 128,
+        reason = False,
+    ):
         lm = _tiny_lm(factory, dim)
         monkeypatch.setattr(lm_cache, "make_prompt_cache", lambda m, **_: lm.make_cache())
-        return mlx_inference._kv_quant_eligibility(lm, False, 8)[0]
+        verdict, why, _ = mlx_inference._kv_quant_eligibility(lm, False, 8)
+        return (verdict, why) if reason else verdict
 
     assert elig(lambda: [lm_cache.KVCache(), lm_cache.KVCache()]) == "full"
     # A width mx.quantize rejects is caught by attempting it, not by naming it.
     assert elig(lambda: [lm_cache.KVCache()], dim = 80) == "refused"
     # A container the quantizer never descends into is skipped, not fatal.
-    assert elig(lambda: [lm_cache.CacheList(lm_cache.KVCache())]) == "none"
+    assert elig(lambda: [lm_cache.CacheList(lm_cache.KVCache())], reason = True) == (
+        "none",
+        "this model's KV cache layout cannot be quantized",
+    )
     # Mixed quantizable/non-quantizable is a real success, reported as partial.
     assert elig(lambda: [lm_cache.KVCache(), lm_cache.CacheList(lm_cache.KVCache())]) == "partial"
+    ring = lambda: [lm_cache.RotatingKVCache(max_size = 32)]
+    assert elig(ring, reason = True) == (
+        "refused",
+        "this model's KV cache cannot be quantized: it uses a bounded sliding window",
+    )
+    assert elig(lambda: [lm_cache.KVCache(), lm_cache.RotatingKVCache(max_size = 32)]) == "refused"
 
 
 def test_parent_mirror_omits_runtime_fields_a_backend_never_reported():
@@ -4518,19 +4532,22 @@ def test_the_load_policy_bounds_a_pin_only_where_the_bound_can_be_enforced(monke
     owns = SimpleNamespace(layers = [object(), object()], make_cache = lambda: [KVCache(), KVCache()])
 
     unset = object()
+    last = {}
 
     def policy(
         model,
         kv_bits,
         requested,
         served = unset,
+        fitted = False,
     ):
         backend = MLXInferenceBackend()
         backend._model = model
         backend._is_vlm = False
         quant, window, enforced = backend._resolve_kv_policy(
-            False, kv_bits, requested, requested if served is unset else served
+            False, kv_bits, requested, requested if served is unset else served, fitted = fitted
         )
+        last.update(quant)
         return quant["kv_bits"], window, enforced
 
     assert policy(honours, 4, 8192) == (None, 8192, True)  # enforceable pin outranks quant
@@ -4538,6 +4555,12 @@ def test_the_load_policy_bounds_a_pin_only_where_the_bound_can_be_enforced(monke
     assert policy(honours, 4, 0, 262144) == (4, None, False)
     assert policy(honours, None, 8192) == (None, 8192, True)
     assert policy(honours, None, 0, 262144) == (None, 262144, True)  # nothing to yield to
+
+    assert policy(honours, 4, 0, 24576, fitted = True) == (None, 24576, True)
+    assert last["reason"] == mlx_inference.MLX_KV_QUANT_FITTED_CONTEXT
+    assert policy(honours, 4, 8192) == (None, 8192, True)
+    assert last["reason"] == mlx_inference.MLX_KV_QUANT_PINNED_CONTEXT
+    assert policy(honours, 4, 0, 24576) == (4, None, False)
 
     # An unenforceable pin spends nothing, and the verdict still travels to the API.
     assert policy(owns, 4, 8192) == (4, None, False)
@@ -4556,7 +4579,7 @@ def test_quantization_is_refused_for_a_pinned_context_rather_than_raising_mid_st
     """Left to mlx-lm this surfaces as NotImplementedError on the first generated token."""
     from core.inference.mlx_inference import _kv_quant_status
 
-    status = _kv_quant_status(4, None, False, context_pinned = True)
+    status = _kv_quant_status(4, None, False, context_bounded = True)
 
     assert status["kv_bits"] is None
     assert status["eligibility"] == "refused"
@@ -4901,6 +4924,505 @@ def test_the_mlx_mcp_snapshot_is_taken_under_the_same_guard_the_gguf_count_uses(
     guard = body.index("async with mcp_server_snapshot_guard():")
     snapshot = body.index("asyncio.to_thread(cached_mcp_tools)")
     assert guard < snapshot, "the guard must be held across the snapshot, not after it"
+
+
+def test_what_the_fit_is_asked_and_when_it_is_asked_at_all(monkeypatch, tmp_path):
+    from core.inference import mlx_inference
+
+    priced = []
+    monkeypatch.setitem(
+        sys.modules,
+        "core.inference.mlx_memory",
+        types.SimpleNamespace(
+            mlx_fit_context = lambda model_dir, **kw: (
+                priced.append(kw | {"dir": model_dir}) or 24_576
+            )
+        ),
+    )
+    monkeypatch.setattr(mlx_inference, "mlx_memory_budget", lambda **_: 8 * 1024**3)
+    judged = []
+    monkeypatch.setattr(mlx_inference, "_kv_window_enforced", lambda *a: judged.append(a) or True)
+
+    def fit(name, **kw):
+        return mlx_inference._fitted_context(None, name, 262_144, **kw)[0]
+
+    assert fit(str(tmp_path), load_in_4bit = True, retains_history = True) == 24_576
+    assert priced[0] == {
+        "budget_bytes": 8 * 1024**3,
+        "max_ctx": 262_144,
+        "kv_bits": None,
+        "load_in_4bit": True,
+        "dir": str(tmp_path),
+    }
+    model = object()
+    verdicts, asked_elig = [], []
+    monkeypatch.setattr(
+        mlx_inference,
+        "_kv_quant_eligibility",
+        lambda m, v, b: asked_elig.append((m, v, b)) or verdicts.pop(0),
+    )
+
+    def resident(verdict = None, **kw):
+        priced.clear()
+        asked_elig.clear()
+        verdicts[:] = [verdict] if verdict else []
+        return mlx_inference._fitted_context(
+            model, str(tmp_path), 262_144, load_in_4bit = True, retains_history = True, **kw
+        )
+
+    assert judged == [(None, False, 24_576)]
+    judged.clear()
+    assert resident(kv_bits = 4, is_vlm = True)[:2] == (24_576, True)
+    assert judged == [(model, True, 24_576)] and asked_elig == []
+    assert resident(kv_bits = None)[2] is None and asked_elig == []
+    monkeypatch.setattr(mlx_inference, "_kv_window_enforced", lambda *_a: False)
+    assert resident(("full", "", True), kv_bits = 4, is_vlm = True)[:2] == (24_576, False)
+    assert asked_elig == [(model, True, 4)]
+    assert resident(kv_bits = None, is_vlm = True)[:2] == (24_576, False)
+    assert asked_elig == []
+    refused = resident(("refused", "", True), kv_bits = 4, is_vlm = True)
+    assert refused == (24_576, False, ("refused", "", True))
+    assert [call["kv_bits"] for call in priced] == [None]
+    assert resident(("partial", "", True), kv_bits = 4, is_vlm = True)[0] == 24_576
+    assert [call["kv_bits"] for call in priced] == [None, 4]
+    monkeypatch.setattr(mlx_inference, "_kv_window_enforced", lambda *a: judged.append(a) or True)
+    monkeypatch.setattr(mlx_inference, "_kv_quant_eligibility", lambda *_a: ("full", "", True))
+
+    rewound = []
+    monkeypatch.setattr(
+        mlx_inference, "_mlx_rng_key_words", lambda: rewound.append("held") or ("key",)
+    )
+    monkeypatch.setattr(mlx_inference, "_restore_mlx_rng_key", rewound.append)
+    monkeypatch.setitem(
+        sys.modules,
+        "core.inference.mlx_memory",
+        types.SimpleNamespace(
+            mlx_fit_context = lambda *_a, kv_bits = None, **_k: (
+                rewound.append(f"priced@{kv_bits}") or (24_576 if kv_bits is None else 8_192)
+            )
+        ),
+    )
+    assert fit(str(tmp_path), load_in_4bit = True, retains_history = True) == 24_576
+    monkeypatch.setattr(mlx_inference, "_kv_window_enforced", lambda *_a: False)
+    monkeypatch.setattr(mlx_inference, "_kv_quant_eligibility", lambda *_a: ("full", "", True))
+    assert fit(str(tmp_path), load_in_4bit = True, retains_history = True, kv_bits = 4) == 8_192
+    assert rewound[-4:] == ["held", "priced@None", "priced@4", ("key",)]
+    monkeypatch.setattr(mlx_inference, "_kv_window_enforced", lambda *_a: True)
+    monkeypatch.setitem(
+        sys.modules,
+        "core.inference.mlx_memory",
+        types.SimpleNamespace(
+            mlx_fit_context = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("no"))
+        ),
+    )
+    assert fit(str(tmp_path), load_in_4bit = True, retains_history = True) is None
+    assert rewound[:3] + rewound[-2:] == ["held", "priced@None", ("key",), "held", ("key",)]
+
+    priced.clear()
+    rewound.clear()
+    monkeypatch.setattr(mlx_inference, "mlx_memory_budget", lambda **_: None)
+    assert fit(str(tmp_path), load_in_4bit = True, retains_history = True) is None
+    monkeypatch.setattr(mlx_inference, "mlx_memory_budget", lambda **_: 8 * 1024**3)
+    monkeypatch.setattr(mlx_inference, "_snapshot_dir", lambda model, name: None)
+    assert fit("org/uncached", load_in_4bit = True, retains_history = True) is None
+    assert (priced, rewound) == ([], [])
+
+
+def test_the_fit_budget_leaves_the_prompt_history_its_own_room(monkeypatch):
+    from core.inference import mlx_inference
+
+    fake = types.SimpleNamespace(
+        metal = types.SimpleNamespace(is_available = lambda: True),
+        device_info = lambda: {"max_recommended_working_set_size": 100_000_000_000},
+    )
+    monkeypatch.setitem(sys.modules, "mlx.core", fake)
+    if "mlx" in sys.modules:
+        monkeypatch.setattr(sys.modules["mlx"], "core", fake, raising = False)
+    else:
+        # The parent package is imported first, so it must resolve on hosts without MLX.
+        monkeypatch.setitem(sys.modules, "mlx", types.SimpleNamespace(core = fake))
+    monkeypatch.delenv("UNSLOTH_MLX_PROMPT_CACHE_BYTES", raising = False)
+
+    assert mlx_inference.mlx_memory_budget() == 85_000_000_000 - 15_000_000_000
+    assert mlx_inference.mlx_memory_budget(retains_history = False) == 85_000_000_000
+    fake.metal.is_available = lambda: False
+    assert mlx_inference.mlx_memory_budget() is None
+
+
+def test_the_fit_asks_about_the_repo_the_loader_actually_opens(monkeypatch, tmp_path):
+    import utils.utils as backend_utils
+    from core.inference import mlx_inference
+
+    asked = []
+    monkeypatch.setattr(
+        backend_utils, "hf_cache_snapshot_dir", lambda name: asked.append(name) or tmp_path
+    )
+    assert mlx_inference._snapshot_dir(SimpleNamespace(_src_path = tmp_path), "org/alias") == str(
+        tmp_path
+    )
+    assert asked == []
+    assert mlx_inference._snapshot_dir(SimpleNamespace(), "org/alias") == str(tmp_path)
+    assert asked == ["org/alias"]
+
+
+def test_only_a_load_that_asked_for_nothing_is_fitted_to_the_machine(monkeypatch):
+    """A pin is the user's own answer about memory and is served verbatim."""
+    _install_fake_mlx(monkeypatch)
+    _install_fake_fast_mlx(monkeypatch, [])
+
+    from core.inference import mlx_inference
+
+    FULL = ("full", "", True)
+    asked, verdicts, probes = [], [], []
+    monkeypatch.setattr(
+        mlx_inference, "_kv_quant_eligibility", lambda *a: verdicts.append(a) or FULL
+    )
+
+    def load(
+        fitted = (24_576, True, FULL),
+        enforceable = bool,
+        model = "fake/text",
+        **kwargs,
+    ):
+        del asked[:], verdicts[:], probes[:]
+        monkeypatch.setattr(
+            mlx_inference,
+            "_fitted_context",
+            lambda _m, name, ceiling, **kw: asked.append((name, ceiling, kw)) or fitted,
+        )
+        monkeypatch.setattr(
+            mlx_inference.MLXInferenceBackend,
+            "_kv_cache_window_enforceable",
+            lambda _s, served: probes.append(served) or enforceable(served),
+        )
+        backend = mlx_inference.MLXInferenceBackend()
+        assert backend.load_model(
+            SimpleNamespace(
+                identifier = model,
+                is_vision = kwargs.pop("vision", False),
+                is_lora = kwargs.pop("lora", False),
+            ),
+            **kwargs,
+        )
+        return backend, backend.models[model]
+
+    _, pinned = load(max_seq_length = 4096, kv_bits = 4)
+    assert (asked, verdicts) == ([], [])
+    assert (pinned["context_length"], pinned["context_length_fitted"]) == (4096, None)
+    assert pinned["mlx_kv_quant_reason"] == mlx_inference.MLX_KV_QUANT_PINNED_CONTEXT
+    _, info = load(max_seq_length = 0, kv_bits = 4)
+    assert verdicts == []
+    assert asked == [
+        ("fake/text", None, dict(load_in_4bit = True, retains_history = True, kv_bits = 4, is_vlm = False))
+    ]
+    assert (info["context_length"], info["context_length_fitted"]) == (24_576, 24_576)
+    assert info["mlx_kv_quant_reason"] == mlx_inference.MLX_KV_QUANT_FITTED_CONTEXT
+
+    _, info = load((24_576, False, FULL), lambda _s: True, max_seq_length = 0, kv_bits = 4)
+    assert (info["mlx_kv_bits"], info["context_length"], verdicts) == (4, 24_576, [])
+    _, info = load((24_576, None, FULL), lambda _s: True, max_seq_length = 0, kv_bits = 4)
+    assert (info["mlx_kv_bits"], info["context_length"], probes) == (4, 24_576, [])
+    backend, info = load(enforceable = lambda _s: False, max_seq_length = 4096, kv_bits = 4)
+    assert (info["mlx_kv_bits"], verdicts) == (4, [(backend._model, False, 4)])
+
+    for available, reserved in ((True, True), (False, False)):
+        monkeypatch.setattr(
+            mlx_inference, "mlx_vlm_snapshot_store_available", lambda a = available: a
+        )
+        load(model = "fake/vlm", vision = True, max_seq_length = 0)
+        assert asked == [
+            (
+                "fake/vlm",
+                None,
+                dict(
+                    load_in_4bit = True,
+                    retains_history = reserved,
+                    kv_bits = None,
+                    is_vlm = True,
+                ),
+            )
+        ]
+
+    for kwargs in (
+        dict(
+            parallel_mode = "tensor",
+            distributed_group = SimpleNamespace(rank = lambda: 0, size = lambda: 2),
+        ),
+        dict(dtype = "float32"),
+        dict(lora = True),
+    ):
+        load(max_seq_length = 0, **kwargs)
+        assert not asked
+
+
+def test_the_fit_is_taken_at_the_width_the_load_will_run_at(monkeypatch):
+    """The window and the KV width are one decision."""
+    from core.inference import mlx_inference
+
+    fits, asked, judged, priced = {}, [], [], []
+    monkeypatch.setattr(mlx_inference, "mlx_memory_budget", lambda **_: 8 * 1024**3)
+    monkeypatch.setitem(
+        sys.modules,
+        "core.inference.mlx_memory",
+        types.SimpleNamespace(
+            mlx_fit_context = lambda _d, *, kv_bits = None, **_k: (
+                asked.append(kv_bits) or fits[kv_bits]
+            )
+        ),
+    )
+
+    def fit(
+        bounded,
+        holds = True,
+        **fits_by_width,
+    ):
+        fits.clear()
+        fits.update({(None if k == "full" else int(k[1:])): v for k, v in fits_by_width.items()})
+        asked.clear(), judged.clear(), priced.clear()
+        monkeypatch.setattr(
+            mlx_inference,
+            "_window_holds",
+            lambda _d, window, _b, _l, bits = None: (
+                priced.append((window, bits)) or (holds(window, bits) if callable(holds) else holds)
+            ),
+        )
+        return mlx_inference.mlx_fit_to_memory(
+            "/d",
+            262_144,
+            load_in_4bit = False,
+            retains_history = True,
+            kv_bits = 4,
+            bounded = lambda window: judged.append(window) or bounded(window),
+        )
+
+    bound, free, unknown = (lambda _w: True), (lambda _w: False), (lambda _w: None)
+    longer_bound = lambda w: w > 24_576
+    ceiling_priced_out = lambda w, _b: w != 262_144
+    for bounded, holds, full, b4, expected in (
+        (bound, True, 24_576, 60_000, (24_576, None, True)),
+        (free, True, 24_576, 8_192, (8_192, 4, False)),
+        (unknown, True, 24_576, 8_192, (8_192, 4, None)),
+        (free, True, 24_576, 60_000, (60_000, 4, False)),
+        (lambda w: None if w == 24_576 else True, True, 24_576, 8_192, (8_192, None, True)),
+        (longer_bound, True, 24_576, 60_000, (60_000, None, True)),
+        (longer_bound, False, 24_576, 60_000, (24_576, 4, False)),
+        (free, True, 24_576, None, (None, 4, None)),
+        (free, ceiling_priced_out, 24_576, None, (24_576, 4, False)),
+        (free, False, 24_576, None, (None, 4, None)),
+        (bound, True, None, None, (None, 4, None)),
+        (free, False, None, 8_192, (8_192, 4, False)),
+        (unknown, False, None, 8_192, (8_192, 4, None)),
+        (bound, True, None, 8_192, (8_192, None, True)),
+        (bound, False, None, 8_192, (None, 4, None)),
+    ):
+        assert fit(bounded, holds = holds, full = full, b4 = b4) == expected, (full, b4)
+
+    def traced(*a, **kw):
+        return (fit(*a, **kw), asked[:], judged[:], priced[:])
+
+    W, N, F = (24_576, None, True), (None, 4, None), (8_192, 4, False)
+    assert traced(bound, full = 24_576, b4 = 60_000) == (W, [None], [24_576], [])
+    assert traced(free, full = 24_576, b4 = 8_192) == (F, [None, 4], [24_576, 8_192], [])
+    assert traced(free, full = 24_576, b4 = 60_000) == (
+        (60_000, 4, False),
+        [None, 4],
+        [24_576, 60_000],
+        [],
+    )
+    assert traced(longer_bound, full = 24_576, b4 = 60_000, holds = False) == (
+        (24_576, 4, False),
+        [None, 4],
+        [24_576, 60_000],
+        [(60_000, None)],
+    )
+    assert traced(free, full = 24_576, b4 = None) == (N, [None, 4], [24_576], [(262_144, 4)])
+    assert traced(free, holds = ceiling_priced_out, full = 24_576, b4 = None) == (
+        (24_576, 4, False),
+        [None, 4],
+        [24_576],
+        [(262_144, 4), (24_576, 4)],
+    )
+    assert traced(bound, full = None, b4 = None) == (N, [None, 4], [], [])
+    assert traced(bound, full = None, b4 = 8_192) == (
+        (8_192, None, True),
+        [None, 4],
+        [8_192],
+        [(8_192, None)],
+    )
+    assert traced(free, full = None, b4 = 8_192, holds = False) == (F, [None, 4], [8_192], [])
+    assert traced(unknown, full = None, b4 = 8_192, holds = False) == (
+        (8_192, 4, None),
+        [None, 4],
+        [8_192],
+        [],
+    )
+
+    monkeypatch.setattr(mlx_inference, "mlx_memory_budget", lambda **_: None)
+    assert fit(bound, full = 24_576, b4 = 8_192) == (None, 4, None)
+    monkeypatch.setattr(mlx_inference, "mlx_memory_budget", lambda **_: 8 * 1024**3)
+    monkeypatch.setitem(
+        sys.modules,
+        "core.inference.mlx_memory",
+        types.SimpleNamespace(
+            mlx_fit_context = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("no"))
+        ),
+    )
+    assert mlx_inference.mlx_fit_to_memory(
+        "/d", 262_144, load_in_4bit = False, retains_history = True, kv_bits = 4
+    ) == (None, 4, None)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "core.inference.mlx_memory",
+        types.SimpleNamespace(mlx_fit_context = lambda _d, *, kv_bits = None, **_k: fits[kv_bits]),
+    )
+    monkeypatch.setattr(mlx_inference, "mlx_bound_would_be_enforced", lambda *_a: True)
+    fits.update({None: 24_576})
+    assert mlx_inference.mlx_fit_to_memory(
+        "/d", 262_144, load_in_4bit = False, retains_history = True
+    ) == (24_576, None, True)
+
+
+def test_what_tells_an_affordable_window_from_one_nothing_fits(monkeypatch):
+    """`mlx_fit_context` answers None to four questions, and only a price separates them."""
+    from core.inference import mlx_inference
+
+    priced = {}
+    monkeypatch.setitem(
+        sys.modules,
+        "core.inference.mlx_memory",
+        types.SimpleNamespace(
+            mlx_memory_breakdown = lambda model_dir, **kw: (
+                priced.update(kw, dir = model_dir)
+                or types.SimpleNamespace(total_bytes = priced["n_ctx"] * 1000)
+            )
+        ),
+    )
+    assert mlx_inference._window_holds("/d", 4096, 4_096_000, load_in_4bit = True) is True
+    assert priced == {"dir": "/d", "n_ctx": 4096, "kv_bits": None, "load_in_4bit": True}
+    assert mlx_inference._window_holds("/d", 4096, 4_096_000, True, 4) is True
+    assert priced["kv_bits"] == 4
+    assert mlx_inference._window_holds("/d", 4096, 4_095_999, load_in_4bit = False) is False
+    assert priced["load_in_4bit"] is False
+    monkeypatch.setitem(
+        sys.modules,
+        "core.inference.mlx_memory",
+        types.SimpleNamespace(mlx_memory_breakdown = lambda *_a, **_k: None),
+    )
+    assert mlx_inference._window_holds("/d", 4096, 1 << 60, load_in_4bit = False) is False
+
+
+def test_the_bound_probe_judges_the_tower_the_sizing_would_price(monkeypatch):
+    """The sizing takes the first tower whose forward pass succeeds."""
+    pytest.importorskip("mlx_lm")
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    from core.inference import mlx_inference
+
+    class Tower:
+        def __init__(
+            self,
+            kind,
+            runs = True,
+        ):
+            self.kind, self.runs = kind, runs
+            self.selected_with = None
+
+        def __call__(
+            self,
+            *_a,
+            cache = None,
+            **_k,
+        ):
+            self.selected_with = cache
+            if not self.runs:
+                raise ValueError("this tower cannot run")
+
+        @property
+        def make_cache(self):
+            if self.kind == "plain":
+                raise AttributeError("make_cache")
+            entries = {"bounded": [RotatingKVCache(1024)], "unbounded": [KVCache()], "empty": []}
+            return lambda: entries[self.kind]
+
+    def make_prompt_cache(model, max_kv_size = None):
+        builder = getattr(model, "make_cache", None)
+        if builder is not None:
+            return builder()
+        return [RotatingKVCache(max_kv_size)] if max_kv_size else [KVCache()]
+
+    def offering(*towers):
+        monkeypatch.setitem(
+            sys.modules,
+            "core.inference.mlx_memory",
+            types.SimpleNamespace(
+                _PROBE_SHORT = 8,
+                _runtime_dtype = lambda: None,
+                _snapshot_config = lambda _d: {"model_type": "x"},
+                _probe_models = lambda *_a: iter(
+                    [
+                        (lambda t = t: rewound.append("built") or t, make_prompt_cache, None)
+                        for t in towers
+                    ]
+                ),
+            ),
+        )
+
+    rewound = []
+    monkeypatch.setattr(
+        mlx_inference, "_mlx_rng_key_words", lambda: rewound.append("held") or ("key",)
+    )
+    monkeypatch.setattr(mlx_inference, "_restore_mlx_rng_key", rewound.append)
+
+    def verdict(*towers):
+        offering(*towers)
+        marks = len(rewound)
+        answer = mlx_inference.mlx_bound_would_be_enforced("/d", 4096)
+        tried = next((n for n, tower in enumerate(towers) if tower.runs), len(towers) - 1) + 1
+        assert rewound[marks:] == ["held", *["built"] * tried, ("key",)]
+        return answer
+
+    plain = Tower("plain")
+    assert verdict(plain) is True
+    assert [getattr(entry, "max_size", None) for entry in plain.selected_with] == [None]
+    assert verdict(Tower("bounded")) is True
+    assert verdict(Tower("unbounded")) is False
+    assert verdict(Tower("empty")) is False
+    assert verdict(Tower("bounded"), Tower("unbounded")) is True
+    assert verdict(Tower("bounded", runs = False), Tower("unbounded")) is False
+    assert verdict(Tower("unbounded", runs = False), Tower("bounded")) is True
+    assert verdict(Tower("bounded", runs = False)) is None
+
+    monkeypatch.setattr(
+        mlx_inference,
+        "_kv_quant_eligibility",
+        lambda *_a: pytest.fail("the estimate must not exercise the model to price a width"),
+    )
+
+    def refused(*towers):
+        offering(*towers)
+        return mlx_inference.mlx_kv_quant_is_refused("/d")
+
+    assert refused(Tower("unbounded")) is False
+    assert refused(Tower("plain")) is False
+    assert refused(Tower("bounded")) is True
+    assert refused(Tower("empty")) is True
+    assert refused(Tower("unbounded", runs = False), Tower("bounded")) is True
+    assert refused(Tower("bounded", runs = False), Tower("unbounded")) is False
+    assert refused(Tower("bounded", runs = False)) is False
+    marks = len(rewound)
+    assert refused(Tower("bounded")) is True
+    assert rewound[marks:] == ["held", "built", ("key",)]
+    monkeypatch.setitem(
+        sys.modules,
+        "core.inference.mlx_memory",
+        types.SimpleNamespace(
+            _snapshot_config = lambda _d: (_ for _ in ()).throw(RuntimeError("no")),
+        ),
+    )
+    marks = len(rewound)
+    assert mlx_inference.mlx_bound_would_be_enforced("/d", 4096) is None
+    assert rewound[marks:] == ["held", ("key",)]
 
 
 def _uncopyable_naive_detokenizer(detokenizers):
