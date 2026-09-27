@@ -242,6 +242,16 @@ _MLX_RUNTIME_MIRROR_FIELDS = (
     "mlx_kv_quant_note",
     "chat_template_override_requested",
     "chat_template_override_reason",
+    "load_in_4bit",
+    "mlx_speculative_mode_requested",
+    "mlx_draft_model_requested",
+    "mlx_draft_block_size_requested",
+    "mlx_speculative_effective_mode",
+    "mlx_speculative_effective_draft_model",
+    "mlx_speculative_effective_block_size",
+    "mlx_speculative_pinned_mode",
+    "mlx_speculative_pinned_draft_model",
+    "mlx_speculative_reason",
 )
 
 
@@ -770,6 +780,7 @@ class InferenceOrchestrator:
             exitcode = getattr(self._proc, "exitcode", 0) if self._proc is not None else 0
             self._worker_stopped_deliberately = exitcode == 0
             self._proc = None
+            self._cleanup_interrupted_mtp_staging()
             return True
 
         self._cancel_generation()
@@ -827,6 +838,7 @@ class InferenceOrchestrator:
         self._cancel_event = None
         self._drain_event = None
         self._reset_worker_scoped_state()
+        self._cleanup_interrupted_mtp_staging()
         logger.info("Inference subprocess shut down")
         return True
 
@@ -903,6 +915,17 @@ class InferenceOrchestrator:
                 return True
             previous = current
         return not expected_free_gb
+
+    @staticmethod
+    def _cleanup_interrupted_mtp_staging() -> None:
+        try:
+            from core.inference.mlx_speculative import cleanup_native_mtp_staging
+            cleanup_native_mtp_staging()
+        except Exception:
+            logger.warning(
+                "Failed to clean interrupted MLX MTP staging checkpoints",
+                exc_info = True,
+            )
 
     def _reset_worker_scoped_state(self) -> None:
         """Drop bookkeeping that only means anything for the worker that just died. Ownership is
@@ -1829,6 +1852,12 @@ class InferenceOrchestrator:
         cache_environment: Optional[Mapping[str, str]] = None,
         anonymous_hf_access: bool = False,
         audio_codec_path: Optional[str] = None,
+        mlx_speculative_mode: str = "off",
+        mlx_draft_model: Optional[str] = None,
+        mlx_draft_block_size: Optional[int] = None,
+        mlx_speculative_resolved_mode: Optional[str] = None,
+        mlx_speculative_resolved_draft_model: Optional[str] = None,
+        mlx_speculative_resolution_reason: Optional[str] = None,
     ) -> bool:
         """Load a model for inference. Always spawns a fresh subprocess per load for a clean
         interpreter (no stale unsloth patches, torch.compile caches, or getsource failures)."""
@@ -1865,6 +1894,12 @@ class InferenceOrchestrator:
                 "chat_template_override": chat_template_override,
                 # Read in the worker, which hides the accelerators before detection.
                 "audio_device": audio_device,
+                "mlx_speculative_mode": mlx_speculative_mode,
+                "mlx_draft_model": mlx_draft_model,
+                "mlx_draft_block_size": mlx_draft_block_size,
+                "mlx_speculative_resolved_mode": mlx_speculative_resolved_mode,
+                "mlx_speculative_resolved_draft_model": mlx_speculative_resolved_draft_model,
+                "mlx_speculative_resolution_reason": mlx_speculative_resolution_reason,
             }
             if anonymous_hf_access:
                 sub_config["anonymous_hf_access"] = True
