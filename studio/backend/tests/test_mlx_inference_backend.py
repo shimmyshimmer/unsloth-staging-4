@@ -277,6 +277,8 @@ def test_mlx_vlm_generation_survives_every_fusion_refusing(monkeypatch, mlx_infe
     backend = MLXInferenceBackend()
     backend._model = SimpleNamespace(config = {"model_type": "generic_vlm"})
     backend._processor = SimpleNamespace(chat_template = "template")
+    backend._is_vlm = True
+    backend._reads_vision = True
     args = (
         [{"role": "user", "content": [{"type": "image"}]}],
         [object()],
@@ -1118,6 +1120,7 @@ def test_mlx_vlm_reemits_think_prefill_inside_adapter_context(
     backend = MLXInferenceBackend()
     backend._model = SimpleNamespace(config = {"model_type": "deepseek_vl_v2"})
     backend._processor = SimpleNamespace(tokenizer = SimpleNamespace())
+    backend._reads_vision = True
     monkeypatch.setattr(
         backend, "_release_vlm_snapshots", lambda: order.append("snapshots_released")
     )
@@ -1196,6 +1199,7 @@ def test_mlx_vlm_generation_selects_renderer_by_capability(monkeypatch):
     )
     backend = MLXInferenceBackend()
     backend._model = SimpleNamespace(config = {"model_type": "deepseek_vl_v2"})
+    backend._reads_vision = True
     backend._processor = SimpleNamespace(tokenizer = SimpleNamespace())
     args = ([{"role": "user", "content": [{"type": "image"}]}], [object()], 0, 1, 0, 0, 1, 1, None)
     tools = [{"function": {"name": "search"}}]
@@ -1227,6 +1231,13 @@ def test_mlx_vlm_generation_selects_renderer_by_capability(monkeypatch):
     tool_history = args[0] + [{"role": "assistant", "tool_calls": [{"id": "call-1"}]}]
     with pytest.raises(RuntimeError, match = "tool-call history"):
         list(backend._generate_vlm(*((tool_history,) + args[1:]), tools = tools))
+    state["generic"] = "generic prompt"
+    backend._kv_quant = {"kv_bits": 3.5}
+    backend._turboquant = True
+    list(backend._generate_vlm(*((text_messages, None) + args[2:]), tools = tools))
+    assert calls["stream"][-1][1]["kv_bits"] == 3.5
+    assert calls["stream"][-1][1]["kv_quant_scheme"] == "turboquant"
+
     state["generic"] = ValueError("generic rendering failed")
     state["model"] = f"User: {args[0][0]['content']}"
     with pytest.raises(ValueError, match = "generic rendering failed"):
@@ -1257,6 +1268,7 @@ def test_mlx_vlm_image_injection_reuses_media_aliases(monkeypatch):
     backend = MLXInferenceBackend()
     backend._model = object()
     backend._is_vlm = True
+    backend._reads_vision = True
     captured = []
     backend._generate_vlm = lambda messages, *_args, **_kwargs: (
         captured.append(messages) or iter(())
@@ -1816,6 +1828,7 @@ def test_mlx_vlm_normalizes_native_reasoning_channels(monkeypatch):
         apply_chat_template = lambda *_args, **_kwargs: "prompt",
     )
     backend._is_vlm = True
+    backend._reads_vision = True
 
     assert list(
         backend.generate_chat_response(
@@ -1862,6 +1875,7 @@ def test_mlx_vlm_post_tool_prompt_opens_reasoning_channel(monkeypatch):
         apply_chat_template = lambda *_args, **_kwargs: post_tool_prompt,
     )
     backend._is_vlm = True
+    backend._reads_vision = True
 
     snapshots = list(
         backend.generate_chat_response(
@@ -2978,6 +2992,25 @@ def test_kv_quant_status_applies_only_when_eligible(monkeypatch):
     assert mlx_inference._normalize_mlx_kv_bits(8) == 8
     # Every width the runtime accepts is offered; mlx-lm adds no domain of its own.
     assert [mlx_inference._normalize_mlx_kv_bits(b) for b in (2, 3, 5, 6)] == [2, 3, 5, 6]
+    assert [mlx_inference.parse_mlx_kv_quant(c) for c in ("auto", "4", "tq-4", "tq-3.5")] == [
+        (None, False),
+        (4, False),
+        (4, True),
+        (3.5, True),
+    ]
+
+    refuse = mlx_inference._turboquant_refusal
+    assert refuse(is_vision = False, is_distributed = False, is_lora = True)
+    assert refuse(is_vision = False, is_distributed = True, is_lora = False)
+    assert not refuse(is_vision = False, is_distributed = False, is_lora = False)
+    assert not refuse(is_vision = True, is_distributed = True, is_lora = True)
+
+    turbo = mlx_inference.MLXInferenceBackend()
+    turbo._kv_quant = {"kv_bits": 3.5}
+    turbo._turboquant = True
+    width = {"kv_bits": 3.5, "kv_quant_scheme": "turboquant", "quantized_kv_start": 0}
+    assert turbo._kv_runtime_quant_kwargs() == width
+    assert turbo._kv_quant_generate_kwargs() == {}
 
     text = mlx_inference._kv_quant_status(8, object(), False)
     vlm = mlx_inference._kv_quant_status(8, object(), True)
@@ -3023,6 +3056,57 @@ def _tiny_lm(
     return _LM()
 
 
+def test_a_text_model_mlx_vlm_cannot_load_is_served_without_turboquant(monkeypatch):
+    pytest.importorskip("mlx.core")
+    from core.inference import mlx_inference
+
+    attempts = []
+
+    class _Loader:
+        @staticmethod
+        def from_pretrained(name, **kwargs):
+            # The retry must not run under the failed load's traceback, which pins its weights.
+            attempts.append((kwargs["text_only"], sys.exc_info()[0]))
+            if not kwargs["text_only"]:
+                raise ValueError("Expected shape (262144, 640) but received shape (262144, 80)")
+            return SimpleNamespace(config = {}), SimpleNamespace()
+
+    loader = types.ModuleType("unsloth_zoo.mlx.loader")
+    loader.FastMLXModel = _Loader
+    monkeypatch.setitem(sys.modules, "unsloth_zoo.mlx.loader", loader)
+    monkeypatch.setattr(mlx_inference, "_classify_mlx_audio_type", lambda *a, **k: None)
+    monkeypatch.setattr(
+        mlx_inference.MLXInferenceBackend, "_resolve_context_lengths", lambda *a: (2048, 2048, 2048)
+    )
+
+    backend = mlx_inference.MLXInferenceBackend()
+    config = SimpleNamespace(identifier = "org/prequantized-text", is_vision = False, is_lora = False)
+    backend.load_model(config, kv_quant = "tq-4")
+
+    assert attempts == [(False, None), (True, None)]
+    assert backend._turboquant_refusal == mlx_inference.MLX_TURBOQUANT_TEXT_LOAD
+    assert backend._is_vlm is False
+    assert backend._kv_quant["kv_bits"] is None
+
+    attempts.clear()
+    vision = SimpleNamespace(identifier = "org/vlm", is_vision = True, is_lora = False)
+    with pytest.raises(ValueError, match = "Expected shape"):
+        mlx_inference.MLXInferenceBackend().load_model(vision, kv_quant = "tq-4")
+    assert attempts == [(False, None)]
+
+    class _DeadQueue(_Loader):
+        @staticmethod
+        def from_pretrained(name, **kwargs):
+            attempts.append((kwargs["text_only"], None))
+            raise RuntimeError("[METAL] Command buffer execution failed: GPU Timeout Error")
+
+    attempts.clear()
+    loader.FastMLXModel = _DeadQueue
+    with pytest.raises(RuntimeError, match = "GPU Timeout"):
+        mlx_inference.MLXInferenceBackend().load_model(config, kv_quant = "tq-4")
+    assert attempts == [(False, None)]
+
+
 def test_reload_comparison_and_response_carry_the_resolved_setting():
     """A load-time knob must force a reload and reach the client.
 
@@ -3036,19 +3120,23 @@ def test_reload_comparison_and_response_carry_the_resolved_setting():
     def req(**knobs):
         return LoadRequest(model = "m", model_path = "m", **knobs)
 
-    be = SimpleNamespace(active_model_name = "m", models = {"m": {"mlx_kv_bits_requested": 8}})
+    be = SimpleNamespace(active_model_name = "m", models = {"m": {"mlx_kv_quant_requested": "8"}})
+    assert _mlx_runtime_settings_match(be, req(mlx_kv_quant = "8"))
+    assert not _mlx_runtime_settings_match(be, req(mlx_kv_quant = "4"))
     assert _mlx_runtime_settings_match(be, req(mlx_kv_bits = 8))
-    assert not _mlx_runtime_settings_match(be, req(mlx_kv_bits = 4))
-    be.models["m"] = {"mlx_kv_bits_requested": None}
-    assert _mlx_runtime_settings_match(be, req(mlx_kv_bits = 7))  # both normalize away
+    assert req(mlx_kv_quant = None, mlx_kv_bits = 8).mlx_kv_quant is None
+    be.models["m"] = {"mlx_kv_quant_requested": "4"}
+    assert not _mlx_runtime_settings_match(be, req(mlx_kv_quant = "tq-4"))
+    be.models["m"] = {"mlx_kv_quant_requested": "auto"}
+    assert _mlx_runtime_settings_match(be, req(mlx_kv_quant = "tq-6"))  # both normalize away
     assert _mlx_runtime_settings_match(
         SimpleNamespace(active_model_name = "m", models = {"m": {}}),
-        req(mlx_kv_bits = 8),
+        req(mlx_kv_quant = "8"),
     )
 
     # Compared against the REQUESTED value, or a refused template reloads every request.
     be.models["m"] = {
-        "mlx_kv_bits_requested": None,
+        "mlx_kv_quant_requested": "auto",
         "chat_template_override_requested": "{{ custom }}",
     }
     assert _mlx_runtime_settings_match(be, req(chat_template_override = "{{ custom }}"))
@@ -3056,7 +3144,7 @@ def test_reload_comparison_and_response_carry_the_resolved_setting():
     assert not _mlx_runtime_settings_match(be, req())
     # A refusal records the request, so the same request still matches.
     be.models["m"] = {
-        "mlx_kv_bits_requested": None,
+        "mlx_kv_quant_requested": "auto",
         "chat_template_override_requested": "{{ refused }}",
         "chat_template_override_reason": "it could not render a conversation",
     }
@@ -3067,11 +3155,11 @@ def test_reload_comparison_and_response_carry_the_resolved_setting():
         model = "m",
         display_name = "m",
         inference = {},
-        mlx_kv_bits = 8,
+        mlx_kv_quant = "8",
         mlx_kv_quant_eligibility = "full",
         mlx_kv_quant_note = "n",
     )
-    assert resp.mlx_kv_bits == 8 and resp.mlx_kv_quant_note == "n"
+    assert resp.mlx_kv_quant == "8" and resp.mlx_kv_quant_note == "n"
 
 
 def test_kv_quant_probe_reports_what_the_runtime_would_really_do(monkeypatch):
@@ -3124,8 +3212,8 @@ def test_parent_mirror_omits_runtime_fields_a_backend_never_reported():
 
     assert _mlx_runtime_mirror_fields({"is_vision": False}) == {}
     assert _mlx_runtime_mirror_fields(
-        {"mlx_kv_bits": 8, "mlx_kv_bits_requested": 8, "other": 1}
-    ) == {"mlx_kv_bits": 8, "mlx_kv_bits_requested": 8}
+        {"mlx_kv_quant": "8", "mlx_kv_quant_requested": "8", "other": 1}
+    ) == {"mlx_kv_quant": "8", "mlx_kv_quant_requested": "8"}
 
 
 def test_chat_template_override_installs_only_where_one_already_exists():
@@ -3936,6 +4024,7 @@ def test_vlm_seed_rides_on_the_sampler_not_a_seed_kwarg(monkeypatch):
     backend = MLXInferenceBackend()
     backend._model = SimpleNamespace(config = {"model_type": "generic_vlm"})
     backend._processor = SimpleNamespace(chat_template = "template")
+    backend._reads_vision = True
     args = (
         [{"role": "user", "content": [{"type": "image"}]}],
         [object()],
@@ -5008,6 +5097,7 @@ def test_the_window_reaches_the_runtime_on_every_generation_route(monkeypatch):
     vlm = MLXInferenceBackend()
     vlm._kv_cache_window = 4096
     vlm._model = SimpleNamespace(config = {"model_type": "m"})
+    vlm._reads_vision = True
     vlm._processor = SimpleNamespace(tokenizer = SimpleNamespace())
     next(
         vlm._generate_vlm(
@@ -5675,6 +5765,7 @@ def _run_spm_vlm_turn(
         tokenizer = turn, chat_template = turn.chat_template, detokenizer = turn.detokenizer
     )
     backend._tokenizer = turn
+    backend._reads_vision = True
     return list(
         backend._generate_vlm(
             [{"role": "user", "content": [{"type": "image"}]}],
@@ -6552,6 +6643,7 @@ def _run_vlm_budget(
 
     backend = _budget_backend(monkeypatch, served = served, marker_tokens = marker_tokens)
     backend._is_vlm = True
+    backend._reads_vision = True
     backend._model = SimpleNamespace()
     backend._processor = SimpleNamespace(tokenizer = backend._tokenizer)
     args = (messages, [image] if image is not None else None, 0, 1, 0, 0, max_new_tokens, 1, None)
@@ -6709,6 +6801,7 @@ def _video_vlm_backend(monkeypatch, streams):
     backend._model = SimpleNamespace(config = {"model_type": "qwen3_5"})
     backend._processor = SimpleNamespace(tokenizer = SimpleNamespace())
     backend._is_vlm = True
+    backend._reads_vision = True
     return backend
 
 
@@ -6993,6 +7086,7 @@ def test_mlx_generate_chat_response_attaches_the_video_part_and_forwards_the_cli
     backend = MLXInferenceBackend()
     backend._model = object()
     backend._is_vlm = True
+    backend._reads_vision = True
     captured = []
     backend._generate_vlm = lambda messages, *_args, **kwargs: (
         captured.append((messages, kwargs)) or iter(())
@@ -7004,11 +7098,12 @@ def test_mlx_generate_chat_response_attaches_the_video_part_and_forwards_the_cli
     assert messages[-1]["content"] == [{"type": "video"}, {"type": "text", "text": "what moves"}]
     assert kwargs["video"] == _CLIP_B64
 
-    backend._is_vlm = False
+    backend._reads_vision = False
     with pytest.raises(RuntimeError, match = "loaded model does not read video"):
         list(backend.generate_chat_response([{"role": "user", "content": "hi"}], video = _CLIP_B64))
 
     backend._is_vlm = True
+    backend._reads_vision = True
     monkeypatch.setattr(mlx_inference, "_mlx_vlm_decodes_video", lambda: False)
     with pytest.raises(RuntimeError, match = "installed mlx-vlm does not read video"):
         list(backend.generate_chat_response([{"role": "user", "content": "hi"}], video = _CLIP_B64))
@@ -7485,6 +7580,8 @@ def _constrained_vlm_reply(
     backend = MLXInferenceBackend()
     backend._model = SimpleNamespace(config = {"model_type": "generic_vlm"})
     backend._processor = SimpleNamespace(chat_template = "template", all_special_tokens = specials)
+    backend._is_vlm = True
+    backend._reads_vision = True
     args = ([{"role": "user", "content": "hi"}], [], 0.7, 0.9, 40, 0.01, 64, 1.0, None)
     return list(backend._generate_vlm(*args, response_format = {"type": "json_object"}))
 
@@ -7737,3 +7834,210 @@ def test_the_grammar_ends_on_the_stop_the_decode_loop_names():
         _allowed(constraint, len(tokenizer))
         constraint.advance(int(token_id))
     assert _allowed(constraint, len(tokenizer)) == {runtime_stop}
+
+
+def test_turboquant_leaves_every_cache_for_the_runtime_to_build():
+    lm_cache = pytest.importorskip("mlx_lm.models.cache")
+
+    from core.inference.mlx_inference import MLXInferenceBackend
+
+    backend = MLXInferenceBackend()
+    kinds = lambda: [
+        type(entry).__name__
+        for entry in backend._prepare_kv_entries([lm_cache.KVCache(), lm_cache.KVCache()])
+    ]
+
+    backend._kv_quant = {"kv_bits": 3.5}
+    backend._turboquant = True
+    assert kinds() == ["KVCache"] * 2
+    backend._kv_quant = {"kv_bits": 4}
+    assert kinds() == ["KVCache"] * 2
+
+    backend._turboquant = False
+    assert kinds() == ["QuantizedKVCache"] * 2
+
+
+def test_turboquant_sends_its_width_on_the_reused_cache_turn_too(monkeypatch):
+    """TurboQuant has no pre-converted entry to carry the width, so the width has to travel on its
+    own. Held inside the branch that builds a cache, a turn that reused one generated unquantized
+    while the load still reported the setting on -- a silent loss, not a failure."""
+    import sys
+    import types
+
+    from core.inference import mlx_inference
+
+    monkeypatch.setattr(
+        "core.inference.chat_template_helpers.apply_chat_template_for_generation",
+        lambda *_args, **_kwargs: "prompt",
+        raising = True,
+    )
+    monkeypatch.setattr(
+        "core.inference.chat_template_helpers.render_with_native_template_fallback",
+        lambda formatted_prompt, **_kwargs: SimpleNamespace(
+            prompt = formatted_prompt,
+            reasoning_channel_markers = None,
+        ),
+        raising = True,
+    )
+
+    seen = {}
+    mlx_lm_pkg = types.ModuleType("mlx_lm")
+    mlx_lm_sample = types.ModuleType("mlx_lm.sample_utils")
+    mlx_lm_sample.make_sampler = lambda **_kwargs: object()
+    mlx_lm_sample.make_logits_processors = lambda **_kwargs: None
+
+    def _stream_generate(_model, _tokenizer, **kwargs):
+        seen.clear()
+        seen.update(kwargs)
+        yield SimpleNamespace(token = 1)
+
+    mlx_lm_pkg.stream_generate = _stream_generate
+    monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm_pkg)
+    monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils", mlx_lm_sample)
+
+    class _Tokenizer:
+        chat_template = "x"
+        all_special_ids = []
+        all_special_tokens = []
+
+        def decode(self, ids, **_kwargs):
+            return "x" * len(list(ids))
+
+    backend = mlx_inference.MLXInferenceBackend()
+    backend._model = object()
+    backend._tokenizer = _Tokenizer()
+    backend._is_vlm = False
+    backend._kv_quant = {"kv_bits": 3.5}
+    backend._turboquant = True
+
+    def _generate(reused):
+        cache = [object()] if reused else None
+        monkeypatch.setattr(
+            backend,
+            "_prepare_prompt_cache",
+            lambda prompt, _adapter: (prompt, cache, "k" if reused else None, [1], 0),
+        )
+        list(
+            backend.generate_chat_response(
+                messages = [{"role": "user", "content": "hi"}], max_new_tokens = 1
+            )
+        )
+        return dict(seen)
+
+    fresh = _generate(reused = False)
+    reused = _generate(reused = True)
+    for kwargs in (fresh, reused):
+        assert kwargs["kv_bits"] == 3.5
+        assert kwargs["kv_quant_scheme"] == "turboquant"
+        assert kwargs["quantized_kv_start"] == 0
+    assert "prompt_cache" in reused and "prompt_cache" not in fresh
+
+
+def test_turboquant_sends_its_width_on_the_reused_vlm_session_too(monkeypatch):
+    """The path a TurboQuant load actually takes. The detour serves text models through mlx-vlm,
+    so _generate_vlm carries every eligible load, and its reused branch is a session rather than
+    an entry list -- a second place the width had to be lifted out of the fresh-cache branch."""
+    import sys
+    import types
+
+    from core.inference.mlx_inference import MLXInferenceBackend
+
+    seen = {}
+    mlx_vlm = types.ModuleType("mlx_vlm")
+    mlx_vlm.prompt_utils = SimpleNamespace(
+        MODEL_CONFIG = {}, apply_chat_template = lambda *_a, **_k: "prompt"
+    )
+
+    def _vlm_stream(*_args, **kwargs):
+        seen.clear()
+        seen.update(kwargs)
+        yield SimpleNamespace(text = "ok", prompt_tokens = 3, generation_tokens = 1)
+
+    mlx_vlm.stream_generate = _vlm_stream
+    monkeypatch.setitem(sys.modules, "mlx_vlm", mlx_vlm)
+    monkeypatch.setattr(
+        "core.inference.chat_template_helpers.apply_chat_template_for_generation",
+        lambda *_a, **_k: "prompt",
+    )
+    monkeypatch.setattr(
+        "core.inference.chat_template_helpers.detect_think_prefill", lambda *_a, **_k: ""
+    )
+
+    backend = MLXInferenceBackend()
+    backend._model = SimpleNamespace(config = {"model_type": "gemma3"})
+    backend._processor = SimpleNamespace(tokenizer = SimpleNamespace())
+    backend._is_vlm = True
+    backend._reads_vision = True
+    backend._kv_quant = {"kv_bits": 3.5}
+    backend._turboquant = True
+    monkeypatch.setattr(backend, "_release_vlm_snapshots", lambda: None)
+
+    def _generate(session):
+        monkeypatch.setattr(backend, "_vlm_prompt_cache_session", lambda *_a, **_k: session)
+        list(
+            backend.generate_chat_response(
+                messages = [{"role": "user", "content": "hi"}], max_new_tokens = 1
+            )
+        )
+        return dict(seen)
+
+    class _Session:
+        cache = [object()]
+        media_block = None
+        step = 8
+        produced_tokens = 0
+        produced_seconds = 0.0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def finish(self):
+            return None
+
+    session = _Session()
+    fresh = _generate(None)
+    reused = _generate(session)
+    for kwargs in (fresh, reused):
+        assert kwargs["kv_bits"] == 3.5
+        assert kwargs["kv_quant_scheme"] == "turboquant"
+        assert kwargs["quantized_kv_start"] == 0
+    assert "prompt_cache" in reused and "prompt_cache" not in fresh
+
+
+def test_a_turboquant_load_turns_a_pin_into_a_request_budget(monkeypatch):
+    # Same rule as mx.quantize since #11084: an enforceable pin budgets requests, it does not refuse.
+    pytest.importorskip("mlx_lm.models.cache")
+    from core.inference import mlx_inference
+    from core.inference.mlx_inference import MLXInferenceBackend
+
+    def status(
+        _model,
+        bits,
+        refusal = "",
+    ):
+        if refusal:
+            return {"kv_bits": None, "eligibility": "refused", "reason": refusal}
+        return {"kv_bits": bits, "eligibility": "full", "reason": ""}
+
+    monkeypatch.setattr(mlx_inference, "_turboquant_status", status)
+    honours = SimpleNamespace(layers = [object(), object()])
+
+    def policy(
+        requested,
+        served,
+        refusal = "",
+    ):
+        backend = MLXInferenceBackend()
+        backend._model = honours
+        backend._is_vlm = True
+        backend._turboquant = True
+        backend._turboquant_refusal = refusal
+        quant, window, enforced, budget = backend._resolve_kv_policy(True, 3.5, requested, served)
+        return quant["kv_bits"], window, enforced, budget
+
+    assert policy(8192, 8192) == (3.5, None, False, 8192)
+    assert policy(0, 262144) == (3.5, None, False, None)
+    assert policy(8192, 8192, "refused") == (None, 8192, True, None)
