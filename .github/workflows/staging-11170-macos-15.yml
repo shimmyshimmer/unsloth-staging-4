@@ -1,0 +1,60 @@
+name: "staging-11170 macos-15"
+on:
+  push:
+    branches: ["pr-11170-mlxmodels3-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_chat_history_routes.py studio/backend/tests/test_gguf_load_cache_reuse.py studio/backend/tests/test_metal_turboquant.py studio/backend/tests/test_mlx_inference_backend.py studio/backend/tests/test_openai_auto_switch.py tests/studio/test_chat_autoload_failure_gate.py tests/studio/test_cli_attach_load_knobs.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > pytest_out.txt 2>&1 || rc=$?; cat pytest_out.txt; tot=$(grep -cE "^(FAILED|ERROR) " pytest_out.txt) || tot=0; dep=$(grep -cE "^(FAILED|ERROR) .* (ModuleNotFoundError|ImportError). No module named .(torch|unsloth_zoo|transformers).$" pytest_out.txt) || dep=0; bare=$(awk '/^_+ ERROR collecting [^ ]+ _+$/ {cur=$4; next} /^(=|_)+ / {cur=""} cur != "" && /(ModuleNotFoundError|ImportError). No module named .(torch|unsloth_zoo|transformers)./ {ok[cur]=1} /^ERROR [^ ]+$/ && ($2 in ok) {n++} END {print n+0}' pytest_out.txt) || bare=0; dep=$((dep + bare)); if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers)." pytest_out.txt && { [ "$tot" = "0" ] || [ "$tot" = "$dep" ]; }; then echo "collection needs a dep this runner does not ship"; rc=0; fi; if [ "$rc" = "1" ] && [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then echo "only tests needing a dep this runner does not ship failed"; rc=0; fi; exit "$rc"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+      - name: Install frontend deps
+        working-directory: studio/frontend
+        run: npm ci --no-fund --no-audit
+      - name: Node tests
+        working-directory: studio/frontend
+        run: node --experimental-strip-types --test tests/hydration-clears-stale-local-record.test.ts tests/mlx-context-pin-record-compat.test.ts tests/model-config-instance-key.test.ts tests/resident-config-match-accelerator-matrix.test.ts tests/resident-config-match.test.ts tests/server-tuning-settings.test.ts tests/server-tuning-upgrade-downgrade-compat.test.ts
+      - name: "jobs: install MLX (Apple Silicon)"
+        if: ${{ !cancelled() }}
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
+          for attempt in 1 2 3; do python -m pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo" && break; [ "$attempt" = 3 ] && exit 1; sleep $((5 * attempt)); done
+          python -m pip install -e . --no-deps
+          python -m pip install -U transformers mlx-vlm mlx-lm
+          python -m pip list 2>/dev/null | grep -iE '^(transformers|mlx|mlx-lm|mlx-vlm|trl|peft|torch) '
+      - name: "job: mlx_kv_quant_models --max-tokens 64 --base-sha b9716be4c77cd2b5ad11b9c3fbdf835ec29d6fd8 --models mlx-community/Qwen3.5-2B-4bit,mlx-community/SmolLM3-3B-4bit,mlx-community/Qwen3-0.6B-4bit (MLX (Apple Silicon))"
+        if: ${{ !cancelled() }}
+        run: |
+          env -u UNSLOTH_IS_PRESENT -u UNSLOTH_COMPILE_DISABLE python .github/scripts/jobs/mlx_kv_quant_models.py --max-tokens 64 --base-sha b9716be4c77cd2b5ad11b9c3fbdf835ec29d6fd8 --models mlx-community/Qwen3.5-2B-4bit,mlx-community/SmolLM3-3B-4bit,mlx-community/Qwen3-0.6B-4bit --out job_0_mlx_kv_quant_models_macos-15.json
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: job-results-macos-15
+          path: job_*.json
+          if-no-files-found: warn
