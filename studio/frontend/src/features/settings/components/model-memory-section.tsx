@@ -4,6 +4,7 @@
 import { Switch } from "@/components/ui/switch";
 import { formatBytes } from "@/features/hub/lib/format";
 import { useT } from "@/i18n";
+import { subscribeModelLifecycle } from "@/lib/model-lifecycle-events";
 import { useEffect, useState } from "react";
 import {
   type ModelMemorySettings,
@@ -13,6 +14,46 @@ import {
 import { SettingsRow } from "./settings-row";
 import { SettingsSection } from "./settings-section";
 
+// Residency asked for, but the loaded model has no copy in system RAM to lock.
+function MlockNotApplicableNote({
+  settings,
+}: { settings: ModelMemorySettings | null }) {
+  const t = useT();
+  if (
+    !settings?.keepResident ||
+    settings.noRamReserve ||
+    settings.mlockActive ||
+    settings.mlockApplicable
+  ) {
+    return null;
+  }
+  return (
+    <p className="pb-1 text-xs text-muted-foreground">
+      {t("settings.resources.modelMemory.mlockNotApplicable")}
+    </p>
+  );
+}
+
+// Forced: the response describes the running model, which may have changed since the last read.
+async function refreshModelMemory(
+  isCancelled: () => boolean,
+  setSettings: (settings: ModelMemorySettings) => void,
+  setError: (error: string | null) => void,
+  fallbackError: string,
+): Promise<void> {
+  try {
+    const loaded = await loadModelMemorySettings({ force: true });
+    if (!isCancelled()) {
+      setSettings(loaded);
+      setError(null);
+    }
+  } catch (loadError) {
+    if (!isCancelled()) {
+      setError(loadError instanceof Error ? loadError.message : fallbackError);
+    }
+  }
+}
+
 export function ModelMemorySection() {
   const t = useT();
   const [settings, setSettings] = useState<ModelMemorySettings | null>(null);
@@ -21,22 +62,22 @@ export function ModelMemorySection() {
 
   useEffect(() => {
     let cancelled = false;
-    void loadModelMemorySettings()
-      .then((loaded) => {
-        if (cancelled) return;
-        setSettings(loaded);
-        setError(null);
-      })
-      .catch((loadError) => {
-        if (cancelled) return;
-        setError(
-          loadError instanceof Error
-            ? loadError.message
-            : t("settings.resources.modelMemory.loadError"),
-        );
-      });
+    const refresh = () =>
+      refreshModelMemory(
+        () => cancelled,
+        setSettings,
+        setError,
+        t("settings.resources.modelMemory.loadError"),
+      );
+    refresh();
+    const unsubscribe = subscribeModelLifecycle(({ loading }) => {
+      if (!loading) {
+        refresh();
+      }
+    });
     return () => {
       cancelled = true;
+      unsubscribe();
     };
   }, [t]);
 
@@ -109,6 +150,7 @@ export function ModelMemorySection() {
               {t("settings.resources.modelMemory.mlockVetoed")}
             </p>
           ) : null}
+          <MlockNotApplicableNote settings={settings} />
           {memlockCap !== null ? (
             <p className="pb-1 text-xs text-amber-600 dark:text-amber-400">
               {t("settings.resources.modelMemory.memlockCapped", {
