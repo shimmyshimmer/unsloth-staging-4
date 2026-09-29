@@ -51,6 +51,7 @@ export interface LoadModelRequest {
 
   /** Start a fresh runtime even when the active settings already match. */
   force_reload?: boolean;
+  alongside?: boolean;
   /** Stop any chats still generating instead of getting a 409: a load replaces the single
    *  llama-server they all decode on. Set only after the user confirms. */
   force_cancel_active?: boolean;
@@ -219,6 +220,7 @@ export function isMultimodalResponse(
 
 export interface LoadModelResponse {
   is_mlx?: boolean;
+  evicted?: string[];
   is_npu?: boolean;
   status: string;
   model: string;

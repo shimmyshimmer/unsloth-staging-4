@@ -10,6 +10,7 @@ OpenAI-compatible /v1/chat/completions endpoint.
 import ast
 import atexit
 import bisect
+import weakref
 import contextlib
 import ctypes
 import errno
@@ -515,6 +516,52 @@ class LlamaServerNotFoundError(RuntimeError):
     __slots__ = ()
 
 
+def _gpu_short_message(
+    need_gb: float, free_gb: float, asked_ctx: int, fitting_ctx: int, capped_only: bool
+) -> str:
+    """What a user reads when a model does not fit next to the loaded ones."""
+    message = (
+        f"This model needs about {need_gb:.1f} GB of GPU memory at a {asked_ctx} context, "
+        f"and {free_gb:.1f} GB is free next to the models already loaded. "
+    )
+    if capped_only:
+        return message + f"It fits with a {fitting_ctx} context."
+    return message + (
+        "Unload one of them, lower the context length, or turn off "
+        '"Keep other models loaded" to replace the current model.'
+    )
+
+
+class GpuMemoryShortError(RuntimeError):
+    """A load that must fit next to the loaded models does not. ``capped``: it would, at a
+    smaller context than asked for. ``gpu_indices``: the GPUs ``short_mib`` was measured on."""
+
+    __slots__ = ("capped", "short_mib", "gpu_indices")
+
+    def __init__(
+        self,
+        message: str,
+        capped: bool = False,
+        short_mib: int = 0,
+        gpu_indices = None,
+    ):
+        super().__init__(message)
+        self.capped = capped
+        self.short_mib = short_mib
+        self.gpu_indices = gpu_indices
+
+
+_serving_backends: "weakref.WeakSet[LlamaCppBackend]" = weakref.WeakSet()
+
+
+def register_serving_backend(backend) -> None:
+    _serving_backends.add(backend)
+
+
+def unregister_serving_backend(backend) -> None:
+    _serving_backends.discard(backend)
+
+
 class GgufDownloadCancelled(RuntimeError):
     """Expected signal from a cancelled GGUF download."""
 
@@ -607,6 +654,7 @@ class GgufLoadIntent:
     # a launch-time rewrite makes the launched and requested lists diverge.
     extra_args_inherited: bool = False
     preserve_multi_gpu_on_layer: bool = False
+    refuse_partial_gpu_fit: bool = False
     compare_mtp_draft: bool = False
     force_reload: bool = False
 
@@ -7659,6 +7707,8 @@ class LlamaCppBackend:
         # Monotonic timestamp set in _kill_process; read by load_model
         # to decide whether to wait for the VRAM reclaim to finish.
         self._last_kill_monotonic: float = 0.0
+        self._planned_vram_mib: dict[int, int] = {}
+        self._pending_plan_mib: dict[int, int] = {}
 
         if manages_processes:
             _reaped = self._kill_orphaned_servers()
@@ -23066,7 +23116,7 @@ class LlamaCppBackend:
             _invalidate_gpu_memory("llama-server spawned")
             # Cross-session backstop for when parent-death cleanup did not run.
             # Under the lock: see _spawn_and_wait.
-            self._record_server_pid(_spawned.pid)
+            self._note_server_pid(_spawned.pid)
 
         # The stale check above and the process-wide latch are only atomic for the
         # instance run.py tears down, which sets its own flag under this same lock. A
@@ -24353,6 +24403,9 @@ class LlamaCppBackend:
                 # from the default unless the verdict is recorded on its own.
                 # Bound before the try for the same reason as _detected_gpus.
                 _placement_verdict_partial = False
+                _ctx_capped_for_vram = False
+                # A path that never prices the launch must not commit the previous one's plan.
+                self._pending_plan_mib = {}
                 # Sized inputs for the tensor-spill planner, None when the fit never
                 # priced them. Bound before the try like _placement_verdict_partial:
                 # the except arm restores use_fit=True without rebinding
@@ -24457,6 +24510,12 @@ class LlamaCppBackend:
                     # so the pin happens anyway. A pinned uncovered GPU is the user's
                     # call and already reports "device kernel image is invalid".
                     _gpu_mem = self._get_gpu_memory(binary, for_llama_server = not gpu_ids)
+                    _held = self._other_planned_vram_mib()
+                    if _held:
+                        _gpu_mem = [
+                            (idx, min(free, max(0, total - _held.get(idx, 0))), total)
+                            for idx, free, total in _gpu_mem
+                        ]
                     # Every present device gated out (#7624). Left alone the launch
                     # takes the `--fit on` arm with `gpu_indices` still None, so no
                     # mask is written, the child enumerates every unsupported card and
@@ -26009,6 +26068,7 @@ class LlamaCppBackend:
                                     or 1,
                                 ),
                             )
+                            _ctx_before_fit = effective_ctx
                             for n_gpus in range(_auto_min_gpus, len(ranked) + 1):
                                 subset = ranked[:n_gpus]
                                 pool_budget = _pool_budget_mib(subset, pin_fraction)
@@ -26072,6 +26132,7 @@ class LlamaCppBackend:
                                     if footprint_mib > pool_budget:
                                         continue
                                 effective_ctx = capped
+                                _ctx_capped_for_vram = 0 < capped < _ctx_before_fit
                                 gpu_indices = sorted(idx for idx, _ in subset)
                                 use_fit = False
                                 break
@@ -26701,6 +26762,12 @@ class LlamaCppBackend:
                         # --fit flag state, not "does it fit": off means this subset provably fits.
                         f"GPUs free: {gpus}, selected: {gpu_indices}, --fit: {'on' if use_fit else 'off'}"
                     )
+                    _on = list(gpu_indices or [idx for idx, _ in gpus])
+                    if _on:
+                        _planned = (gguf_size + mmproj_size + kv_cache_bytes) // (
+                            1024 * 1024 * len(_on)
+                        )
+                        self._pending_plan_mib = {idx: _planned for idx in _on}
                     if (
                         not gpus
                         and not _detected_gpus
@@ -26938,6 +27005,23 @@ class LlamaCppBackend:
                 if _metal_ctx_refusal:
                     raise RuntimeError(_metal_ctx_refusal)
                 self._record_load_warning(_metal_ctx_warning)
+
+                if (
+                    intent.refuse_partial_gpu_fit
+                    and (_placement_verdict_partial or _ctx_capped_for_vram)
+                    and gpu_memory_mode != "manual"
+                ):
+                    capped_only = _ctx_capped_for_vram and not _placement_verdict_partial
+                    asked_ctx = _ctx_before_fit if capped_only else effective_ctx
+                    need_mib = (gguf_size + mmproj_size + _kv_bytes(asked_ctx)) // (1024 * 1024)
+                    free_mib = sum(free for _, free in gpus)
+                    need_gb, free_gb = need_mib / 1024, free_mib / 1024
+                    raise GpuMemoryShortError(
+                        _gpu_short_message(need_gb, free_gb, asked_ctx, effective_ctx, capped_only),
+                        capped = capped_only,
+                        short_mib = max(0, need_mib - free_mib),
+                        gpu_indices = tuple(idx for idx, _ in gpus),
+                    )
 
                 # An unenumerated explicit Vulkan ordinal can't be pinned; fail loudly
                 # instead of fitting onto an unselected device. Clear the raw selection
@@ -29591,7 +29675,7 @@ class LlamaCppBackend:
                             # Inside the lock: written after a sweep reaped the child,
                             # _pid_start_identity yields no start time, and the bare pid
                             # left behind is one a later launch kills blind.
-                            self._record_server_pid(_spawned.pid)
+                            self._note_server_pid(_spawned.pid)
                         # mark_process_shutting_down does not take _spawn_lock, so the
                         # check above is not atomic against it for a helper-owned
                         # backend. Without this recheck a child spawned in that gap sits
@@ -32526,6 +32610,7 @@ class LlamaCppBackend:
                 logger.info("load no longer belongs to this lifecycle; not publishing it healthy")
                 return False
             self._healthy = True
+            self._planned_vram_mib = dict(getattr(self, "_pending_plan_mib", {}))
             return True
 
     def _close_attempt_log(self) -> None:
@@ -32617,6 +32702,7 @@ class LlamaCppBackend:
         self._diffusion_requested_ngl = None
         self._child_gpu_physical_ids = None
         if self._process is None:
+            self._planned_vram_mib = {}
             return
         # Not every _process is a Popen: tests stand one in to mean "a server is
         # loaded" without spawning anything. Terminating what cannot be terminated
@@ -32731,12 +32817,15 @@ class LlamaCppBackend:
                 except Exception:
                     pass
             self._process = None
+            self._planned_vram_mib = {}
             # Same rule as the lifetime record above: the pidfile is the next launch's
             # only handle on a server that outlived this kill, so it is removed once the
             # exit is confirmed and not merely attempted. Without a child handle there is
             # no exit to confirm and nothing was signalled, so the pidfile is dropped as
             # it always was rather than kept forever by a stand-in that cannot answer.
-            if _killed_pid is None or _exited or not _owns_child:
+            if getattr(self, "_owns_pidfile", True) and (
+                _killed_pid is None or _exited or not _owns_child
+            ):
                 self._clear_server_pid()
             # Clear healthy so a /load during the replacement's warm-up can't
             # short-circuit against the previous server's health (#5401).
@@ -32762,6 +32851,29 @@ class LlamaCppBackend:
                 except Exception:
                     pass
                 self._llama_log_fh = None
+
+    def _other_planned_vram_mib(self) -> dict[int, int]:
+        """MiB per GPU the other serving backends' running servers hold."""
+        held: dict[int, int] = {}
+        serving = list(_serving_backends)
+        if self not in serving:
+            return held
+        for backend in serving:
+            if backend is self or not getattr(backend, "is_active", False):
+                continue
+            for idx, mib in getattr(backend, "_planned_vram_mib", {}).items():
+                held[idx] = held.get(idx, 0) + mib
+        return held
+
+    def _note_server_pid(self, pid: int) -> None:
+        if getattr(self, "_owns_pidfile", True):
+            self._record_server_pid(pid)
+            return
+        try:
+            from utils.process_lifetime import adopt_pid
+            adopt_pid(pid)
+        except Exception as e:
+            logger.debug(f"Could not track llama-server for lifetime sweep: {e}")
 
     @staticmethod
     def _server_pidfile_path() -> Optional[Path]:

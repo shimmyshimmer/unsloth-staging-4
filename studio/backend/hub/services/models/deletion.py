@@ -622,27 +622,24 @@ _LOAD_STATE_UNVERIFIABLE_DETAIL = (
 def _llama_cpp_blocks_delete(repo_id: str, variant: Optional[str]) -> bool:
     """Whether the llama.cpp backend holds *repo_id* (/variant). Acquiring fails open (import error means nothing loaded); reading load state is unguarded so a raise propagates and the caller fails closed rather than delete a live model."""
     try:
-        from routes.inference import get_llama_cpp_backend
-        backend = get_llama_cpp_backend()
+        from routes.inference import extra_slot_backends, filling_slot_model, get_llama_cpp_backend
+        backends = [get_llama_cpp_backend(), *(llama for llama, _ in extra_slot_backends())]
+        filling = filling_slot_model()
     except Exception as e:
         logger.debug(f"llama.cpp backend unavailable during delete guard for {repo_id}: {e}")
         return False
-    loaded_id = backend.model_identifier
-    loaded_variant = getattr(backend, "hf_variant", None)
-    if backend.is_active and not backend.is_loaded and loaded_id:
-        return _loaded_repo_variant_blocks_delete(
-            loaded_id,
-            repo_id,
-            variant,
-            loaded_variant,
-        )
-    if backend.is_loaded and loaded_id:
-        return _loaded_repo_variant_blocks_delete(
-            loaded_id,
-            repo_id,
-            variant,
-            loaded_variant,
-        )
+    if filling and _loaded_id_matches_repo(filling, repo_id):
+        return True
+    for backend in backends:
+        loaded_id = backend.model_identifier
+        if (backend.is_active or backend.is_loaded) and loaded_id:
+            if _loaded_repo_variant_blocks_delete(
+                loaded_id,
+                repo_id,
+                variant,
+                getattr(backend, "hf_variant", None),
+            ):
+                return True
     return False
 
 
@@ -650,14 +647,23 @@ def _inference_backend_blocks_delete(repo_id: str) -> bool:
     """Whether the subprocess inference backend holds *repo_id*; same fail-open-on-acquire / surface-on-query contract as :func:`_llama_cpp_blocks_delete`."""
     try:
         from core.inference.orchestrator import peek_inference_backend
-        backend = peek_inference_backend()
+        from routes.inference import extra_slot_backends
+
+        primary = peek_inference_backend()
+        kept = [orch for _, orch in extra_slot_backends()]
     except Exception as e:
         logger.debug(f"Inference backend unavailable during delete guard for {repo_id}: {e}")
         return False
-    if backend is None:
-        return False
-    active_name = backend.active_model_name
-    return bool(active_name) and _loaded_id_matches_repo(active_name, repo_id)
+    for backend in (primary, *kept):
+        if backend is None:
+            continue
+        active_name = backend.active_model_name
+        if active_name and _loaded_id_matches_repo(active_name, repo_id):
+            return True
+    for backend in kept:
+        if any(_loaded_id_matches_repo(m, repo_id) for m in getattr(backend, "loading_models", ())):
+            return True
+    return False
 
 
 def _diffusion_blocks_delete(repo_id: str) -> Optional[str]:
@@ -700,13 +706,21 @@ def any_model_load_blocks_cache_clear() -> Optional[str]:
     different matter, and the caller fails closed on it rather than unlink weights blindly.
     """
     try:
-        from routes.inference import get_llama_cpp_backend
+        from routes.inference import extra_slot_backends, extra_slot_loading, get_llama_cpp_backend
+
         backend = get_llama_cpp_backend()
+        kept = extra_slot_backends()
+        kept_loading = extra_slot_loading()
     except Exception as exc:  # noqa: BLE001 - unavailable is not "in use"
         logger.debug(f"llama.cpp backend unavailable during the cache-clear guard: {exc}")
     else:
         if (backend.is_loaded or backend.is_active) and backend.model_identifier:
             return "Unload the model before clearing the model cache"
+        for llama, orchestrator in kept:
+            if (llama.is_loaded or llama.is_active) or orchestrator.active_model_name:
+                return "Unload the model before clearing the model cache"
+        if kept_loading:
+            return "A model load is using the cache; wait for it to finish"
 
     # is_active above only covers a live llama-server process, which an HF-backed chat load does
     # not have until its GGUF finished downloading: minutes, per chat_load_active's own docstring.

@@ -1791,8 +1791,10 @@ function GgufVariantExpander({
   diffusionLoad = false,
   hostPooledMemory = false,
   gpuCount,
+  loadedQuants,
 }: {
   repoId: string;
+  loadedQuants?: readonly string[];
   pipelineTag?: string | null;
   /** True on Images / Video, where a GGUF is placed by the diffusion backend rather than
    *  llama-server, so the llama.cpp budget does not apply. Audio is task-scoped but not this. */
@@ -2336,6 +2338,10 @@ function GgufVariantExpander({
               {unusableLocal ? (
                 <span className="ml-1.5 text-ui-9 font-sans font-medium text-amber-700 dark:text-amber-300">
                   incomplete
+                </span>
+              ) : loadedQuants?.some((q) => ggufVariantsMatchForPicker(q, v.quant)) ? (
+                <span className="ml-1.5 text-ui-9 font-sans font-medium text-green-600/90 dark:text-green-400/80">
+                  loaded
                 </span>
               ) : v.downloaded ? (
                 <>
@@ -2898,6 +2904,7 @@ export function HubModelPicker({
   section = "downloaded",
   sectionToggle,
   onEject,
+  onEjectAll,
   task,
   catalog,
   communityModelPolicy = "none",
@@ -2926,7 +2933,8 @@ export function HubModelPicker({
   /** Section shown when not searching. Search spans all sections. */
   section?: "downloaded" | "recommended" | "connected";
   sectionToggle?: ReactNode;
-  onEject?: () => void;
+  onEject?: (modelId?: string) => void;
+  onEjectAll?: () => void;
   /** Restrict results to a pipeline task; undefined = all tasks (the chat default). */
   task?: HfTaskFilter;
   /** Curated catalog for a task-scoped picker: one canonical row per model, formats as the second level. */
@@ -2952,6 +2960,10 @@ export function HubModelPicker({
   // resident. Same predicate as the header tick.
   const selectedCheckpoint = useChatRuntimeStore((s) => s.params.checkpoint);
   const residentCheckpoint = useChatRuntimeStore((s) => s.residentCheckpoint);
+  const keepModelsLoaded = useChatRuntimeStore((s) => s.keepModelsLoaded);
+  const loadedModels = useChatRuntimeStore((s) => s.loadedModels);
+  const setKeepModelsLoaded = useChatRuntimeStore((s) => s.setKeepModelsLoaded);
+  const isChatPicker = task === undefined;
   const chatLoadedModelId = chatModelLoaded({
     checkpoint: selectedCheckpoint,
     isExternalModel: isExternalModelId(selectedCheckpoint),
@@ -2970,6 +2982,33 @@ export function HubModelPicker({
   const hfToken = useHfTokenStore((s) => s.token);
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query);
+  const loadedIdSet = useMemo(
+    () => new Set(isChatPicker ? loadedModels.map((m) => m.id.toLowerCase()) : []),
+    [isChatPicker, loadedModels],
+  );
+  const isKeptLoaded = (repoId: string) =>
+    loadedIdSet.has(repoId.toLowerCase());
+  const loadedQuantsFor = (repoId: string): string[] => {
+    const quants =
+      isChatPicker
+        ? loadedModels
+            .filter((m) => m.quant && modelIdsMatchForPicker(m.id, repoId))
+            .map((m) => m.quant as string)
+        : [];
+    if (activeGgufVariant && modelIdsMatchForPicker(loadedModelId, repoId)) {
+      quants.push(activeGgufVariant);
+    }
+    return [...new Set(quants)];
+  };
+  const loadedRows = useMemo(() => {
+    if (!isChatPicker || section !== "recommended") return [];
+    const q = debouncedQuery.trim().toLowerCase();
+    return loadedModels.filter((m) => m.id.toLowerCase().includes(q));
+  }, [isChatPicker, section, debouncedQuery, loadedModels]);
+  const loadedRowIds = useMemo(
+    () => new Set(loadedRows.map((m) => m.id.toLowerCase())),
+    [loadedRows],
+  );
   // Shared Hub search stack so the picker and Hub run one implementation. Scoped to unsloth like the old listing.
   const online = useOnlineStatus();
   const { phase: hubPhase } = useHubAvailability();
@@ -4878,41 +4917,52 @@ export function HubModelPicker({
   );
 
   // Split downloaded models so non-Unsloth repos get their own "Other models" section above Fine-tuned.
+  // Kept-loaded models first: a stable partition, so the splits below keep that order.
+  const [keptFirstCachedGguf, keptFirstCachedModelRows] = useMemo(() => {
+    const first = <T extends { repo_id: string }>(rows: T[]): T[] =>
+      loadedIdSet.size === 0
+        ? rows
+        : [
+            ...rows.filter((r) => loadedIdSet.has(r.repo_id.toLowerCase())),
+            ...rows.filter((r) => !loadedIdSet.has(r.repo_id.toLowerCase())),
+          ];
+    return [first(visibleCachedGguf), first(visibleCachedModelRows)] as const;
+  }, [visibleCachedGguf, visibleCachedModelRows, loadedIdSet]);
   const unslothCachedGguf = useMemo(
     () =>
-      visibleCachedGguf.filter(
+      keptFirstCachedGguf.filter(
         (c) =>
           isUnslothPublisherRepoId(c.repo_id) &&
           !pinnedSoleQuantRepoIds.has(c.repo_id),
       ),
-    [visibleCachedGguf, pinnedSoleQuantRepoIds],
+    [keptFirstCachedGguf, pinnedSoleQuantRepoIds],
   );
   const otherCachedGguf = useMemo(
     () =>
-      visibleCachedGguf.filter(
+      keptFirstCachedGguf.filter(
         (c) =>
           !isUnslothPublisherRepoId(c.repo_id) &&
           !pinnedSoleQuantRepoIds.has(c.repo_id),
       ),
-    [visibleCachedGguf, pinnedSoleQuantRepoIds],
+    [keptFirstCachedGguf, pinnedSoleQuantRepoIds],
   );
   const unslothCachedModelRows = useMemo(
     () =>
-      visibleCachedModelRows.filter(
+      keptFirstCachedModelRows.filter(
         (c) =>
           isUnslothPublisherRepoId(c.repo_id) &&
           !pinnedSet.has(pinKey(c.repo_id)),
       ),
-    [visibleCachedModelRows, pinnedSet],
+    [keptFirstCachedModelRows, pinnedSet],
   );
   const otherCachedModelRows = useMemo(
     () =>
-      visibleCachedModelRows.filter(
+      keptFirstCachedModelRows.filter(
         (c) =>
           !isUnslothPublisherRepoId(c.repo_id) &&
           !pinnedSet.has(pinKey(c.repo_id)),
       ),
-    [visibleCachedModelRows, pinnedSet],
+    [keptFirstCachedModelRows, pinnedSet],
   );
 
   // Param counts come straight off the unsloth listings the picker already loaded, so the VRAM
@@ -5217,7 +5267,9 @@ export function HubModelPicker({
     ];
   }, [connectedMatches, pinnedConnectedSet, connectedSort]);
   const hubOptionKeys = useMemo(() => {
-    const keys: string[] = [];
+    const keys: string[] = loadedRows.map((m) =>
+      makeModelOptionKey("loaded", m.id),
+    );
 
     // The tab lists nothing else, so these are the whole roving order, in drawn order.
     if (section === "connected") {
@@ -5354,12 +5406,16 @@ export function HubModelPicker({
 
     if (section === "recommended") {
       keys.push(
-        ...recommendedRows.map((r) => makeModelOptionKey("recommended", r.id)),
+        ...recommendedRows
+          .filter((r) => !loadedRowIds.has(r.id.toLowerCase()))
+          .map((r) => makeModelOptionKey("recommended", r.id)),
       );
     }
 
     return keys;
   }, [
+    loadedRows,
+    loadedRowIds,
     cachedReady,
     chatOnly,
     sortedCustomFolderModels,
@@ -5726,6 +5782,7 @@ export function HubModelPicker({
     );
 
   const showConnected = section === "connected";
+  const ejectsAll = Boolean(onEjectAll) && loadedModels.length > 1;
   // The Connected layout uses a wider box, so it drops the search inset to keep Search Hub on the last dropdown's edge.
   const hasConnected = externalModels.length > 0;
   // The Other models section and its shortcut only show with non-Unsloth downloads.
@@ -5749,6 +5806,90 @@ export function HubModelPicker({
         style={drag.draggingKey === key ? { opacity: 0.4 } : undefined}
       >
         {row}
+      </div>
+    );
+  };
+
+
+  // Row-level eject only once several are loaded; with one, the footer button ejects it.
+  const ejectsKept = Boolean(onEject) && loadedModels.length > 1;
+  const ejectMenuItems = (modelId: string) =>
+    ejectsKept && isKeptLoaded(modelId)
+      ? [
+          {
+            key: "eject",
+            label: "Eject",
+            icon: (
+              <HugeiconsIcon
+                icon={RemoveCircleIcon}
+                strokeWidth={1.75}
+                className="size-icon"
+              />
+            ),
+            onSelect: () => onEject?.(modelId),
+          },
+        ]
+      : undefined;
+
+  const renderLoadedRow = (entry: (typeof loadedModels)[number]) => {
+    const optionKey = makeModelOptionKey("loaded", entry.id);
+    const isSelected = modelIdsMatchForPicker(value, entry.id);
+    const quant = entry.quant ?? (isSelected ? activeGgufVariant : null);
+    return (
+      <div
+        key={optionKey}
+        className={downloadedRowShellClassName(isSelected)}
+      >
+        <div className="min-w-0 flex-1">
+          <ModelRow
+            label={entry.id}
+            tooltipText={entry.id}
+            hideOwner={isUnslothOwned(entry.id)}
+            alignMeta="hub"
+            meta={quant ? "GGUF" : extractParamLabel(entry.id)}
+            tags={quant ? [ggufQuantChipLabel(quant)] : undefined}
+            selected={isSelected}
+            loaded={true}
+            optionProps={hubModelList.getOptionProps(optionKey, isSelected)}
+            onClick={() =>
+              onSelect(entry.id, {
+                source: "hub",
+                isLora: false,
+                ggufVariant: quant ?? undefined,
+                isDownloaded: true,
+                isGguf: Boolean(quant),
+              })
+            }
+            vramStatus={null}
+            className={downloadedRowButtonClassName}
+          />
+        </div>
+        <span className={ROW_ACTIONS_CLASS}>
+          {ejectsKept ? (
+            <Tooltip delayDuration={0}>
+              <TooltipTrigger asChild={true}>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onEject?.(entry.id);
+                  }}
+                  aria-label={`Eject ${entry.id}`}
+                  className="flex size-5 shrink-0 items-center justify-center rounded-md text-muted-foreground/60 transition-colors hover:bg-[rgb(0_0_0_/_calc(0.05*var(--contrast-wash-gain,1)))] hover:text-red-500 dark:hover:bg-[rgb(255_255_255_/_calc(0.1*var(--contrast-wash-gain,1)))]"
+                >
+                  <HugeiconsIcon
+                    icon={RemoveCircleIcon}
+                    strokeWidth={1.75}
+                    className="size-3.5"
+                  />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="tooltip-compact">
+                Eject
+              </TooltipContent>
+            </Tooltip>
+          ) : null}
+        </span>
       </div>
     );
   };
@@ -6106,7 +6247,7 @@ export function HubModelPicker({
             gpuGb={expanderGpuGb}
             showVision={c.has_vision || sole.hasVision}
             selected={isSelected}
-            loaded={rowState.loaded}
+            loaded={rowState.loaded || isKeptLoaded(c.repo_id)}
             alignMeta="device"
             optionProps={hubModelList.getOptionProps(optionKey, isSelected)}
             onClick={() => onSelect(c.repo_id, selectMeta)}
@@ -6124,6 +6265,7 @@ export function HubModelPicker({
           <ModelRowMenu
             ariaLabel={`More options for ${c.repo_id} ${variant.quant}`}
             cachePath={{ repoId: c.repo_id, variant: variant.quant }}
+            items={ejectMenuItems(c.repo_id)}
             pin={{
               pinned: isPinned,
               pinLabel: "Pin to top",
@@ -6182,6 +6324,7 @@ export function HubModelPicker({
     const isSelected = value === c.repo_id;
     const soleQuant = soleQuants.quants.get(c.repo_id);
     if (soleQuant) return renderSoleQuantGgufRow(c, soleQuant);
+    const loadedQuants = loadedQuantsFor(c.repo_id);
     // Auto-expansion waits for the probe: expanding every row first would mount an expander, and
     // its remote listing, for repos about to collapse.
     const expanderOpen = shouldMountVariantExpander({
@@ -6199,17 +6342,21 @@ export function HubModelPicker({
               label={c.repo_id}
               tooltipText={localPathTooltip(c.repo_id, c.cache_path)}
               meta="GGUF"
+              quantChip={loadedQuants.map(ggufQuantChipLabel).join(", ") || undefined}
               showVision={c.has_vision ?? visionByRepo[c.repo_id]}
               alignMeta="device"
               partial={isPartialRepo}
               partialResumable={c.partial_resumable}
               selected={isSelected}
-              loaded={isRuntimeLoadedModel(
-                loadedModelId,
-                activeGgufVariant,
-                c.repo_id,
-                "required",
-              )}
+              loaded={
+                isKeptLoaded(c.repo_id) ||
+                isRuntimeLoadedModel(
+                  loadedModelId,
+                  activeGgufVariant,
+                  c.repo_id,
+                  "required",
+                )
+              }
               optionProps={hubModelList.getOptionProps(optionKey, isSelected)}
               onClick={() => toggleGgufExpanded(c.repo_id, expanderOpen)}
               onArrowDownIntoChildren={
@@ -6277,6 +6424,7 @@ export function HubModelPicker({
             hostPooledMemory={gpu.loadDeviceSharesHostMemory}
             gpuCount={expanderGpuCount}
             repoId={c.repo_id}
+            loadedQuants={loadedQuants}
             pipelineTag={c.task ?? null}
             loadId={c.load_id}
             cachePath={c.cache_path}
@@ -6336,12 +6484,15 @@ export function HubModelPicker({
             alignMeta="device"
             partial={isPartial}
             partialResumable={c.partial_resumable}
-            loaded={isRuntimeLoadedModel(
-              loadedModelId,
-              activeGgufVariant,
-              c.repo_id,
-              "none",
-            )}
+            loaded={
+              isKeptLoaded(c.repo_id) ||
+              isRuntimeLoadedModel(
+                loadedModelId,
+                activeGgufVariant,
+                c.repo_id,
+                "none",
+              )
+            }
             optionProps={hubModelList.getOptionProps(optionKey, isSelected)}
             onClick={() =>
               onSelect(c.repo_id, {
@@ -6385,6 +6536,7 @@ export function HubModelPicker({
           <ModelRowMenu
             ariaLabel={`More options for ${c.repo_id}`}
             cachePath={{ repoId: c.repo_id }}
+            items={ejectMenuItems(c.repo_id)}
             pin={{
               pinned: pinnedSet.has(pinKey(c.repo_id)),
               pinLabel: "Pin to top",
@@ -6685,9 +6837,17 @@ export function HubModelPicker({
               // On Device pulls the heading block tight to the controls; Recommended keeps more top room
               // above its first row.
               showDownloaded ? "pt-0" : "pt-[calc(4px*var(--ui-space-scale,1))]",
-              onEject ? "pb-[calc(60px*var(--ui-space-scale,1))]" : "pb-4",
+              onEject || isChatPicker
+                ? "pb-[calc(60px*var(--ui-space-scale,1))]"
+                : "pb-4",
             )}
           >
+            {loadedRows.length > 0 ? (
+              <div className="pb-1.5">
+                {loadedRows.map(renderLoadedRow)}
+                <div className="mx-2.5 mt-1.5 border-t border-border/50" />
+              </div>
+            ) : null}
             {showConnected ? (
               connectedMatches.length === 0 ? (
                 <div className="px-2.5 py-2 text-xs leading-relaxed text-muted-foreground">
@@ -7366,6 +7526,7 @@ export function HubModelPicker({
                                   hostPooledMemory={gpu.loadDeviceSharesHostMemory}
                                   gpuCount={expanderGpuCount}
                                   repoId={m.id}
+                                  loadedQuants={loadedQuantsFor(m.id)}
                                   onDevice={true}
                                   onSelect={onSelect}
                                   resolveDownloadFootprint={resolveDownloadFootprint}
@@ -7504,6 +7665,7 @@ export function HubModelPicker({
                                 hostPooledMemory={gpu.loadDeviceSharesHostMemory}
                                 gpuCount={expanderGpuCount}
                                 repoId={m.id}
+                                loadedQuants={loadedQuantsFor(m.id)}
                                 onDevice={true}
                                 onSelect={onSelect}
                                 resolveDownloadFootprint={resolveDownloadFootprint}
@@ -7631,6 +7793,7 @@ export function HubModelPicker({
                                 hostPooledMemory={gpu.loadDeviceSharesHostMemory}
                                 gpuCount={expanderGpuCount}
                                 repoId={m.id}
+                                loadedQuants={loadedQuantsFor(m.id)}
                                 onDevice={true}
                                 onSelect={onSelect}
                                 resolveDownloadFootprint={resolveDownloadFootprint}
@@ -7705,6 +7868,7 @@ export function HubModelPicker({
                     ) : (
                       recommendedRows.map((r) => {
                         const id = r.id;
+                        if (loadedRowIds.has(id.toLowerCase())) return null;
                         const info = recommendedMeta.get(id);
                         const isG = isKnownGgufRepo(id);
                         const optionKey = makeModelOptionKey("recommended", id);
@@ -7766,6 +7930,7 @@ export function HubModelPicker({
                                 hostPooledMemory={gpu.loadDeviceSharesHostMemory}
                                 gpuCount={expanderGpuCount}
                                 repoId={id}
+                                loadedQuants={loadedQuantsFor(id)}
                                 pipelineTag={pipelineTagById.get(id) ?? null}
                                 onSelect={onSelect}
                                 resolveDownloadFootprint={resolveDownloadFootprint}
@@ -7897,6 +8062,7 @@ export function HubModelPicker({
                               hostPooledMemory={gpu.loadDeviceSharesHostMemory}
                               gpuCount={expanderGpuCount}
                               repoId={id}
+                              loadedQuants={loadedQuantsFor(id)}
                               pipelineTag={pipelineTagById.get(id) ?? null}
                               onSelect={onSelect}
                               resolveDownloadFootprint={resolveDownloadFootprint}
@@ -8024,6 +8190,7 @@ export function HubModelPicker({
                                 hostPooledMemory={gpu.loadDeviceSharesHostMemory}
                                 gpuCount={expanderGpuCount}
                                 repoId={id}
+                                loadedQuants={loadedQuantsFor(id)}
                                 pipelineTag={pipelineTagById.get(id) ?? null}
                                 onSelect={onSelect}
                                 resolveDownloadFootprint={resolveDownloadFootprint}
@@ -8069,19 +8236,51 @@ export function HubModelPicker({
             )}
           </div>
         </div>
-        {onEject ? (
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-end pr-3.5 pb-[calc(19px*var(--ui-space-scale,1))]">
+        <div
+          className={cn(
+            "pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-between rounded-b-[inherit] px-3.5 pb-[calc(19px*var(--ui-space-scale,1))]",
+            isChatPicker && "bg-popover pt-2",
+          )}
+        >
+          {isChatPicker ? (
+            <Tooltip>
+              <TooltipTrigger asChild={true}>
+                <button
+                  type="button"
+                  role="checkbox"
+                  aria-checked={keepModelsLoaded}
+                  onClick={() => setKeepModelsLoaded(!keepModelsLoaded)}
+                  className="pointer-events-auto flex cursor-pointer select-none items-center gap-1.5 rounded-md bg-popover px-3 py-2 text-xs text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  <Checkbox
+                    checked={keepModelsLoaded}
+                    tabIndex={-1}
+                    aria-hidden={true}
+                    className="pointer-events-none size-3.5 rounded-full [&_svg]:!size-2.5"
+                  />
+                  Keep other models loaded
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="top">
+                Loading a model keeps the loaded ones in memory, so you can switch
+                between them and call each one by name from the API.
+              </TooltipContent>
+            </Tooltip>
+          ) : (
+            <span />
+          )}
+          {onEject ? (
             <button
               type="button"
-              onClick={onEject}
+              onClick={() => (ejectsAll ? onEjectAll?.() : onEject())}
               className="pointer-events-auto inline-flex items-center justify-center gap-2 rounded-md bg-popover px-3 py-2 text-ui-13 font-medium text-destructive shadow-[0_2px_8px_-2px_rgba(0,0,0,0.16)] transition-colors hover:bg-[color-mix(in_srgb,var(--destructive)_12%,var(--popover))] dark:bg-[color-mix(in_srgb,var(--foreground)_10%,var(--sidebar))] dark:shadow-none dark:hover:bg-[color-mix(in_srgb,var(--destructive)_22%,var(--sidebar))]"
-              title="Eject model"
+              title={ejectsAll ? "Eject all models" : "Eject model"}
             >
               <HugeiconsIcon icon={RemoveCircleIcon} className="size-3.5" />
-              Eject model
+              {ejectsAll ? "Eject all" : "Eject model"}
             </button>
-          </div>
-        ) : null}
+          ) : null}
+        </div>
       </div>
       <TransportConflictDialog
         conflict={updateTransportConflict}
@@ -8343,6 +8542,11 @@ function FineTunedRows({
             {expandedGguf === adapter.id && (
               <GgufVariantExpander
                 repoId={adapter.id}
+                loadedQuants={
+                  activeGgufVariant && modelIdsMatchForPicker(loadedModelId, adapter.id)
+                    ? [activeGgufVariant]
+                    : undefined
+                }
                 onSelect={onSelect}
                 onConfigure={onConfigure}
                 parentOptionKey={optionKey}
