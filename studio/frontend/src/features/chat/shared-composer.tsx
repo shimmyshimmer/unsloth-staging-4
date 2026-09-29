@@ -120,7 +120,13 @@ import {
   exportConversationCsv,
   exportConversationMarkdown,
 } from "./prompt-storage/prompt-storage-dialog";
-import { listPromptEntries, type PromptEntry } from "./api/prompts-api";
+import {
+  listPromptEntries,
+  listPromptLists,
+  type PromptEntry,
+  type PromptListEntry,
+} from "./api/prompts-api";
+import { PromptCountBadge } from "./prompt-storage/prompt-count-badge";
 import { McpComposerButton } from "./mcp-composer-button";
 import { PermissionModeComposerPill } from "./permission-mode-select";
 import { reasoningCapsFromLoad } from "./lib/apply-inference-status-to-store";
@@ -615,6 +621,8 @@ export function SharedComposer({
     },
     [],
   );
+  // Audio files still being read into base64, which pendingAudio cannot see yet.
+  const audioDecodingRef = useRef(0);
   useEffect(() => {
     textRef.current = text;
     pendingImagesRef.current = pendingImages;
@@ -626,15 +634,30 @@ export function SharedComposer({
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [promptStorageOpen, setPromptStorageOpen] = useState(false);
   const [recentPrompts, setRecentPrompts] = useState<PromptEntry[]>([]);
+  const [recentLists, setRecentLists] = useState<PromptListEntry[]>([]);
+  const recentSeqRef = useRef(0);
   const refreshRecentPrompts = useCallback(async () => {
+    recentSeqRef.current += 1;
+    const seq = recentSeqRef.current;
     try {
       const rows = await listPromptEntries();
+      if (seq !== recentSeqRef.current) return;
       const byRecent = [...rows].sort((a, b) => b.updatedAt - a.updatedAt);
       // Pinned prompts take over the submenu; fall back to the 3 most recent.
       const pinnedIds = usePlusMenuPrefsStore.getState().pinnedPromptIds;
       const pinned = byRecent.filter((p) => pinnedIds.includes(p.id));
       setRecentPrompts(pinned.length > 0 ? pinned : byRecent.slice(0, 3));
     } catch {
+      // Clear, don't keep: a stale list row would run its cached items.
+      if (seq === recentSeqRef.current) setRecentPrompts([]);
+    }
+    try {
+      const rows = await listPromptLists();
+      if (seq !== recentSeqRef.current) return;
+      const pinnedIds = usePlusMenuPrefsStore.getState().pinnedListIds;
+      setRecentLists(rows.filter((l) => pinnedIds.includes(l.id)));
+    } catch {
+      if (seq === recentSeqRef.current) setRecentLists([]);
     }
   }, []);
   const plusPins = usePlusMenuPrefsStore((s) => s.pins);
@@ -1056,10 +1079,19 @@ export function SharedComposer({
             audioSizeError ??= sizeError;
             continue;
           }
-          fileToBase64(file).then((base64) => {
-            setPendingAudio({ name: file.name, base64, contentType: file.type });
-            setPendingAudioStore(base64, file.name);
-          });
+          // Count now: pendingAudio cannot see it until the read resolves.
+          audioDecodingRef.current += 1;
+          fileToBase64(file)
+            .then((base64) => {
+              setPendingAudio({ name: file.name, base64, contentType: file.type });
+              setPendingAudioStore(base64, file.name);
+            })
+            .catch(() => {
+              toast.error("Could not read that audio file.");
+            })
+            .finally(() => {
+              audioDecodingRef.current -= 1;
+            });
           continue;
         }
         // video_base64 targets the single loaded GGUF, so at most one side of a compare could answer. Say
@@ -2124,6 +2156,62 @@ export function SharedComposer({
     { enabled: chatActive },
   );
 
+  const runPromptList = useCallback(
+    (items: string[]) => {
+      const filtered = items.filter((p) => p.trim());
+      if (!filtered.length) return;
+      // `running` lags the 200ms poll, so ask the handles directly like the poll does.
+      const liveRunning =
+        busy || Object.values(handlesRef.current).some((h) => h.isRunning());
+      if (liveRunning || isQueueRunningRef.current) {
+        toast.error("Wait for the current response to finish");
+        return;
+      }
+      if (isDictating) {
+        toast.error("Finish dictating before running a list");
+        return;
+      }
+      // Only the first send would carry staged attachments; refuse rather than clear.
+      if (
+        pendingImagesRef.current.length > 0 ||
+        pendingAudioRef.current ||
+        audioDecodingRef.current > 0
+      ) {
+        toast.error("Remove the staged attachment before running a list", {
+          description: "Only the first prompt in the list would carry it.",
+        });
+        return;
+      }
+      const hasCompareHandles = Boolean(
+        handlesRef.current["model1"] || handlesRef.current["model2"],
+      );
+      const isGeneralizedCompare =
+        hasCompareHandles && Boolean(model1?.id && model2?.id);
+      if (hasCompareHandles && !isGeneralizedCompare) {
+        toast.error("Pick a model in each pane to compare", {
+          description:
+            "Use the model dropdown above each pane, then send your prompt.",
+        });
+        return;
+      }
+      setPromptStorageOpen(false);
+      queueRef.current = filtered;
+      queueIndexRef.current = 0;
+      isQueueRunningRef.current = true;
+      setIsQueueRunning(true);
+      setQueueProgress({ current: 1, total: filtered.length });
+      toast(`Prompt 1 / ${filtered.length}`, {
+        description:
+          filtered[0].length > 80 ? `${filtered[0].slice(0, 80)}…` : filtered[0],
+      });
+      setCurrentText(filtered[0]);
+      setTimeout(() => {
+        sendRef.current?.();
+      }, 100);
+    },
+    [busy, isDictating, handlesRef, model1?.id, model2?.id, setCurrentText],
+  );
+
   // Adjustable "+" menu items, keyed by id. Pinned ones render at the top level; the rest fall into
   // the "More" overflow submenu. Core items and "More" itself live outside this map.
   const plusMenuNodes: Record<PlusMenuItemId, ReactNode> = {
@@ -2173,7 +2261,7 @@ export function SharedComposer({
         >
           {recentPrompts.map((p) => (
             <DropdownMenuItem
-              key={p.id}
+              key={`prompt:${p.id}`}
               onSelect={() => {
                 setCurrentText(p.text);
                 requestAnimationFrame(() => textareaRef.current?.focus());
@@ -2182,7 +2270,15 @@ export function SharedComposer({
               <span className="truncate">{p.name}</span>
             </DropdownMenuItem>
           ))}
-          {recentPrompts.length > 0 ? <DropdownMenuSeparator /> : null}
+          {recentLists.map((l) => (
+            <DropdownMenuItem key={`list:${l.id}`} onSelect={() => runPromptList(l.items)}>
+              <span className="truncate">{l.name}</span>
+              <PromptCountBadge count={l.items.length} />
+            </DropdownMenuItem>
+          ))}
+          {recentPrompts.length > 0 || recentLists.length > 0 ? (
+            <DropdownMenuSeparator />
+          ) : null}
           <DropdownMenuItem onSelect={() => setPromptStorageOpen(true)}>
             All saved prompts…
           </DropdownMenuItem>
@@ -2321,33 +2417,7 @@ export function SharedComposer({
           setCurrentText(t);
           requestAnimationFrame(() => textareaRef.current?.focus());
         }}
-        onRunList={(items) => {
-          const filtered = items.filter((p) => p.trim());
-          if (!filtered.length) return;
-          const hasCompareHandles = Boolean(
-            handlesRef.current["model1"] || handlesRef.current["model2"],
-          );
-          const isGeneralizedCompare =
-            hasCompareHandles && Boolean(model1?.id && model2?.id);
-          if (hasCompareHandles && !isGeneralizedCompare) {
-            toast.error("Pick a model in each pane to compare", {
-              description:
-                "Use the model dropdown above each pane, then send your prompt.",
-            });
-            return;
-          }
-          setPromptStorageOpen(false);
-          queueRef.current = filtered;
-          queueIndexRef.current = 0;
-          isQueueRunningRef.current = true;
-          setIsQueueRunning(true);
-          setQueueProgress({ current: 1, total: filtered.length });
-          toast(`Prompt 1 / ${filtered.length}`, {
-            description: filtered[0].length > 80 ? filtered[0].slice(0, 80) + "…" : filtered[0],
-          });
-          setCurrentText(filtered[0]);
-          setTimeout(() => { sendRef.current?.(); }, 100);
-        }}
+        onRunList={runPromptList}
       />
       {/* Gemini-style drop affordance, mirrored from the single composer. */}
       <div
