@@ -43,6 +43,7 @@ from functools import lru_cache
 from typing import Any, Iterator, Optional
 
 from . import diffusion_compile_config as compile_config
+from .diffusion_bg_compile import eager_forced as _bg_eager_forced
 from . import diffusion_gguf_compile as gguf_compile
 
 SPEED_OFF = "off"
@@ -866,6 +867,12 @@ def _compile_repeated_blocks(
     except Exception as exc:  # noqa: BLE001 - optimisation only
         _warn(logger, "compile_repeated_blocks", exc)
         return False
+    # A block whose attention runs inside sdpa_kernel would otherwise bypass AOTAutogradCache on every start.
+    try:
+        from . import diffusion_aot_cache
+        diffusion_aot_cache.install(logger)
+    except Exception as exc:  # noqa: BLE001 - optimisation only
+        _warn(logger, "sdpa aot cache", exc)
     if unet is not None:
         # Whole-module static compile for the U-Net classes above. fullgraph mirrors the regional decision; dynamic is
         # ALWAYS False, so each new (height, width, batch) pays its own compile. ``Module.compile`` keeps the module
@@ -1062,7 +1069,8 @@ class _CompileGuard:
         guard = self
 
         def guarded(*args: Any, **kwargs: Any) -> Any:
-            if guard.error is None:
+            # Compile still in flight in the background: entering it here would compile inline.
+            if guard.error is None and not _bg_eager_forced():
                 compile_config.apply()
                 try:
                     return compiled(*args, **kwargs)
