@@ -190,6 +190,7 @@ from .diffusion_speed import (
 from .diffusion_vae_fp16 import enable_fp16_vae_decode
 from .diffusion_attention import (
     apply_attention_backend,
+    auto_attention_reason,
     normalize_attention_backend,
     sdpa_math_only,
     sdpa_subquadratic_confirmed,
@@ -1903,6 +1904,11 @@ def _uninstall_fused_dit_patches() -> None:
         uninstall_qwen_real_rope()
         uninstall_zimage_fused()
         uninstall_flux2_rope()
+    except Exception:  # noqa: BLE001 - teardown is best effort
+        pass
+    try:
+        from .diffusion_rocm_fused import uninstall as uninstall_rocm_fused
+        uninstall_rocm_fused()
     except Exception:  # noqa: BLE001 - teardown is best effort
         pass
 
@@ -6908,7 +6914,11 @@ class DiffusionBackend:
                     attention_engaged = apply_attention_backend(
                         pipe,
                         select_attention_backend(
-                            target, attention_backend, speed_active = effective_speed != SPEED_OFF
+                            target,
+                            attention_backend,
+                            speed_active = effective_speed != SPEED_OFF,
+                            family = fam,
+                            speed_unset = speed_mode is None,
                         ),
                         logger = logger,
                         target = target,
@@ -7032,6 +7042,10 @@ class DiffusionBackend:
                     from .diffusion_flux2_rope import install_for_pipe as install_flux2_rope
 
                     install_flux2_rope(pipe, dtype, device, logger)
+                    # ROCm (auto) FLUX.1 / FLUX.2: one-kernel RoPE (bit-identical) and AdaLN modulation.
+                    from .diffusion_rocm_fused import install_for_pipe as install_rocm_fused
+
+                    install_rocm_fused(pipe, dtype, device, logger)
                     # fp16-only cards: a guarded family stays float16; patch its overflow sites.
                     from .diffusion_fp16_guard import family_fp16_guard, install_fp16_guard
 
@@ -7335,7 +7349,7 @@ class DiffusionBackend:
                             "attention_backend": (
                                 attention_backend,
                                 attention_engaged or "native",
-                                "cuDNN fused attention upgrade"
+                                auto_attention_reason(attention_engaged)
                                 if attention_engaged and attention_backend is None
                                 else "diffusers default"
                                 if attention_engaged is None
@@ -7484,6 +7498,7 @@ class DiffusionBackend:
                         if eager_patched:
                             uninstall_patches()
                             uninstall_arch_patches()
+                            _uninstall_fused_dit_patches()
                         state = pipe = transformer = None
                         pipe_kwargs.clear()
                         clear_gpu_cache()
@@ -9146,7 +9161,9 @@ class DiffusionBackend:
         # Re-run the load-time selection with the caller's ORIGINAL request: auto still upgrades to cuDNN here.
         attention_engaged = apply_attention_backend(
             state.pipe,
-            select_attention_backend(target, state.attention_request, speed_active = True),
+            select_attention_backend(
+                target, state.attention_request, speed_active = True, family = state.family
+            ),
             logger = logger,
             target = target,
         )
@@ -9214,9 +9231,7 @@ class DiffusionBackend:
         att = (state.resolved or {}).get("attention_backend")
         if isinstance(att, dict) and att.get("source") == "auto":
             att["value"] = attention_engaged or "native"
-            att["reason"] = (
-                "cuDNN fused attention upgrade" if attention_engaged else "diffusers default"
-            )
+            att["reason"] = auto_attention_reason(attention_engaged)
         # The load recorded "speed tier does not capture" for the deferred tier; the profile that just engaged may
         # have armed graphs, so re-derive the entry the same way the load does or the badge keeps saying "off".
         graph = (state.resolved or {}).get("cuda_graph")
@@ -10231,6 +10246,8 @@ class DiffusionBackend:
 
             uninstall_patches()
             uninstall_arch_patches()
+            # Again: the deferred profile layers the eager patch over the fused AdaLN.
+            _uninstall_fused_dit_patches()
         # Deliberately NOT unload_lora_weights(): the whole pipe is dropped below, freeing any adapters with it. Drop
         # the workflow pipes so they do not pin the freed pipeline modules past unload.
         self._aux_pipes.clear()
