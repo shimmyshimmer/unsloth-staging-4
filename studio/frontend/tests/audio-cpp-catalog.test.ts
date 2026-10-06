@@ -16,6 +16,7 @@ import {
   AUDIO_CPP_MUSIC_MIN_SECONDS,
   AUDIO_CPP_REPO,
   AUDIO_CPP_STT_KEYS,
+  AUDIO_CPP_UNOFFERED_FOLDERS,
   audioCppDictationModelFor,
   audioCppDisplayName,
   audioCppModelFor,
@@ -132,6 +133,25 @@ test("recommended ids are unique and name their Hub repo or package folder", () 
   assert.equal(audioCppSizeLabel(2358.4 * 1024 * 1024), "2.3 GB");
 });
 
+test("folders of the shared repo the pickers leave out are never seeded and say why", () => {
+  assert.equal(Object.keys(AUDIO_CPP_UNOFFERED_FOLDERS).length, 18);
+  for (const [folder, reason] of Object.entries(AUDIO_CPP_UNOFFERED_FOLDERS)) {
+    assert.equal(audioCppModelFor(`${AUDIO_CPP_REPO}/${folder}`), null, folder);
+    assert.match(folder, /-GGUF$/);
+    assert.ok(reason.trim(), folder);
+  }
+  // Single-language transcription models say so; the rest are multilingual.
+  for (const [folder, languages] of [
+    ["Granite-Speech-5.0-470M-TurboCTC-GGUF", ["en"]],
+    ["Kroko-ASR-GGUF", ["en"]],
+    ["Niagara-ASR-GGUF", ["en"]],
+    ["Hviske-v5.3-GGUF", ["da"]],
+    ["GigaAM-ASR-GGUF", undefined],
+  ] as const) {
+    assert.deepEqual(audioCppModelFor(`${AUDIO_CPP_REPO}/${folder}`)?.languages, languages, folder);
+  }
+});
+
 test("recommended models are plain GGUF Audio rows named as on the Hub", () => {
   for (const model of AUDIO_CPP_MODELS) {
     const group = groupForRepoId(model.id, AUDIO_CATALOG);
@@ -167,6 +187,7 @@ test("voice conversion models are seeded with the pages they run on", () => {
     ["RVC-GGUF", ["convert"], "Voice conversion"],
     ["SeedVC-MLX-GGUF", ["convert"], "Voice conversion"],
     ["MeanVC2-GGUF", ["convert"], "Voice conversion"],
+    ["Tone-Color-VC-GGUF", ["convert"], "Voice conversion"],
     ["Chatterbox-GGUF", ["clone", "convert"], "Voice cloning and conversion"],
     ["Vevo2-GGUF", ["clone", "edit", "convert"], "Voice cloning and conversion"],
     ["IndexTTS2-GGUF", ["clone"], "Voice cloning"],
