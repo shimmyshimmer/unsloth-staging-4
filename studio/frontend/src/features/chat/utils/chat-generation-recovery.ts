@@ -151,6 +151,7 @@ type RecoveryUsage = {
   prompt_tokens?: unknown;
   completion_tokens?: unknown;
   total_tokens?: unknown;
+  context_tokens?: unknown;
   prompt_tokens_details?: { cached_tokens?: unknown; cache_write_tokens?: unknown };
   cache_creation_input_tokens?: unknown;
   cache_read_input_tokens?: unknown;
@@ -212,12 +213,16 @@ export function recoveredGenerationFinalMetadata(options: {
     next.contextUsage === undefined &&
     typeof usage?.prompt_tokens === "number" &&
     completionTokens !== undefined &&
-    typeof usage.total_tokens === "number"
+    (typeof usage.total_tokens === "number" ||
+      typeof usage.context_tokens === "number")
   ) {
     next.contextUsage = {
       promptTokens: usage.prompt_tokens,
       completionTokens,
-      totalTokens: usage.total_tokens,
+      totalTokens:
+        typeof usage.context_tokens === "number"
+          ? usage.context_tokens
+          : usage.total_tokens,
       cachedTokens:
         (typeof timings?.cache_n === "number" ? timings.cache_n : undefined) ??
         (typeof usage.prompt_tokens_details?.cached_tokens === "number"

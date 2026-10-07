@@ -36423,6 +36423,8 @@ class LlamaCppBackend:
                 "prompt_tokens": _fp,
                 "completion_tokens": _tc,
                 "total_tokens": _fp + _tc,
+                # Earlier passes' completions are already inside _fp, so the context is _fp + this pass only.
+                "context_tokens": _fp + int(_fu.get("completion_tokens") or 0),
             }
             # Preserve KV-cache hit details (cached_tokens) so the tool path
             # reports them like the standard non-tool path does, not always 0.

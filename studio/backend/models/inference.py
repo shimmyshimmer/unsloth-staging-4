@@ -3456,6 +3456,8 @@ class CompletionUsage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    # Studio tool loops: final pass's prompt + completion (total_tokens sums every pass's completion).
+    context_tokens: Optional[int] = None
     prompt_tokens_details: Optional[dict] = Field(
         default_factory = lambda: {"cached_tokens": 0, "audio_tokens": 0}
     )
