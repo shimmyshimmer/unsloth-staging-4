@@ -7725,9 +7725,11 @@ function Enter-StudioVenv {
         $env:VIRTUAL_ENV = $VenvDir
         $env:PATH = (Join-Path $VenvDir "Scripts") + ";" + $env:PATH
         Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue
+        Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
         return
     }
     . $ActivateScript
+    Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
 }
 Enter-StudioVenv
 Assert-VenvActivated -VenvDir $VenvDir
