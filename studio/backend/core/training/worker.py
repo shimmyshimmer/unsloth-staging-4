@@ -1636,6 +1636,39 @@ def _parse_mem_fraction_env(env_value: str | None) -> float | None:
     return override if 0.0 < override <= 1.0 else None
 
 
+def _training_vram_budget_fraction(
+    budget_gb: float | None,
+    denominator_bytes: int,
+    current: float = 1.0,
+) -> float | None:
+    """The memory fraction that holds this process to ``budget_gb``, never looser than ``current``
+    (the OOM guard's cap); None when there is no budget or no total to divide by."""
+    try:
+        budget = float(budget_gb)
+    except (TypeError, ValueError):
+        return None
+    if not (budget > 0) or denominator_bytes <= 0:
+        return None
+    return min(current, budget * 1024**3 / denominator_bytes)
+
+
+def _offload_plan_shape(config: dict) -> dict:
+    """The per-device batch and LoRA rank an Auto offload plan sizes its training reserve for."""
+    return {"batch_size": config.get("batch_size"), "lora_rank": config.get("lora_r")}
+
+
+def _with_vram_budget_hint(config: dict, message: str) -> str:
+    """Point a run that does not fit at its own VRAM budget, the one cause the generic advice omits."""
+    budget = config.get("offload_vram_gb")
+    lower = (message or "").lower()
+    if not budget or not any(k in lower for k in ("out of memory", "out of vram", "does not fit")):
+        return message
+    return (
+        f"{message}\nThis run is capped at a {budget:g} GiB VRAM budget. Raise or clear the "
+        "VRAM budget under Training Hyperparameters > Memory."
+    )
+
+
 def _allocator_divides_by_props_total(torch_version: str | None) -> bool:
     """Whether ``set_per_process_memory_fraction`` scales ``props.total_memory``. c10's
     ``CUDACachingAllocator::setMemoryFraction`` caps at ``fraction * device_prop.totalGlobalMem``
@@ -4183,6 +4216,49 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) -> 
         )
         return
 
+    # Offload layers sizes "auto" to what the allocator may use, so a budget makes the run fit in it,
+    # and two runs on one card can each take their share.
+    # ── 2b. Training VRAM budget ──
+    _budget_gb = config.get("offload_vram_gb")
+    # Only "auto" sizes to a budget, and only LoRA runs outside decision / embedding offload.
+    if (
+        _budget_gb
+        and config.get("offload_layers") == "auto"
+        and config.get("training_type", "LoRA/QLoRA") in ("LoRA/QLoRA", "Continued Pretraining")
+        and not config.get("is_decision")
+        and not config.get("is_embedding")
+    ):
+        try:
+            import torch as _torch_budget
+            if _torch_budget.cuda.is_available():
+                for _b_index in range(_torch_budget.cuda.device_count()):
+                    _b_props = _torch_budget.cuda.get_device_properties(_b_index)
+                    _b_denominator = int(getattr(_b_props, "total_memory", 0) or 0)
+                    if not _allocator_divides_by_props_total(
+                        getattr(_torch_budget, "__version__", "")
+                    ):
+                        _b_denominator = int(_torch_budget.cuda.mem_get_info(_b_index)[1])
+                    _get_fraction = getattr(
+                        _torch_budget.cuda, "get_per_process_memory_fraction", None
+                    )
+                    _b_current = _get_fraction(_b_index) if _get_fraction is not None else 1.0
+                    _b_fraction = _training_vram_budget_fraction(
+                        _budget_gb, _b_denominator, _b_current
+                    )
+                    if _b_fraction is None:
+                        continue
+                    _torch_budget.cuda.set_per_process_memory_fraction(_b_fraction, _b_index)
+                    logger.info(
+                        "Training VRAM budget: set_per_process_memory_fraction(%.4f, cuda:%d), "
+                        "%.1f GiB of %.1f GiB",
+                        _b_fraction,
+                        _b_index,
+                        _b_fraction * _b_denominator / 1024**3,
+                        _b_denominator / 1024**3,
+                    )
+        except Exception as _budget_err:
+            logger.warning("Could not apply the training VRAM budget: %s", _budget_err)
+
     if config.get("is_decision", False):
         try:
             _download_decision_checkpoint(event_queue, config)
@@ -4459,6 +4535,9 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) -> 
                 actual_model_repo_id = config.get("actual_model_repo_id"),
                 model_revision = model_revision,
                 use_gradient_checkpointing = config.get("gradient_checkpointing", "unsloth"),
+                offload_layers = config.get("offload_layers", 0),
+                prefetch_depth = config.get("prefetch_depth", 2),
+                offload_plan_shape = _offload_plan_shape(config),
             )
             fallback_error = (
                 _model_cache_fallback_error(config, trainer.model_load_error)
@@ -4525,6 +4604,9 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) -> 
                         actual_model_repo_id = config.get("actual_model_repo_id"),
                         model_revision = model_revision,
                         use_gradient_checkpointing = config.get("gradient_checkpointing", "unsloth"),
+                        offload_layers = config.get("offload_layers", 0),
+                        prefetch_depth = config.get("prefetch_depth", 2),
+                        offload_plan_shape = _offload_plan_shape(config),
                     )
         finally:
             _load_watchdog_stop.set()
@@ -4533,7 +4615,9 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) -> 
             if trainer.should_stop:
                 event_queue.put({"type": "complete", "output_dir": None, "ts": time.time()})
             else:
-                error_msg = trainer.training_progress.error or "Failed to load model"
+                error_msg = _with_vram_budget_hint(
+                    config, trainer.training_progress.error or "Failed to load model"
+                )
                 event_queue.put(
                     {
                         "type": "error",
@@ -4627,7 +4711,9 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) -> 
                 event_queue.put(
                     {
                         "type": "error",
-                        "error": trainer.training_progress.error or "Failed to prepare model",
+                        "error": _with_vram_budget_hint(
+                            config, trainer.training_progress.error or "Failed to prepare model"
+                        ),
                         "stack": "",
                         "ts": time.time(),
                     }
@@ -4778,7 +4864,7 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) -> 
             event_queue.put(
                 {
                     "type": "error",
-                    "error": _oom_msg,
+                    "error": _with_vram_budget_hint(config, _oom_msg),
                     "stack": traceback.format_exc(limit = 20),
                     "ts": time.time(),
                 }
@@ -4946,6 +5032,7 @@ def _create_trainer_progress_callback(event_queue: Any) -> Callable[[TrainingPro
                     "num_tokens": progress.num_tokens,
                     "eval_loss": progress.eval_loss,
                     "status_message": progress.status_message,
+                    "offload": getattr(progress, "offload", None),
                     "ts": time.time(),
                 }
             )
