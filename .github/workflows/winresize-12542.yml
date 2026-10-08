@@ -1,0 +1,85 @@
+name: "winresize 12542: Windows WebView bounds after fast resize (base vs head)"
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: winresize-12542-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resize:
+    name: "windows-latest base vs head resize"
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Arms differ only by the PR's src-tauri change
+        run: |
+          git fetch --no-tags origin upstream-main
+          $files = @(git diff --name-only origin/upstream-main HEAD -- studio/src-tauri)
+          "src-tauri files differing from upstream-main: $($files -join ', ')"
+          $want = @('studio/src-tauri/Cargo.toml', 'studio/src-tauri/src/main.rs')
+          if (Compare-Object ($files | Sort-Object) ($want | Sort-Object)) { throw "unexpected src-tauri diff vs upstream-main" }
+          git rev-parse HEAD origin/upstream-main
+
+      - name: Frontend build
+        working-directory: studio/frontend
+        run: |
+          npm ci --no-fund --no-audit
+          npm run build
+
+      - name: Build head (debug, embedded frontend)
+        working-directory: studio/src-tauri
+        run: |
+          cargo build
+          if ($LASTEXITCODE) { throw "head build failed" }
+          Copy-Item target/debug/unsloth-studio.exe target/debug/unsloth-head.exe
+
+      - name: Build base (upstream-main src-tauri)
+        working-directory: studio/src-tauri
+        run: |
+          git checkout origin/upstream-main -- Cargo.toml src/main.rs
+          cargo build
+          if ($LASTEXITCODE) { throw "base build failed" }
+          Copy-Item target/debug/unsloth-studio.exe target/debug/unsloth-base.exe
+          git checkout HEAD -- Cargo.toml src/main.rs
+          git status --short
+
+      - name: Probe (ABBA, fresh process per launch)
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          python -m pip install --quiet pillow
+          $out = Join-Path $env:RUNNER_TEMP 'winresize'
+          $exe = Join-Path $PWD 'studio/src-tauri/target/debug'
+          $order = @(@('base',1), @('head',1), @('head',2), @('base',2), @('base',3), @('head',3))
+          foreach ($o in $order) {
+            python .github/winresize/probe.py --exe (Join-Path $exe "unsloth-$($o[0]).exe") --label $o[0] --launch $o[1] --out $out
+          }
+          python .github/winresize/verdict.py $out
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: winresize-12542
+          path: ${{ runner.temp }}/winresize
+          if-no-files-found: warn
