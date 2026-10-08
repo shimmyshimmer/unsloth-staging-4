@@ -15,22 +15,28 @@ for r in recs:
     if r.get("error"):
         a["errors"].append(r["error"])
     for t in r["trials"]:
-        k = a["kinds"].setdefault(t["kind"], {"trials": 0, "settled_bad": 0, "early_bad": 0, "worst": [0, 0]})
+        k = a["kinds"].setdefault(t.get("kind_detail", t["kind"]), {"trials": 0, "settled_bad": 0, "early_bad": 0, "worst": [0, 0]})
         k["trials"] += 1
         k["settled_bad"] += t["settled_mismatch"]
         k["early_bad"] += t["early_mismatch"]
+        if t.get("drag"):
+            k.setdefault("drag_lag_max", 0)
+            w = t["drag"]["worst_during"]
+            k["drag_lag_max"] = max(k["drag_lag_max"], abs(w[0]) + abs(w[1]))
+            k.setdefault("moved", 0)
+            k["moved"] += t["drag"]["start"] != t["drag"]["end"]
         for key in ("container_delta", "widget_delta"):
             d = t["settled"][key] or [0, 0]
             if abs(d[0]) + abs(d[1]) > abs(k["worst"][0]) + abs(k["worst"][1]):
                 k["worst"] = d
 
-lines = ["| arm | trial kind | trials | WebView short of window after 1.5 s | short at 150 ms | worst settled delta (w,h px) |",
-         "|---|---|---|---|---|---|"]
+lines = ["| arm | trial kind | trials | WebView off after 1.5 s | off at 150 ms | worst settled delta (w,h px) | drags that resized | worst lag during drag (px) |",
+         "|---|---|---|---|---|---|---|---|"]
 for arm in sorted(arms):
     for kind, k in sorted(arms[arm]["kinds"].items()):
-        lines.append("| %s | %s | %d | %d | %d | %s |" % (arm, kind, k["trials"], k["settled_bad"], k["early_bad"], k["worst"]))
+        lines.append("| %s | %s | %d | %d | %d | %s | %s | %s |" % (arm, kind, k["trials"], k["settled_bad"], k["early_bad"], k["worst"], k.get("moved", "-"), k.get("drag_lag_max", "-")))
 print("\n".join(lines))
-probe = {r["label"] + str(r["launch"]): {k: r.get(k) for k in ("ready", "cursor_ok", "input_desktop", "thickframe", "error")} for r in recs}
+probe = {r["label"] + str(r["launch"]): {k: r.get(k) for k in ("ready", "cursor_ok", "input_desktop", "thickframe", "thickframe_after", "error")} for r in recs}
 print("probes:", json.dumps(probe))
 
 
@@ -42,10 +48,11 @@ def trials(arm):
     return sum(k["trials"] for k in arms.get(arm, {"kinds": {}})["kinds"].values())
 
 
+drags = sum(k.get("moved", 0) for a in arms.values() for k in a["kinds"].values())
 if not trials("base") or not trials("head"):
     verdict = "VOID (an arm ran no trials)"
 elif total("base", "settled_bad") == 0:
-    verdict = "NOT_REPRODUCED (base WebView always matched the window after settling)"
+    verdict = "NOT_REPRODUCED (base WebView always matched the window after settling; %d real drags resized the window)" % drags
 elif total("head", "settled_bad") == 0:
     verdict = "CONFIRMED (base %d/%d settled mismatches, head 0/%d)" % (
         total("base", "settled_bad"), trials("base"), trials("head"))

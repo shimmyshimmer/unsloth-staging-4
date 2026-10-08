@@ -148,16 +148,30 @@ def burst(top, sizes, flags):
 
 
 def drag(top, dx, dy, steps, pause):
+    """A user corner drag: button down, DefWindowProc's modal sizing loop (SC_SIZE from
+    the bottom-right), cursor moves, button up. Samples the WebView lag on the way."""
     r = wt.RECT()
     user32.GetWindowRect(top, ctypes.byref(r))
     x, y = r.right - 3, r.bottom - 3
+    user32.SetForegroundWindow(top)
     user32.SetCursorPos(x, y)
     time.sleep(0.2)
     user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+    user32.PostMessageW(top, 0x0112, 0xF000 + 8, (y << 16) | (x & 0xFFFF))  # WM_SYSCOMMAND SC_SIZE|WMSZ_BOTTOMRIGHT
+    time.sleep(0.1)
+    worst = [0, 0]
+    sizes = []
     for i in range(1, steps + 1):
         user32.SetCursorPos(x + dx * i // steps, y + dy * i // steps)
         time.sleep(pause)
+        g = geometry(top)
+        sizes.append(g["client"])
+        for key in ("container_delta", "widget_delta"):
+            d = g[key] or [0, 0]
+            if abs(d[0]) + abs(d[1]) > abs(worst[0]) + abs(worst[1]):
+                worst = d
     user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    return {"worst_during": worst, "start": sizes[0] if sizes else None, "end": sizes[-1] if sizes else None}
 
 
 def ramp(a, b, n):
@@ -194,28 +208,37 @@ def main():
         time.sleep(3)
         style = user32.GetWindowLongPtrW(top, GWL_STYLE)
         rec["thickframe"] = bool(style & WS_THICKFRAME)
-        user32.SetWindowPos(top, None, 40, 40, 900, 650, SWP_NOZORDER | SWP_NOACTIVATE)
+        style = user32.GetWindowLongPtrW(top, GWL_STYLE)
+        if not style & WS_THICKFRAME:
+            # The splash window is not resizable yet; give it the frame bit a resizable
+            # tao window has so DefWindowProc runs the sizing loop.
+            user32.SetWindowLongPtrW(top, GWL_STYLE, ctypes.c_ssize_t(style | WS_THICKFRAME))
+            user32.SetWindowPos(top, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | 0x20)
+        rec["thickframe_after"] = bool(user32.GetWindowLongPtrW(top, GWL_STYLE) & WS_THICKFRAME)
+        user32.SetWindowPos(top, None, 0, 0, 600, 420, SWP_NOZORDER | SWP_NOACTIVATE)
         time.sleep(1.5)
         rec["initial"] = geometry(top)
         shot(top, os.path.join(args.out, tag + "_initial.png"))
 
         plan = []
-        for i, (a, b) in enumerate([((900, 650), (1500, 1000)), ((1500, 1000), (800, 600))] * 3):
+        for i, (a, b) in enumerate([((520, 380), (1000, 740)), ((1000, 740), (520, 380))] * 3):
             plan.append(("burst_async", a, b, 80, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS))
-        for i, (a, b) in enumerate([((900, 650), (1500, 1000)), ((1500, 1000), (800, 600))] * 2):
+        for i, (a, b) in enumerate([((520, 380), (1000, 740)), ((1000, 740), (520, 380))] * 2):
             plan.append(("burst_sync", a, b, 80, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE))
-        if rec["cursor_ok"] and rec["thickframe"]:
-            for dx, dy in [(600, 350), (-600, -350)] * 3:
-                plan.append(("drag", dx, dy, 30, 0.002))
+        if rec["cursor_ok"] and rec["thickframe_after"]:
+            for dx, dy, steps, pause in [(440, 330, 12, 0.001), (-440, -330, 12, 0.001),
+                                         (440, 330, 40, 0.004), (-440, -330, 40, 0.004)] * 3:
+                plan.append(("drag", dx, dy, steps, pause))
 
         for n, step in enumerate(plan):
             kind = step[0]
+            info = None
             if kind == "drag":
                 _, dx, dy, steps, pause = step
-                user32.SetWindowPos(top, None, 40, 40, 900 if dx > 0 else 1500, 650 if dy > 0 else 1000,
+                user32.SetWindowPos(top, None, 0, 0, 540 if dx > 0 else 1000, 400 if dy > 0 else 740,
                                     SWP_NOZORDER | SWP_NOACTIVATE)
                 time.sleep(1.0)
-                drag(top, dx, dy, steps, pause)
+                info = drag(top, dx, dy, steps, pause)
             else:
                 _, a, b, count, flags = step
                 user32.SetWindowPos(top, None, 0, 0, a[0], a[1], SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)
@@ -228,8 +251,9 @@ def main():
             png = shot(top, os.path.join(args.out, "%s_t%02d_%s.png" % (tag, n, kind)))
             rec["trials"].append({"n": n, "kind": kind, "early": early, "settled": settled,
                                   "early_mismatch": mismatch(early),
-                                  "settled_mismatch": mismatch(settled), "png": png})
-            print(tag, n, kind, "settled", settled["client"], settled["container_delta"],
+                                  "settled_mismatch": mismatch(settled), "png": png, "drag": info,
+                                  "kind_detail": "%s_%s" % (kind, step[3])})
+            print(tag, n, kind, info, "settled", settled["client"], settled["container_delta"],
                   settled["widget_delta"], flush=True)
         rec["alive_at_end"] = proc.poll() is None
         return rec
