@@ -157,7 +157,9 @@ def drag(top, dx, dy, steps, pause):
     user32.SetCursorPos(x, y)
     time.sleep(0.2)
     user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-    user32.PostMessageW(top, 0x0112, 0xF000 + 8, (y << 16) | (x & 0xFFFF))  # WM_SYSCOMMAND SC_SIZE|WMSZ_BOTTOMRIGHT
+    # What a press on the frame does: WM_NCLBUTTONDOWN on HTBOTTOMRIGHT enters the
+    # mouse-driven sizing loop, which ends at button up.
+    user32.PostMessageW(top, 0x00A1, 17, (y << 16) | (x & 0xFFFF))
     time.sleep(0.1)
     worst = [0, 0]
     sizes = []
@@ -171,6 +173,8 @@ def drag(top, dx, dy, steps, pause):
             if abs(d[0]) + abs(d[1]) > abs(worst[0]) + abs(worst[1]):
                 worst = d
     user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    time.sleep(0.1)
+    user32.SendMessageW(top, 0x001F, 0, 0)  # WM_CANCELMODE: never leave a loop running
     return {"worst_during": worst, "start": sizes[0] if sizes else None, "end": sizes[-1] if sizes else None}
 
 
@@ -196,6 +200,14 @@ def main():
     rec["cursor_ok"] = (p.x, p.y) == (123, 77)
     rec["input_desktop"] = bool(user32.OpenInputDesktop(0, False, 0x0100))
     rec["screen"] = [user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)]
+    # Runner images ship "show window contents while dragging" off (outline drags resize
+    # once at release); users have it on.
+    full = wt.BOOL()
+    user32.SystemParametersInfoW(0x0026, 0, ctypes.byref(full), 0)  # SPI_GETDRAGFULLWINDOWS
+    rec["drag_full_windows_before"] = bool(full.value)
+    user32.SystemParametersInfoW(0x0025, 1, None, 0)  # SPI_SETDRAGFULLWINDOWS on
+    user32.SystemParametersInfoW(0x0026, 0, ctypes.byref(full), 0)
+    rec["drag_full_windows"] = bool(full.value)
 
     proc = subprocess.Popen([args.exe], stdout=open(os.path.join(args.out, tag + ".log"), "w"),
                             stderr=subprocess.STDOUT)

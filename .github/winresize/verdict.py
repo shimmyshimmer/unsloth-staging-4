@@ -36,7 +36,7 @@ for arm in sorted(arms):
     for kind, k in sorted(arms[arm]["kinds"].items()):
         lines.append("| %s | %s | %d | %d | %d | %s | %s | %s |" % (arm, kind, k["trials"], k["settled_bad"], k["early_bad"], k["worst"], k.get("moved", "-"), k.get("drag_lag_max", "-")))
 print("\n".join(lines))
-probe = {r["label"] + str(r["launch"]): {k: r.get(k) for k in ("ready", "cursor_ok", "input_desktop", "thickframe", "thickframe_after", "error")} for r in recs}
+probe = {r["label"] + str(r["launch"]): {k: r.get(k) for k in ("ready", "cursor_ok", "input_desktop", "thickframe", "thickframe_after", "drag_full_windows_before", "drag_full_windows", "error")} for r in recs}
 print("probes:", json.dumps(probe))
 
 
