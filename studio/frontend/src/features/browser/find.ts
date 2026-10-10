@@ -9,7 +9,7 @@ import {
   notifyFindTargets,
   registerFindTarget,
 } from "@/features/find-in-page";
-import { hasNativeView, nativeFind } from "./native-view";
+import { focusPage, focusPanel, hasNativeView, nativeFind, refreshCoveredPage } from "./native-view";
 import { sendFrameCommand } from "./page-frame";
 import { type BrowserTab, currentEntry, useBrowserStore } from "./store";
 
@@ -40,6 +40,8 @@ function nativeStep(tabId: string, backwards: boolean): void {
   void nativeFind(tabId, asked, backwards).then((found) => {
     // The native view walks matches without counting them: null keeps the walk open.
     if (asked === query && searchedTabId === tabId) setResult({ count: found ? null : 0, active: found ? 0 : -1 });
+    // Show the new match on a covered page's snapshot.
+    refreshCoveredPage(tabId);
   });
 }
 
@@ -80,6 +82,17 @@ export function registerBrowserFind(contains: (node: Node) => boolean): () => vo
       else sendFrameCommand(searchedTabId, { command: "findStep", delta });
     },
     result: () => result,
+    // The chord from the app menu while the native page has keys: this document isn't focused.
+    takeFocus: () => {
+      const tab = activeTab();
+      if (!searchable(tab) || !hasNativeView(tab.id) || document.hasFocus()) return false;
+      void focusPanel(tab.id);
+      return true;
+    },
+    returnFocus: () => {
+      const tab = activeTab();
+      if (tab) focusPage(tab.id);
+    },
   });
   // Another tab, or a page turning into a document, moves or drops the search.
   let tabId = activeTab()?.id;
