@@ -1,0 +1,7 @@
+studio/backend/tests/test_audio_workflows.py
+studio/backend/tests/test_kernel_install.py
+studio/backend/tests/test_log_bounds.py
+studio/backend/tests/test_logging_middleware.py
+studio/backend/tests/test_orphaned_children.py
+studio/backend/tests/test_pdf_ocr_regressions.py
+studio/backend/tests/test_sandbox_files_and_storage_roots.py
