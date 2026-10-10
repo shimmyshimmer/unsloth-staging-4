@@ -33,6 +33,9 @@ from utils.paths.path_utils import is_appledouble_metadata
 _NATIVE_EXTS = (".safetensors", ".gguf")
 _DIFFUSERS_EXTS = (".safetensors",)
 _ALL_EXTS = (".safetensors", ".gguf")
+# ``kind`` in a ``<stem>.json`` sidecar marking the weight beside it as an image LoRA, not model weights.
+LORA_SIDECAR_KIND = "diffusion-lora"
+_MAX_SCAN_FOLDER_SUBDIRS = 200
 
 
 @dataclass(frozen = True)
@@ -48,6 +51,7 @@ class LoraCatalogEntry:
     local_path: Optional[str] = None
     size_bytes: int = 0
     weight_default: float = 1.0
+    fine_tuned: bool = False
 
 
 @dataclass(frozen = True)
@@ -112,31 +116,69 @@ def sanitize_alias(raw: str) -> str:
     return stem or "lora"
 
 
-def _scan_local() -> list[LoraCatalogEntry]:
-    root = loras_dir()
+def _weight_files(root: Path) -> list[Path]:
     try:
         children = sorted(root.iterdir())
     except OSError:
         return []
-
-    files = [
+    return [
         p
         for p in children
         if p.is_file() and p.suffix.lower() in _ALL_EXTS and not is_appledouble_metadata(p)
     ]
+
+
+def _scan_folder_roots() -> list[Path]:
+    """Registered custom model folders plus their direct sub-folders (where an export lands)."""
+    try:
+        from storage.studio_db import list_scan_folders
+        folders = list_scan_folders()
+    except Exception:  # noqa: BLE001 -- discovery never fails on the scan-folder table
+        return []
+    roots: list[Path] = []
+    for folder in folders:
+        root = Path(folder.get("path") or "")
+        try:
+            if not root.is_dir():
+                continue
+            subdirs = sorted(c for c in root.iterdir() if c.is_dir() and not c.name.startswith("."))
+        except OSError:
+            continue
+        roots.append(root)
+        roots.extend(subdirs[:_MAX_SCAN_FOLDER_SUBDIRS])
+    return roots
+
+
+def _scan_local() -> list[LoraCatalogEntry]:
+    files = _weight_files(loras_dir())
     # Two files sharing a stem but differing in extension collide on id (== stem), so a colliding stem keeps the full
     # filename.
     stem_counts: dict[str, int] = {}
     for p in files:
         stem_counts[p.stem] = stem_counts.get(p.stem, 0) + 1
+    found = [(p, p.name if stem_counts.get(p.stem, 0) > 1 else p.stem) for p in files]
+    used = {entry_id for _, entry_id in found}
+    seen = {os.path.normcase(os.path.realpath(p)) for p in files}
+    # Custom models folders contribute only sidecar-marked image LoRAs, so model weights never show up here.
+    for root in _scan_folder_roots():
+        for p in _weight_files(root):
+            key = os.path.normcase(os.path.realpath(p))
+            if key in seen or not is_image_lora_file(p):
+                continue
+            seen.add(key)
+            entry_id, n = p.stem, 2
+            while entry_id in used:
+                entry_id = f"{p.stem}-{n}"
+                n += 1
+            used.add(entry_id)
+            found.append((p, entry_id))
+
     entries: list[LoraCatalogEntry] = []
-    for p in files:
-        ext = p.suffix.lower()
+    for p, entry_id in found:
         try:
             size = p.stat().st_size
         except OSError:
             size = 0
-        entry_id = p.name if stem_counts.get(p.stem, 0) > 1 else p.stem
         # A ``<stem>.json`` sidecar (written by the trainer on publish) records the adapter's family + default weight so
         # it is family-gated instead of "unknown". Best-effort.
         families, weight_default = _read_lora_sidecar(p)
@@ -145,25 +187,41 @@ def _scan_local() -> list[LoraCatalogEntry]:
                 id = entry_id,
                 display_name = entry_id,
                 source = "local",
-                fmt = "gguf" if ext == ".gguf" else "safetensors",
+                fmt = "gguf" if p.suffix.lower() == ".gguf" else "safetensors",
                 local_path = str(p),
                 size_bytes = size,
                 families = families,
                 weight_default = weight_default,
+                fine_tuned = (_sidecar_data(p) or {}).get("source") == "studio-trained",
             )
         )
     return entries
 
 
+def _sidecar_data(weight_path: Path) -> Optional[dict]:
+    try:
+        data = json.loads(weight_path.with_suffix(".json").read_text(encoding = "utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def is_image_lora_file(path: Path) -> bool:
+    """A .safetensors/.gguf whose sidecar marks it as an image LoRA (``kind``, or a trainer sidecar
+    from before the marker). Model scanners use this to keep image LoRAs out of model listings."""
+    if path.suffix.lower() not in _ALL_EXTS:
+        return False
+    data = _sidecar_data(path)
+    return data is not None and (
+        data.get("kind") == LORA_SIDECAR_KIND or data.get("source") == "studio-trained"
+    )
+
+
 def _read_lora_sidecar(weight_path: Path) -> tuple[tuple[str, ...], float]:
     """Read the ``<stem>.json`` sidecar next to a local adapter -> ``(families, weight_default)``.
     Returns ``((), 1.0)`` when absent or unreadable, so discovery never fails on a bad file."""
-    sidecar = weight_path.with_suffix(".json")
-    try:
-        data = json.loads(sidecar.read_text(encoding = "utf-8"))
-    except (OSError, ValueError):
-        return (), 1.0
-    if not isinstance(data, dict):
+    data = _sidecar_data(weight_path)
+    if data is None:
         return (), 1.0
     raw_family = data.get("family")
     raw_families = data.get("families")
@@ -196,6 +254,41 @@ def list_loras(*, family: Optional[str] = None) -> list[LoraCatalogEntry]:
 
 def _catalog_by_id() -> dict[str, LoraCatalogEntry]:
     return {e.id: e for e in (list(_CURATED) + _scan_local())}
+
+
+def export_local_lora(lora_id: str, dest_dir: Path) -> Path:
+    """Copy a local adapter into ``dest_dir`` with a ``<stem>.json`` sidecar carrying the image LoRA marker.
+
+    Takes a catalog id, never a path, so only listed image LoRAs can be read.
+    Returns the copied weight file; a name already taken by other bytes or a foreign ``.json`` gets a suffix.
+    """
+    import filecmp
+    import shutil
+
+    entry = next((e for e in _scan_local() if e.id == lora_id), None)
+    if entry is None or not entry.local_path:
+        raise FileNotFoundError(f"no local image LoRA named '{lora_id}'")
+    src = Path(entry.local_path)
+    dest_dir.mkdir(parents = True, exist_ok = True)
+
+    def _free(out: Path) -> bool:
+        if out.exists():
+            if os.path.samefile(src, out):
+                return True
+            if not filecmp.cmp(src, out, shallow = False):
+                return False
+        return not out.with_suffix(".json").exists() or is_image_lora_file(out)
+
+    out, n = dest_dir / src.name, 2
+    while not _free(out):
+        out = dest_dir / f"{src.stem}-{n}{src.suffix}"
+        n += 1
+    # Exporting into the folder it already sits in would copy a file onto itself.
+    if not (out.exists() and os.path.samefile(src, out)):
+        shutil.copy2(src, out)
+    meta = {**(_sidecar_data(src) or {}), "kind": LORA_SIDECAR_KIND}
+    out.with_suffix(".json").write_text(json.dumps(meta, indent = 2), encoding = "utf-8")
+    return out
 
 
 def resolve_one(
