@@ -17,6 +17,7 @@ error placeholders, session banners, cookie prompts) from the result.
 from __future__ import annotations
 
 import html
+import itertools
 import re
 import secrets
 from html.parser import HTMLParser
@@ -207,6 +208,35 @@ _MAX_REPEATED_CELL_CHARS = 200
 # floor per scope candidate once the page-wide total is spent, so an earlier decoy cannot starve a later article
 _MIN_SCOPE_SPAN_CHARS = 256
 _INLINE_EMPHASIS = {"strong": "**", "b": "**", "em": "*", "i": "*"}
+
+_ORDINAL_SUFFIXES = frozenset({"st", "nd", "rd", "th"})
+# French ordinals after a digit (1er, 2e, 3ème); after a letter "e" can be Euler's number
+_DIGIT_ORDINAL_SUFFIXES = frozenset({"e", "er", "re", "ère", "ème", "eme", "nd", "nde"})
+_MD_DELIMITERS = "*_`"
+_STRIP_MD_DELIMITERS = str.maketrans("", "", _MD_DELIMITERS)
+# SiteLinks wraps same-site links in invisible \x00 markers; the base is the text before them
+_SITE_LINK_MARKER_TAIL = re.compile(r"\x00[0-9a-f]+:\d+:[se]\x00$")
+# parts a base lookup reads back: enough for delimiters and link markers, bounded on hostile pages
+_SUP_BASE_SCAN_PARTS = 8
+_SUP_BASE_SCAN_CHARS = 128
+# a caret binds one token: a signed number or one letter goes bare, anything longer in parentheses
+_BARE_EXPONENT = re.compile(r"[-+−]?(?:\d+(?:[.,]\d+)?|[^\W\d_])")
+# split cents: $19<sup>99</sup> is a price, not an exponent
+_PRICE_TAIL = re.compile(r"[$€£¥₹¢]\s?\d(?:[\d,.]|[ \u00a0\u202f]\d)*$")
+# note markers that keep their plain-text form, like Wikipedia's class="reference"
+_FOOTNOTE_CLASSES = frozenset({"reference", "footnote", "footnote-ref", "noteref", "fn", "cite"})
+# deeper <sup> nests render as plain text: each tracked level rescans its whole suffix on close
+_MAX_SUP_DEPTH = 8
+
+
+def _visible_tail(text: str) -> str:
+    """*text* without the emphasis/code delimiters and link markers the renderer appended."""
+    while True:
+        trimmed = _SITE_LINK_MARKER_TAIL.sub("", text.rstrip(_MD_DELIMITERS))
+        if trimmed == text:
+            return text
+        text = trimmed
+
 
 # measured density: 0.94-1.00 for link lists, 0.13-0.90 for content headers
 _HEADER_LINK_DENSITY = 0.93
@@ -496,6 +526,9 @@ class _MarkdownRenderer(HTMLParser):
         # Blockquote state: stack of buffers so nested blockquotes get the right ">" depth.
         self._bq_stack: list[list[str]] = []
 
+        # per open <sup>: (output list, start) and the (copy, start) pairs that tee the same text
+        self._sup_starts: list[tuple[list[str], int, list[tuple[list[str], int]], str] | None] = []
+
     def _nested_buffer_open(self, frame: _HeaderFrame) -> bool:
         """True when a side buffer opened *inside* *frame* still holds content.
 
@@ -538,22 +571,77 @@ class _MarkdownRenderer(HTMLParser):
         # Tally once, on the emit reaching the frame; counting again on flush doubled it.
         if frame is not None and not nested_open:
             frame.rendered_chars += len(measured.strip())
-            frame.parts.append(text)
-            return
+        elif self._in_link and self._heading_marks:
+            self._link_heading_parts.append(text)
+        self._emit_target().append(text)
+
+    def _emit_target(self) -> list[str]:
+        frame = self._header_stack[-1] if self._header_stack else None
+        if frame is not None and not self._nested_buffer_open(frame):
+            return frame.parts
         if self._in_link:
-            self._link_text_parts.append(text)
-            if self._heading_marks:
-                self._link_heading_parts.append(text)
-        elif self._in_cell:
-            self._cell_parts.append(text)
-        elif self._in_pre:
-            self._pre_parts.append(text)
-        elif self._table_stack and len(self._bq_stack) <= self._table_stack[-1].outer_bq_depth:
-            self._table_stack[-1].parts.append(text)
-        elif self._bq_stack:
-            self._bq_stack[-1].append(text)
-        else:
-            self._out.append(text)
+            return self._link_text_parts
+        if self._in_cell:
+            return self._cell_parts
+        if self._in_pre:
+            return self._pre_parts
+        if self._table_stack and len(self._bq_stack) <= self._table_stack[-1].outer_bq_depth:
+            return self._table_stack[-1].parts
+        if self._bq_stack:
+            return self._bq_stack[-1]
+        return self._out
+
+    def _sup_base(self, target: list[str]) -> str:
+        """The visible character a <sup> raises, or "" when it has none: after whitespace or
+        sentence punctuation it is a footnote marker (``fact.<sup>1</sup>``,
+        ``<a href="#fn1"><sup>1</sup></a>``) or a fraction numerator (``<sup>1</sup>&frasl;``)."""
+        for part in itertools.islice(reversed(target), _SUP_BASE_SCAN_PARTS):
+            part = part[-_SUP_BASE_SCAN_CHARS:]
+            part = _visible_tail(part)
+            if part:
+                base = part[-1]
+                if base.isdigit() and _PRICE_TAIL.search(
+                    _visible_tail("".join(p[-40:] for p in target[-4:])[-40:])
+                ):
+                    return ""
+                return base if base.isalnum() or base in ")]}|" else ""
+        return ""
+
+    def _sup_copies(self) -> list[tuple[list[str], int]]:
+        copies = [self._link_heading_parts, self._seg_heading_texts]
+        if self._header_stack:
+            copies.append(self._header_stack[-1].heading_parts)
+        return [(copy, len(copy)) for copy in copies]
+
+    def _finish_sup(self) -> None:
+        opened = self._sup_starts.pop()
+        if opened is None or opened[0] is not self._emit_target():
+            return
+        target, start, copies, base = opened
+        joined = "".join(target[start:])
+        raw = joined.strip()
+        shown = self._site_links.clean(raw) if self._site_links is not None else raw
+        visible = shown.strip(_MD_DELIMITERS)
+        if (
+            not visible
+            or "\n" in visible
+            or visible[0] in "[."
+            or not any(c.isalnum() for c in visible)
+            or visible.lower() in _ORDINAL_SUFFIXES
+            or (base.isdigit() and visible.lower() in _DIGIT_ORDINAL_SUFFIXES)
+        ):
+            return
+        token = shown.translate(_STRIP_MD_DELIMITERS)
+        bare = _BARE_EXPONENT.fullmatch(token) or (
+            token.startswith("(") and token.endswith(")") and token.count("(") == 1
+        )
+        exponent = f"^{raw}" if bare else f"^({raw})"
+        exponent += joined[len(joined.rstrip()) :]
+        target[start:] = [exponent]
+        # headings are teed into these copies; a stale one renders "E=mc2" or skews the prose gate
+        for copy, copy_start in copies:
+            if "".join(copy[copy_start:]) == joined:
+                copy[copy_start:] = [exponent]
 
     def _seg_heading_prose(self) -> int:
         """Heading characters in this segment that the gate would otherwise read as
@@ -1008,6 +1096,20 @@ class _MarkdownRenderer(HTMLParser):
         elif tag == "br":
             self._emit("\n")
 
+        elif tag == "sup":
+            target = self._emit_target()
+            reference = (
+                not _FOOTNOTE_CLASSES.isdisjoint((attr_dict.get("class") or "").lower().split())
+                or (attr_dict.get("role") or "").lower() == "doc-noteref"
+            )
+            self._sup_starts.append(
+                None
+                if reference
+                or len(self._sup_starts) >= _MAX_SUP_DEPTH
+                or not (base := self._sup_base(target))
+                else (target, len(target), self._sup_copies(), base)
+            )
+
         elif tag in _BLOCK_TAGS:
             if not self._li_marker_pending:
                 self._emit("\n\n")
@@ -1106,6 +1208,9 @@ class _MarkdownRenderer(HTMLParser):
 
         elif tag in _INLINE_EMPHASIS:
             self._emit(_INLINE_EMPHASIS[tag])
+
+        elif tag == "sup" and self._sup_starts:
+            self._finish_sup()
 
         elif tag in _BLOCK_TAGS:
             self._emit("\n\n")
