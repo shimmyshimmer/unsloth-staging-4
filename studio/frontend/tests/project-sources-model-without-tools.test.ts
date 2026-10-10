@@ -12,6 +12,7 @@ import type * as GateModule from "../src/features/chat/hooks/use-rag-tool-disabl
 import { loadWithStubs } from "./helpers/module-stubs.ts";
 
 const PROJECT_DOC = { id: "doc-1", filename: "handbook.pdf", status: "completed" };
+let extraProjectDocs: Record<string, unknown>[] = [];
 
 let runtime: Record<string, unknown> = {};
 const useChatRuntimeStore = (select: (s: Record<string, unknown>) => unknown) =>
@@ -46,7 +47,18 @@ const { ThreadDocumentsBar } = loadWithStubs<typeof BarModule>(
     "react/jsx-runtime": jsxRuntime,
     "@hugeicons/react": { HugeiconsIcon: Nothing },
     "@hugeicons/core-free-icons": {},
+    "lucide-react": new Proxy({}, { get: () => Nothing }),
     "@/lib/tick-icon": {},
+    "@/lib/open-file-picker": { openFilePicker: () => undefined },
+    "@/components/assistant-ui/attachment": {
+      AttachmentKindIcon: Nothing,
+      FileCardBody: ({ name }: { name: string }) =>
+        React.createElement("span", null, name),
+    },
+    "@/components/ui/spinner": { Spinner: Nothing },
+    "./preview-store": {
+      useDocumentPreviewStore: selectorStore({ openPreview: () => undefined }),
+    },
     "@/lib/chevron-icons": {},
     "@assistant-ui/react": { useAui: () => ({}) },
     "@/lib/utils": {
@@ -61,6 +73,7 @@ const { ThreadDocumentsBar } = loadWithStubs<typeof BarModule>(
     "@/features/chat": {
       isThreadIncognito: () => false,
       chatHistoryClearBoundary: { capture: () => 0 },
+      attachmentFileKind: () => "pdf",
     },
     "@/features/native-intents": {
       useNativeAttachmentTargetKey: () => null,
@@ -72,23 +85,34 @@ const { ThreadDocumentsBar } = loadWithStubs<typeof BarModule>(
       listKnowledgeBases: async () => [],
       subscribeKnowledgeBasesChanged: () => () => undefined,
       listProjectDocuments: async () => [PROJECT_DOC],
+      listLinkedFolders: async () => [],
       listThreadDocuments: async () => [],
     },
     "../api/rag-availability": {
       useRagAvailabilityStore: selectorStore({ isUnavailable: () => false }),
     },
-    "../types/rag": { RAG_UPLOAD_ACCEPT: "", isLinkedFolderManaged: () => false },
-    "@/components/ui/alert-dialog": new Proxy({}, { get: () => Passthrough }),
-    "./document-status-chip": {
-      DocumentStatusChip: ({ filename }: { filename: string }) =>
-        React.createElement("span", null, filename),
+    "../types/rag": { isLinkedFolderManaged: () => false },
+    "./source-drop-policy": {
+      RAG_SOURCE_UPLOAD_ACCEPT: "",
+      SUPPORTED_SOURCES_HINT: "",
+      isSupportedSourceName: () => true,
     },
+    "./use-source-drop": {
+      useSourceDrop: () => ({
+        dragging: false,
+        dropProps: {},
+        nativeDropTarget: () => undefined,
+      }),
+    },
+    "@/components/ui/alert-dialog": new Proxy({}, { get: () => Passthrough }),
+    "./document-status-chip": { STAGE_LABELS: {} },
     "./knowledge-base-dialog": { KnowledgeBaseDialog: Nothing },
     "./staged-source": { EXPIRY_GRACE_MS: 0 },
     "./use-rag-documents": {
       uploadItemFromIntent: () => null,
       useRagDocuments: (scope: { type: string } | null) => ({
-        documents: scope?.type === "project" ? [PROJECT_DOC] : [],
+        documents:
+          scope?.type === "project" ? [PROJECT_DOC, ...extraProjectDocs] : [],
         uploading: false,
         hasIndexing: false,
         loading: false,
@@ -154,6 +178,31 @@ test("with Docs on, a model without tool calling dims the files it will not sear
   assert.match(html, /handbook\.pdf/);
   assert.match(html, /title="[^"]*these files aren&#x27;t used[^"]*">Not used</);
   assert.match(html, /opacity-50/);
+});
+
+// A linked folder can hold thousands of files; one card per file would flood the composer.
+test("a linked folder's files collapse into one folder card", () => {
+  extraProjectDocs = ["a.py", "b.py", "c.md"].map((filename, i) => ({
+    id: `linked-${i}`,
+    filename,
+    status: "completed",
+    linkedFolderId: "folder-1",
+    managed: true,
+  }));
+  try {
+    for (const ragEnabled of [false, true]) {
+      const html = renderProjectChat(
+        { checkpoint: "unsloth/Qwen3-4B-GGUF", supportsTools: true },
+        ragEnabled,
+      );
+      assert.match(html, /handbook\.pdf/);
+      assert.match(html, /Linked folder/);
+      assert.match(html, /3 files/);
+      assert.doesNotMatch(html, /a\.py|b\.py|c\.md/);
+    }
+  } finally {
+    extraProjectDocs = [];
+  }
 });
 
 test("with Docs on, a model with tool calling keeps the files in effect", () => {
