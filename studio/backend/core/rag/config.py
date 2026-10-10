@@ -68,7 +68,14 @@ SOURCE_TEXT_EXTS = frozenset(
     .mmd .mermaid .puml .plantuml .dot .gv .feature .robot .http .rest .diff .patch
     """.split()
 )
-_PARSEABLE_EXTS = SUPPORTED_UPLOAD_EXTS | SOURCE_TEXT_EXTS
+# Office, OpenDocument, e-book, email, RTF and web page files.
+DOCUMENT_UPLOAD_EXTS = frozenset(
+    """
+    .doc .docm .dotx .dotm .xls .xlsx .xlsm .xltx .xltm .ppt .pptx .pptm .potx .potm .ppsx .ppsm
+    .odt .ods .odp .ott .ots .otp .msg .eml .mht .mhtml .rtf .epub .xhtml .xht
+    """.split()
+)
+_PARSEABLE_EXTS = SUPPORTED_UPLOAD_EXTS | SOURCE_TEXT_EXTS | DOCUMENT_UPLOAD_EXTS
 # RAG_UPLOAD_EXTS (e.g. ".md,.markdown") can only narrow: a type without a parser would fail every ingest.
 _requested_exts = {
     "." + ext.strip().lstrip(".").lower()
@@ -82,6 +89,8 @@ MAX_UPLOAD_BYTES = int(os.environ.get("RAG_MAX_UPLOAD_BYTES", str(200 * 1024 * 1
 # Caps prevent an accidentally broad linked folder from becoming an unbounded ingestion queue.
 FOLDER_SYNC_INTERVAL_S = float(os.environ.get("RAG_FOLDER_SYNC_INTERVAL_S", "30"))
 FOLDER_MAX_FILES = int(os.environ.get("RAG_FOLDER_MAX_FILES", "10000"))
+# Plain-text files over this in a linked folder are logs and data dumps, not documents; 0 disables.
+FOLDER_MAX_TEXT_BYTES = int(os.environ.get("RAG_FOLDER_MAX_TEXT_BYTES", str(20 * 1024 * 1024)))
 FOLDER_JOB_HISTORY_LIMIT = int(os.environ.get("RAG_FOLDER_JOB_HISTORY_LIMIT", "200"))
 # Linked-folder documents ingested concurrently, clamped to 1..4.
 FOLDER_INGEST_WORKERS = int(os.environ.get("RAG_FOLDER_INGEST_WORKERS", "2"))
