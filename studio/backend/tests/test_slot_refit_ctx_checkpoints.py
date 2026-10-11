@@ -1,15 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Discrete-GPU placement must not charge --ctx-checkpoints against VRAM.
-
-llama-server copies each snapshot device-to-host into a std::vector, so the N per
-slot live in host RAM. Charging them against the card shrank the context of an
-explicit request (Gemma 3 27B on 24 GiB: 87552 blank, 8192 at 32) for memory the
-card never holds (#8988).
-
-The target is Gemma-3 shaped, the SWA case the old fit charged.
-"""
+"""The slot/context fit must charge the --ctx-checkpoints reserve, which the child allocates per slot."""
 
 from __future__ import annotations
 
@@ -66,7 +58,7 @@ def _plan(
 
     backend._read_gguf_metadata = read
     backend._get_gguf_size_bytes = lambda _path: weights_mib * MIB
-    del backend._can_estimate_kv  # the real one, now that the dims are set
+    del backend._can_estimate_kv
     backend.probe_server_capabilities = lambda _binary = None: {
         "mtp_token": "draft-mtp",
         "supports_ngram_mod": True,
@@ -105,7 +97,6 @@ def _plan(
         "slots": slots,
         "fit": flag("--fit", "off"),
         "checkpoints": flag("--ctx-checkpoints"),
-        # What the launch reserves beyond the plain cache.
         "reserve_bytes": (
             backend._estimate_kv_cache_bytes(ctx, cache_type_kv, ctx_checkpoints = _cp, **kv_kwargs)
             - backend._estimate_kv_cache_bytes(ctx, cache_type_kv, ctx_checkpoints = 0, **kv_kwargs)
@@ -145,7 +136,10 @@ class TestTheReserveIsHostMemory:
 
 class TestThePlanIgnoresTheReserve:
     @pytest.mark.parametrize("checkpoints", [4, 16, 32])
-    def test_a_checkpointed_launch_plans_like_an_uncheckpointed_one(self, tmp_path, checkpoints):
+    def test_a_checkpointed_launch_gets_less_context_than_an_uncheckpointed_one(
+        self, tmp_path, checkpoints
+    ):
+        """The reserve is charged, but it may be paid in slots, context or residency rather than context."""
         free = _plan(tmp_path, weights_mib = 9_200, n_parallel = 4, ctx_checkpoints = 0)
         asked = _plan(tmp_path, weights_mib = 9_200, n_parallel = 4, ctx_checkpoints = checkpoints)
         assert asked["reserve_bytes"] > 0

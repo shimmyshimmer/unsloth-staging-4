@@ -95,10 +95,7 @@ def install_prebuilt(
 
 
 def hipcc_gcc_install_dir() -> str | None:
-    """Highest-numbered ``/usr/lib/gcc/x86_64-linux-gnu/<N>`` that has BOTH the gcc runtime dir AND
-    ``/usr/include/c++/<N>`` headers, or None. Ubuntu 24.04 ships gcc-14 runtime but not
-    ``/usr/include/c++/14``; ROCm clang-20 picks the highest runtime dir, finds no ``<cstdlib>``,
-    and the HIP build fails, hence ``--gcc-install-dir``. Mirrors studio/setup.sh (PR #5301)."""
+    """Newest gcc runtime with C++ headers too; ROCm clang takes the highest runtime dir, headers or not."""
     if not sys.platform.startswith("linux") or platform.machine().lower() != "x86_64":
         return None
     for ver in (14, 13, 12, 11):
@@ -209,7 +206,7 @@ def resolve_wheel_url(name: str, env: dict[str, str] | None) -> str | None:
         return None
     if name == "xformers":
         return xformers_wheel_url(env)
-    # flash-attn, causal-conv1d and mamba-ssm publish Linux wheels only.
+    # These kernels publish Linux wheels only.
     if not str(env.get("platform_tag") or "").startswith("linux"):
         return None
     if name == "flash_attn":
@@ -229,11 +226,7 @@ _TRITON: dict = {}
 
 
 def _triton_version(run: Callable[..., subprocess.CompletedProcess]) -> tuple[int, int] | None:
-    """The `triton` module's version, as unsloth_zoo reads it. Probed once per runner.
-
-    Asked of the module, not the `triton` distribution: pytorch-triton and other
-    providers ship the same import under another name.
-    """
+    """Read from the triton module, not the distribution, since other providers ship the same import."""
     if run not in _TRITON:
         try:
             result = run(
@@ -311,7 +304,7 @@ def _loads(check: str, run: Callable[..., subprocess.CompletedProcess]) -> bool:
 
 
 def _outside_venv() -> bool:
-    # Colab and other system interpreters: uv refuses them without --system.
+    # System interpreters (Colab): uv refuses them without --system.
     return sys.prefix == sys.base_prefix
 
 
@@ -346,11 +339,11 @@ def install_kernel(
                 )
                 return 0
     torch_desc = f"torch {env.get('torch_version')}" if env else "this environment"
-    # Only a 404 proves nothing is published; an unreachable check falls through to the install.
+    # Only a 404 proves nothing is published; an unreachable check falls through.
     if url is None or exists(url) is False:
         print(f"Unsloth: no prebuilt {name} for {torch_desc}; using the torch fallback.")
         return 0
-    # UNSLOTH_PYTORCH_MIRROR may carry credentials, and notebook output gets shared.
+    # UNSLOTH_PYTORCH_MIRROR may carry credentials.
     shown = redact_url_credentials(url)
     if dry_run:
         print(shown)

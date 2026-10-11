@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""`studio update` torch repairs on the cu130 torch 2.13 route keep the resident release.
-
-install.sh gives new Linux x86_64 cu130 Python 3.13 installs torch 2.13; a repair on that
-route must not move an existing install to another torch, and every other route must get
-exactly the specs it got before.
-"""
+"""On the cu130 torch 2.13 route a repair keeps the installed torch; other routes keep their specs."""
 
 from __future__ import annotations
 
@@ -59,10 +54,9 @@ def test_a_resident_release_is_kept(monkeypatch, mod, resident, expected):
     assert mod._cuda_repair_torch_specs(CU130, mod._TORCH_FLAVOR_REPAIR_PKG_SPEC) == expected
 
 
-# 2.4-2.8 are older than anything the cu130 index serves, so pinning them would fail the repair.
+# 2.4-2.8 predate anything the cu130 index serves, so pinning them would fail the repair.
 @pytest.mark.parametrize("resident", [None, "2.15.0", "2.3.1", "2.6.0", "2.8.0"])
 def test_no_keepable_release_repairs_to_the_default_range(monkeypatch, mod, resident):
-    # 2.13 without a kept release would bypass install.sh's PyPI gate and any uv upload cutoff.
     _route(monkeypatch, mod, torch = resident)
     for default in (mod._CUDA_TORCH_PKG_SPEC, mod._TORCH_FLAVOR_REPAIR_PKG_SPEC):
         assert mod._cuda_repair_torch_specs(CU130, default) is default

@@ -5,12 +5,10 @@
 
 from pathlib import Path
 
-# Feature ids tagging each column of a CSV read by `csv_as_text_kwargs`.
 _CSV_TEXT = "csv_text"
 _CSV_TYPED = "csv_typed"
 # The csv loader types each column from the first chunk of the first file.
 _CSV_CHUNK_ROWS = 10_000
-# pandas' default missing-value markers.
 _NA_CELLS = frozenset(
     ("", "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan", "1.#IND", "1.#QNAN")
     + ("<NA>", "N/A", "NA", "NULL", "NaN", "None", "n/a", "nan", "null")
@@ -18,15 +16,7 @@ _NA_CELLS = frozenset(
 
 
 def cell_text(value):
-    """The text to train on for a single Alpaca-style dataset cell.
-
-    A blank cell is a missing value to every loader we use, so it arrives as
-    None, and a column holding numbers arrives typed, so a cell typed as 1
-    arrives as 1.0. Untreated, the first trains the word None and the second
-    raises on .strip(). NaN counts as blank too: Arrow normalises a blank
-    numeric cell to null, but a dataset built straight from pandas need not have
-    passed through Arrow.
-    """
+    """Blank cells arrive as None or NaN, and typed numbers as floats; normalise both before .strip()."""
     if value is None:
         return ""
     if isinstance(value, dict) and {"text", "answer_start"} <= value.keys():
@@ -118,7 +108,6 @@ def csv_as_text_kwargs(files):
     with pd.read_csv(files[0], chunksize = _CSV_CHUNK_ROWS) as chunks:
         first = next(chunks)
     headers = [first.columns] + [pd.read_csv(path, nrows = 0).columns for path in files[1:]]
-    # A string schema needs the same columns in every file; else keep the loader's defaults.
     if any(set(columns) != set(headers[0]) for columns in headers):
         return {}
     strings = {

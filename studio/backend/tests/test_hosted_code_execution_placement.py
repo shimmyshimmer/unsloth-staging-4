@@ -1,21 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Which side runs the code when a turn mixes the Code pill with an Unsloth tool.
-
-``code_execution`` runs in the provider's sandbox; ``python`` / ``terminal`` run
-on the machine Unsloth is installed on. They are two trust boundaries, not two
-spellings of one feature, so the request says which one it wants by name and
-this server forwards accordingly. Unsloth has no implementation of
-``code_execution`` (``ALL_TOOLS`` is web_search / python / terminal / render_html
-/ search_knowledge_base), so filtering it out as "locally replaced" does not
-substitute anything -- it drops the tool while its pill stays lit, and the model
-is never offered a sandbox at all.
-
-The one case that IS a substitution is a request naming both, which no Unsloth
-build sends: there the local names win and the hosted one is dropped, so a
-single pill can never bill the provider and run on this host at the same time.
-"""
+"""code_execution runs at the provider, python and terminal on this host; both named, local wins."""
 
 import pytest
 
