@@ -124,6 +124,7 @@ import {
   isUnslothFinetunable,
   matchesCapability,
   matchesFormat,
+  matchesRecommended,
 } from "./lib/view-models";
 import { hfApiToken, useHfTokenStore } from "./stores/hf-token-store";
 import {
@@ -148,7 +149,7 @@ const INVENTORY_SORT_STORAGE_KEY = "unsloth.hub.inventorySort";
 const OWNER_SCOPE_STORAGE_KEY = "unsloth.hub.ownerScope";
 const RUN_CONFIG_REFRESH_TIMEOUT_MS = 5_000;
 
-// Iconless models (no provider logo, e.g. Ornith, Inkling) show once they clear this many likes.
+// Under Recommended, iconless models (no provider logo, e.g. Ornith, Inkling) show once they clear this many likes.
 const MIN_ICONLESS_MODEL_LIKES = 30;
 
 async function waitForRunConfigRefresh(
@@ -578,7 +579,7 @@ export function ModelsPage() {
     );
   }, [urlResourceType]);
   const [discoverFormat, setDiscoverFormat] = useState<ModelFormatFilter>(
-    () => findChannel(DEFAULT_DISCOVER_CHANNEL)?.format ?? "gguf",
+    () => findChannel(DEFAULT_DISCOVER_CHANNEL)?.format ?? "recommended",
   );
   const [downloadedFormat, setDownloadedFormat] =
     useState<ModelFormatFilter>("all");
@@ -674,7 +675,7 @@ export function ModelsPage() {
       setSortBrowseActive(false);
       if (next === "models") {
         const preset = findChannel(DEFAULT_DISCOVER_CHANNEL);
-        setDiscoverFormat(preset?.format ?? "gguf");
+        setDiscoverFormat(preset?.format ?? "recommended");
         setSortBy(preset?.sort ?? "trendingScore");
         setDirection("desc");
       }
@@ -714,7 +715,7 @@ export function ModelsPage() {
   );
   const handleBackToFeed = useCallback(() => {
     const preset = findChannel(DEFAULT_DISCOVER_CHANNEL);
-    setDiscoverFormat(preset?.format ?? "gguf");
+    setDiscoverFormat(preset?.format ?? "recommended");
     setSortBy(preset?.sort ?? "trendingScore");
     setDirection("desc");
     setCapabilityFilter("all");
@@ -731,7 +732,7 @@ export function ModelsPage() {
     setQuery("");
     setCapabilityFilter("all");
     setDownloadedFormat("all");
-    setDiscoverFormat(preset?.format ?? "gguf");
+    setDiscoverFormat(preset?.format ?? "recommended");
     setSortBy(preset?.sort ?? "trendingScore");
     setDirection("desc");
     setSortBrowseActive(false);
@@ -835,8 +836,17 @@ export function ModelsPage() {
       : requestedSort;
   const effectiveDirection: HfSortDirection = isFeedMode ? "desc" : direction;
   // The format dropdown always filters the visible list, including the feed's "Latest" list, so
-  // the default (GGUF) hides fp8/safetensors and picking a format actually changes the rows.
+  // the default (Recommended) hides unrunnable checkpoints and picking a format changes the rows.
   const effectiveDiscoverFormat: ModelFormatFilter = deferredFormatFilter;
+  const checkpointQuantFormats = gpu.checkpointQuantFormats;
+  // Image / video NVFP4 also needs the build's NVFP4 switch: the backend refuses *-NVFP4 diffusion repos while it is off.
+  const diffusionQuantFormats = useMemo(
+    () =>
+      gpu.nvfp4Diffusion
+        ? checkpointQuantFormats
+        : checkpointQuantFormats.filter((format) => format !== "nvfp4"),
+    [checkpointQuantFormats, gpu.nvfp4Diffusion],
+  );
 
   const listChannel = useMemo<HfModelSearchChannel | null>(() => {
     if (!liveListChannel) return null;
@@ -981,14 +991,23 @@ export function ModelsPage() {
       (row) =>
         !isHiddenModelId(row.id) &&
         !isConfiguredHiddenModelId(hiddenEmbeddingModelIds, row.id) &&
-        // Feed shows logo'd models, plus iconless ones above the likes threshold.
-        (!isFeedMode ||
+        // Recommended curates browsing to logo'd models plus well-liked iconless ones; a typed
+        // search and every other format show all matches.
+        (effectiveDiscoverFormat !== "recommended" ||
+          hasQuery ||
           resolveOwnerProviderLogo(row.owner, row.repo) !== null ||
           (row.result.likes ?? 0) >= MIN_ICONLESS_MODEL_LIKES) &&
-        matchesFormat(
-          detectResultFormat(row.result),
-          effectiveDiscoverFormat,
-        ) &&
+        (effectiveDiscoverFormat === "recommended"
+          ? matchesRecommended(
+              row.result,
+              row.capabilities.some((c) => c.key === "diffusion")
+                ? diffusionQuantFormats
+                : checkpointQuantFormats,
+            )
+          : matchesFormat(
+              detectResultFormat(row.result),
+              effectiveDiscoverFormat,
+            )) &&
         matchesCapability(row.capabilities, deferredCapabilityFilter) &&
         (!activeChannel?.finetunableOnly || isUnslothFinetunable(row.result)) &&
         // Models already on disk stay visible regardless of device fit, matching the chat selector.
@@ -1001,8 +1020,10 @@ export function ModelsPage() {
     discoverRows,
     hiddenEmbeddingModelIds,
     isDatasetMode,
-    isFeedMode,
+    hasQuery,
     effectiveDiscoverFormat,
+    checkpointQuantFormats,
+    diffusionQuantFormats,
     deferredCapabilityFilter,
     activeChannel,
     fitOnDeviceOnly,
@@ -1286,7 +1307,7 @@ export function ModelsPage() {
       setAllModelsViewState(next);
       writeAllModelsViewPreference(next);
       const preset = findChannel(DEFAULT_DISCOVER_CHANNEL);
-      setDiscoverFormat(preset?.format ?? "gguf");
+      setDiscoverFormat(preset?.format ?? "recommended");
       setSortBy(preset?.sort ?? "trendingScore");
       setDirection("desc");
       setCapabilityFilter("all");
@@ -1657,8 +1678,11 @@ export function ModelsPage() {
             deferredCapabilityFilter !== "all" ||
             (tab === "downloaded" && typeFilterActive)),
         typeFilterActive,
-        // A single format filter makes every row's format dot the same.
-        showFormatDots: isDatasetMode || deferredFormatFilter === "all",
+        // A single format filter makes every row's format dot the same; Recommended mixes GGUF and checkpoints.
+        showFormatDots:
+          isDatasetMode ||
+          deferredFormatFilter === "all" ||
+          deferredFormatFilter === "recommended",
       };
     },
     [
