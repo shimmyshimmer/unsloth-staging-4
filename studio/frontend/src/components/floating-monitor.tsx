@@ -381,7 +381,7 @@ export function FloatingMonitor() {
   // follows the painted width and falls back to the committed one.
   const [paintedSettingsWidth, setPaintedSettingsWidth] = useState(0);
   useEffect(() => {
-    if (!(isChatRoute && settingsPanelOpen)) {
+    if (!(isOpen && isChatRoute && settingsPanelOpen)) {
       setPaintedSettingsWidth(0);
       return;
     }
@@ -399,7 +399,7 @@ export function FloatingMonitor() {
     const observer = new ResizeObserver(measure);
     observer.observe(panel);
     return () => observer.disconnect();
-  }, [isChatRoute, settingsPanelOpen, isMobile]);
+  }, [isOpen, isChatRoute, settingsPanelOpen, isMobile]);
 
   // Same lag as the settings panel: the sidebar paints per frame and commits
   // on release, so a docked monitor could sit under a grown sidebar.
@@ -409,7 +409,7 @@ export function FloatingMonitor() {
   // state that takes the monitor's room.
   const [sidebarHoldsRail, setSidebarHoldsRail] = useState(false);
   useEffect(() => {
-    const sidebar = document.querySelector('[data-slot="sidebar"]');
+    const sidebar = isOpen ? document.querySelector('[data-slot="sidebar"]') : null;
     if (!sidebar) {
       setPaintedSidebarWidth(0);
       setSidebarHoldsRail(false);
@@ -427,7 +427,7 @@ export function FloatingMonitor() {
     const observer = new ResizeObserver(measure);
     observer.observe(sidebar);
     return () => observer.disconnect();
-  }, [isMobile]);
+  }, [isOpen, isMobile]);
 
   // `useIsMobile` only notifies when the 768 px breakpoint is crossed, and the
   // two width stores stop notifying at their maxima, so the capacity decision
