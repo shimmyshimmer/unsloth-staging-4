@@ -48,6 +48,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { NonModalDropdownMenu } from "@/components/ui/non-modal-dropdown-menu";
 import { ProgressiveRows } from "@/components/progressive-rows";
+import { isAssistantLocalThreadId } from "@/features/chat/utils/thread-ids";
 import {
   HELP_GROUPS,
   HELP_ITEMS,
@@ -176,7 +177,15 @@ import {
   useChatRuntimeStore,
   useChatProjects,
   useChatSearchStore,
-  useChatSidebarItems,
+  useSidebarRowPages,
+  fetchSidebarRowPage,
+  CHAT_HISTORY_UPDATED_EVENT,
+  fetchSidebarThreadRows,
+  readAllSidebarRowIds,
+  type SidebarRowSlot,
+  sidebarRowQuery,
+  mergeManualOrderTail,
+  SIDEBAR_PAGE_SIZE,
   usePinnedChatsStore,
   usePinnedProjectsStore,
   rangeBetween,
@@ -361,7 +370,7 @@ const MoreVerticalCenteredIcon = MoreVerticalIcon.map(([tag, attrs]) => [
 
 const PROJECT_CHAT_LIMIT = 4;
 const SIDEBAR_PROJECT_LIMIT = 5;
-const RECENTS_PAGE_SIZE = 50;
+const RECENTS_PAGE_SIZE = SIDEBAR_PAGE_SIZE;
 
 // shared radio items tick on the right; these read as settings, so tick first.
 // sidebar and account menu padding precedes UI scaling; rows keep 2px margins and submenu gaps.
@@ -1351,7 +1360,11 @@ export function AppSidebar() {
   // Training runs surface as sidebar "Recents" on Train/Recipes/Export, else chat recents.
   // Read up here because the chat lists below only exist when this is off.
   const trainingRecentsRoute = isStudioRoute || isRecipesRoute || isExportRoute;
-  const { items: runItems } = useTrainingHistorySidebarItems(
+  const {
+    items: runItems,
+    hasMore: runsHaveMore,
+    loadMore: loadMoreRuns,
+  } = useTrainingHistorySidebarItems(
     !chatOnly && trainingRecentsRoute,
   );
   const showTrainingRecents =
@@ -1362,14 +1375,6 @@ export function AppSidebar() {
   const activeProjectId = isChatRoute
     ? ((search.project as string | undefined) ?? null)
     : null;
-  const {
-    items: allChatItems,
-    archivedItems: archivedChatItems,
-    loaded: chatItemsLoaded,
-  } = useChatSidebarItems({
-    enabled: !isStudioRoute,
-    requireMessages: false,
-  });
   const pinnedIds = usePinnedChatsStore((s) => s.pinnedIds);
   const togglePinnedChat = usePinnedChatsStore((s) => s.togglePin);
   const setPinnedChats = usePinnedChatsStore((s) => s.setPinned);
@@ -1381,16 +1386,6 @@ export function AppSidebar() {
     (s) => s.alwaysDeleteChatFiles,
   );
   const pinnedIdSet = useMemo(() => new Set(pinnedIds), [pinnedIds]);
-  // Which row every thread belongs to, listed or not. The published lists carry
-  // only what is on screen, so this is what keeps an unread Compare row behind
-  // a collapsed section counting as one chat.
-  const rowIdByThreadId = useMemo(() => {
-    const map: Record<string, string> = {};
-    for (const item of allChatItems) {
-      for (const threadId of getSidebarItemThreadIds(item)) map[threadId] = item.id;
-    }
-    return map;
-  }, [allChatItems]);
   const organizeBy = useSidebarOrganizationStore((s) => s.organizeBy);
   // User-made sections, what is filed in them, and which sections "Show" turned off.
   const customSections = useSidebarOrganizationStore((s) => s.customSections);
@@ -1449,6 +1444,15 @@ export function AppSidebar() {
   const chatSort = useSidebarOrganizationStore((s) => s.chatSort);
   const pinnedSort = useSidebarOrganizationStore((s) => s.pinnedSort);
   const manualOrder = useSidebarOrganizationStore((s) => s.manualOrder);
+  // a drag in a partly loaded list shows here until its full order is saved (see writeManualOrder)
+  const [pendingManualOrder, setPendingManualOrder] = useState<Record<string, string[]>>({});
+  const displayManualOrder = useMemo(
+    () =>
+      Object.keys(pendingManualOrder).length > 0
+        ? { ...manualOrder, ...pendingManualOrder }
+        : manualOrder,
+    [manualOrder, pendingManualOrder],
+  );
   const setOrganizeBy = useSidebarOrganizationStore((s) => s.setOrganizeBy);
   const setChatSort = useSidebarOrganizationStore((s) => s.setChatSort);
   const setPinnedSort = useSidebarOrganizationStore((s) => s.setPinnedSort);
@@ -1468,6 +1472,152 @@ export function AppSidebar() {
   const setProjectsSection = useSidebarOrganizationStore((s) => s.setProjectsSection);
   const setPagesSection = useSidebarOrganizationStore((s) => s.setPagesSection);
   const setSectionHidden = useSidebarOrganizationStore((s) => s.setSectionHidden);
+  // `allChatItems` is only what the paged lists have loaded, not the whole history.
+  const sectionFiledChatIds = useMemo(() => Object.keys(sectionByChatId), [sectionByChatId]);
+  const [openFolderIds, setOpenFolderIds] = useState<readonly string[]>([]);
+  // The open chat and the running ones are looked up by row (header actions, shortcuts, unread
+  // and running counts), so their rows load even when no list has paged that far.
+  const slotStoreThreadId = useChatRuntimeStore((s) => s.activeThreadId);
+  const runningThreadKey = useChatRuntimeStore((s) =>
+    Object.keys(s.runningByThreadId)
+      .filter((id) => s.runningByThreadId[id])
+      .sort()
+      .join("\n"),
+  );
+  const slotActiveId = isChatRoute
+    ? ((search.thread as string | undefined) ??
+      (search.compare as string | undefined) ??
+      slotStoreThreadId ??
+      undefined)
+    : undefined;
+  const chatRowSlots = useMemo(() => {
+    const excludeIds = [...pinnedIds, ...sectionFiledChatIds];
+    const lookupIds = [
+      ...new Set(
+        [slotActiveId, ...runningThreadKey.split("\n")].filter(
+          (id): id is string => Boolean(id) && !isAssistantLocalThreadId(id),
+        ),
+      ),
+    ];
+    const slots: Record<string, SidebarRowSlot | null> = {
+      recents: {
+        query: sidebarRowQuery({
+          unfiledOnly: !showsInRecents("project", organizeBy),
+          excludeIds,
+          sort: chatSort,
+          manualOrder: manualOrder[RECENTS_ORDER_SCOPE],
+        }),
+      },
+      // the full pin order, so unranked pins keep their pin order
+      pinned: pinnedIds.length
+        ? {
+            query: sidebarRowQuery({
+              includeIds: pinnedIds,
+              sort: pinnedSort,
+              manualOrder:
+                pinnedSort === "manual"
+                  ? applyManualOrder(pinnedIds, manualOrder[PINNED_ORDER_SCOPE], (id) => id)
+                  : null,
+            }),
+          }
+        : null,
+      active: lookupIds.length ? { query: sidebarRowQuery({ includeIds: lookupIds }) } : null,
+    };
+    for (const section of customSections) {
+      const ids = sectionFiledChatIds.filter(
+        (id) => sectionByChatId[id] === section.id && !pinnedIdSet.has(id),
+      );
+      if (ids.length === 0) continue;
+      // the newest chat alone, so a hidden or hand-ordered section keeps its place in Move to
+      if (hiddenSectionSet.has(section.id) || section.sort === "manual") {
+        slots[`latest:${section.id}`] = {
+          initialLimit: 1,
+          query: sidebarRowQuery({ includeIds: ids }),
+        };
+      }
+      if (hiddenSectionSet.has(section.id)) continue;
+      slots[`section:${section.id}`] = {
+        query: sidebarRowQuery({
+          includeIds: ids,
+          sort: section.sort,
+          manualOrder: manualOrder[customSectionScope(section.id)],
+        }),
+      };
+    }
+    for (const projectId of openFolderIds) {
+      slots[`folder:${projectId}`] = {
+        // one past the preview, so the folder knows whether to offer Show more
+        initialLimit: PROJECT_CHAT_LIMIT + 1,
+        query: sidebarRowQuery({
+          projectId,
+          excludeIds,
+          sort: chatSort,
+          manualOrder: manualOrder[projectOrderScope(projectId)],
+        }),
+      };
+    }
+    return slots;
+  }, [
+    pinnedIds,
+    pinnedIdSet,
+    sectionFiledChatIds,
+    sectionByChatId,
+    organizeBy,
+    chatSort,
+    pinnedSort,
+    manualOrder,
+    customSections,
+    hiddenSectionSet,
+    openFolderIds,
+    slotActiveId,
+    runningThreadKey,
+  ]);
+  const { lists: chatRowLists, items: allChatItems } = useSidebarRowPages(
+    chatRowSlots,
+    !isStudioRoute,
+  );
+  const recentsPages = chatRowLists.recents;
+  const chatItemsLoaded = recentsPages?.loaded ?? false;
+  const folderPages = useCallback(
+    (projectId: string) => chatRowLists[`folder:${projectId}`],
+    [chatRowLists],
+  );
+  // "No chats yet" needs no chat anywhere: archived ones and ones in folders that are not loaded
+  // (a collapsed Projects section) are not in the loaded lists.
+  const [hasUnlistedChats, setHasUnlistedChats] = useState(false);
+  const sidebarLooksEmpty = chatItemsLoaded && allChatItems.length === 0;
+  useEffect(() => {
+    if (!sidebarLooksEmpty) return;
+    let cancelled = false;
+    // re-asked on every history change: archiving or deleting can flip it while the list stays empty
+    const probe = () => {
+      void Promise.all(
+        [sidebarRowQuery({}), sidebarRowQuery({ archived: true })].map((query) =>
+          fetchSidebarRowPage(query, 1, null),
+        ),
+      )
+        .then((pages) => {
+          if (!cancelled) setHasUnlistedChats(pages.some((page) => page.rows.length > 0));
+        })
+        .catch(() => undefined);
+    };
+    probe();
+    window.addEventListener(CHAT_HISTORY_UPDATED_EVENT, probe);
+    return () => {
+      cancelled = true;
+      window.removeEventListener(CHAT_HISTORY_UPDATED_EVENT, probe);
+    };
+  }, [sidebarLooksEmpty]);
+  // Which row every thread belongs to, listed or not. The published lists carry
+  // only what is on screen, so this is what keeps an unread Compare row behind
+  // a collapsed section counting as one chat.
+  const rowIdByThreadId = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const item of allChatItems) {
+      for (const threadId of getSidebarItemThreadIds(item)) map[threadId] = item.id;
+    }
+    return map;
+  }, [allChatItems]);
   // With the Projects section on, a project chat lives in its folder and repeating it here would be
   // noise. With it off there are no folders, so Recents is where those chats go. Pinned chats are
   // held back either way: the Pinned section renders those, as a custom section does its own.
@@ -1518,7 +1668,10 @@ export function AppSidebar() {
     const map = new Map<string, number>();
     for (const project of projects) {
       const newest = chatsByProjectId.get(project.id)?.[0]?.updatedAt ?? 0;
-      map.set(project.id, Math.max(project.updatedAt ?? project.createdAt, newest));
+      map.set(
+        project.id,
+        Math.max(project.lastActivityAt ?? 0, project.updatedAt ?? project.createdAt, newest),
+      );
     }
     return map;
   }, [projects, chatsByProjectId]);
@@ -1591,13 +1744,20 @@ export function AppSidebar() {
   // Memoised for its identity, not for the slice. It feeds the rendered-row set the selection guard
   // depends on, and that effect sets state: React re-renders once to find the bail-out, which would
   // rebuild this array and schedule the effect again, without end.
+  const [projectPageLimit, setProjectPageLimit] = useState(SIDEBAR_PAGE_SIZE);
   const visibleProjectRecords = useMemo(
     () =>
-      showAllProjects
-        ? sidebarProjectRecords
-        : sidebarProjectRecords.slice(0, SIDEBAR_PROJECT_LIMIT),
-    [showAllProjects, sidebarProjectRecords],
+      sidebarProjectRecords.slice(
+        0,
+        showAllProjects ? projectPageLimit : SIDEBAR_PROJECT_LIMIT,
+      ),
+    [showAllProjects, projectPageLimit, sidebarProjectRecords],
   );
+  const moreProjectsUnlisted =
+    showAllProjects && sidebarProjectRecords.length > visibleProjectRecords.length;
+  const listMoreProjects = useCallback(() => {
+    setProjectPageLimit((count) => count + SIDEBAR_PAGE_SIZE);
+  }, []);
   // Default expanded; the row toggles this. Show-more reveals chats past the limit.
   const [collapsedProjectIds, setCollapsedProjectIds] = useState<Set<string>>(
     () => new Set(),
@@ -1755,11 +1915,11 @@ export function AppSidebar() {
       if (mode === "manual") {
         // Incoming order is the list's own rule, so undragged rows keep it:
         // newest first in Recents, pin order in Pinned.
-        return applyManualOrder(items, manualOrder[scope], (item) => item.id);
+        return applyManualOrder(items, displayManualOrder[scope], (item) => item.id);
       }
       return [...items].sort((a, b) => b.updatedAt - a.updatedAt);
     },
-    [manualOrder],
+    [displayManualOrder],
   );
   const sortedRecentChatItems = useMemo(
     () => sortChatItems(recentChatItems, RECENTS_ORDER_SCOPE, chatSort),
@@ -1839,9 +1999,9 @@ export function AppSidebar() {
       if (!sectionByPageId[page.id]) rows.push({ kind: "page", id: page.id, page });
     }
     return pinnedSort === "manual"
-      ? applyManualOrder(rows, manualOrder[PINNED_ORDER_SCOPE], (row) => row.id)
+      ? applyManualOrder(rows, displayManualOrder[PINNED_ORDER_SCOPE], (row) => row.id)
       : rows;
-  }, [pinnedProjectBase, sortedPinnedChatItems, pinnedPages, sectionByPageId, pinnedSort, manualOrder]);
+  }, [pinnedProjectBase, sortedPinnedChatItems, pinnedPages, sectionByPageId, pinnedSort, displayManualOrder]);
   const pinnedRowIds = useMemo(() => pinnedRows.map((row) => row.id), [pinnedRows]);
   // Each custom section is one list of folders and chats, as Pinned is: folders lead until a drop
   // says otherwise. A pinned row stays in Pinned and keeps its section for when it is unpinned.
@@ -1881,7 +2041,7 @@ export function AppSidebar() {
       rows.set(
         section.id,
         section.sort === "manual"
-          ? applyManualOrder(list, manualOrder[scope], (row) => row.id)
+          ? applyManualOrder(list, displayManualOrder[scope], (row) => row.id)
           : list,
       );
     }
@@ -1897,7 +2057,7 @@ export function AppSidebar() {
     pinnedProjectIdSet,
     pinnedIdSet,
     sortChatItems,
-    manualOrder,
+    displayManualOrder,
   ]);
   const visibleCustomSections = useMemo(
     () => customSections.filter((section) => !hiddenSectionSet.has(section.id)),
@@ -1960,6 +2120,33 @@ export function AppSidebar() {
   // unread would take it over the open chat. Navigation is exempt: it moves the chat the user IS
   // looking at, and the sheet is closed for most of its life on a narrow window.
   const chatRowsOnScreen = chatListsOnScreen && (!isMobile || openMobile);
+  const wantedFolderIds = useMemo(() => {
+    if (!chatListsOnScreen || organizeBy !== "project") return "";
+    const ids = new Set<string>();
+    const add = (open: boolean, records: ProjectRecord[]) => {
+      if (!open) return;
+      for (const project of records) {
+        if (!collapsedProjectIds.has(project.id)) ids.add(project.id);
+      }
+    };
+    add(projectsSectionRendered && projectsOpen, visibleProjectRecords);
+    add(pinnedOpen, pinnedProjectRecords);
+    add(true, customSectionProjectRecords);
+    return [...ids].sort().join("\n");
+  }, [
+    chatListsOnScreen,
+    organizeBy,
+    collapsedProjectIds,
+    projectsSectionRendered,
+    projectsOpen,
+    visibleProjectRecords,
+    pinnedOpen,
+    pinnedProjectRecords,
+    customSectionProjectRecords,
+  ]);
+  useEffect(() => {
+    setOpenFolderIds(wantedFolderIds ? wantedFolderIds.split("\n") : []);
+  }, [wantedFolderIds]);
   // The chats a section's folders show, in row order. A pinned folder leaves with Pinned's
   // disclosure, not the Projects one, so each section collects its own.
   const folderChatItems = useCallback(
@@ -2124,6 +2311,19 @@ export function AppSidebar() {
     attentionItemIds,
     activeThreadId,
   ]);
+  const lastRecentId = visibleRecentItems[visibleRecentItems.length - 1]?.id;
+  const loadMoreRecents = recentsPages?.hasMore ? recentsPages.loadMore : undefined;
+  useEffect(() => {
+    if (activeThreadId && activeThreadId === lastRecentId) void loadMoreRecents?.();
+  }, [activeThreadId, lastRecentId, loadMoreRecents]);
+  // the same for Pinned, sections and folders, so a chord can walk past their first page too
+  useEffect(() => {
+    if (!activeThreadId) return;
+    for (const [name, list] of Object.entries(chatRowLists)) {
+      if (name === "recents" || name.startsWith("latest:") || !list.hasMore) continue;
+      if (list.rows[list.rows.length - 1]?.id === activeThreadId) void list.loadMore();
+    }
+  }, [activeThreadId, chatRowLists]);
 
   const projectRowIds = useMemo(
     () => sidebarProjectRecords.map((project) => project.id),
@@ -2224,8 +2424,35 @@ export function AppSidebar() {
     });
   }, [chatRowsOnScreen, clearSelection, renderedChatIds, renderedProjectIds]);
 
-  /** Select every chat row on screen, pinned block included. */
+  const [selectAllPending, setSelectAllPending] = useState(false);
   const selectAllChats = useCallback(() => {
+    if (!chatRowsOnScreen) return;
+    const partial = Object.entries(chatRowLists).filter(([name, list]) => {
+      if (!list.hasMore) return false;
+      if (name === "recents") return chatOpen;
+      if (name === "pinned") return pinnedOpen;
+      const sectionId = customSectionIdOf(name);
+      if (sectionId) return !collapsedSectionIds.has(sectionId);
+      return name.startsWith("folder:") && expandedChatProjectIds.has(name.slice(7));
+    });
+    if (partial.length > 0) {
+      // a failed page selects nothing: a bulk action must never take a silent subset for "all"
+      void Promise.all(partial.map(([, list]) => list.loadAll()))
+        .then(() => setSelectAllPending(true))
+        .catch(() => undefined);
+      return;
+    }
+    setSelectAllPending(true);
+  }, [
+    chatRowsOnScreen,
+    chatRowLists,
+    chatOpen,
+    pinnedOpen,
+    collapsedSectionIds,
+    expandedChatProjectIds,
+  ]);
+  /** Select every chat row on screen, pinned block included. */
+  const selectRenderedChats = useCallback(() => {
     if (!chatRowsOnScreen) return;
     const ids = renderedChatItems.map((item) => item.id);
     if (ids.length === 0) return;
@@ -2234,6 +2461,55 @@ export function AppSidebar() {
     selectionAnchorRef.current = null;
     setSelectedChatIds(new Set(ids));
   }, [chatRowsOnScreen, renderedChatItems, dropProjectSelection]);
+  useEffect(() => {
+    if (!selectAllPending) return;
+    setSelectAllPending(false);
+    selectRenderedChats();
+  }, [selectAllPending, selectRenderedChats]);
+
+  // in a partly loaded list, unloaded rows keep their places after the dragged ones
+  const manualOrderWritesRef = useRef(new Map<string, number>());
+  const writeManualOrder = useCallback(
+    (scope: string, ids: string[]) => {
+      // every write supersedes an older one still reading its list's ids
+      const writes = manualOrderWritesRef.current;
+      const generation = (writes.get(scope) ?? 0) + 1;
+      writes.set(scope, generation);
+      const slot =
+        scope === RECENTS_ORDER_SCOPE
+          ? "recents"
+          : scope === PINNED_ORDER_SCOPE
+            ? "pinned"
+            : customSectionIdOf(scope)
+              ? scope
+              : scope.startsWith("project:")
+                ? `folder:${scope.slice("project:".length)}`
+                : null;
+      const query = slot ? chatRowSlots[slot]?.query : undefined;
+      if (!slot || !query || !chatRowLists[slot]?.hasMore) {
+        setManualOrder(scope, ids);
+        setPendingManualOrder(({ [scope]: _superseded, ...rest }) => rest);
+        return;
+      }
+      // Saving the loaded ids alone would leave every unloaded row unranked, and unranked rows sort
+      // first, so the list would jump; show the order now, save it once every id is known.
+      const saved = useSidebarOrganizationStore.getState().manualOrder[scope] ?? [];
+      const shown = mergeManualOrderTail(ids, saved);
+      setPendingManualOrder((pending) => ({ ...pending, [scope]: shown }));
+      const settle = (order: string[]) => {
+        if (writes.get(scope) !== generation) return;
+        setManualOrder(scope, order);
+        setPendingManualOrder(({ [scope]: _settled, ...rest }) => rest);
+      };
+      void readAllSidebarRowIds(query)
+        .then((all) => {
+          const current = useSidebarOrganizationStore.getState().manualOrder[scope] ?? [];
+          settle(mergeManualOrderTail(mergeManualOrderTail(ids, all), current));
+        })
+        .catch(() => settle(shown));
+    },
+    [setManualOrder, chatRowSlots, chatRowLists],
+  );
 
   // Escape leaves a selection, as it does the menus. A passive listener rather than one that consumes
   // the key: dictation's Escape reads defaultPrevented first, and a stale selection must not outrank
@@ -2547,7 +2823,7 @@ export function AppSidebar() {
       superseded?: boolean,
     ) => {
       for (const order of effects.orders) {
-        setManualOrder(
+        writeManualOrder(
           order.scope,
           before ? landedOrder(order, before[order.scope]) : order.ids,
         );
@@ -2650,7 +2926,7 @@ export function AppSidebar() {
     const next = moveIdBy(orderedIds, item.id, delta);
     if (next === orderedIds) return;
     const resorts = sort !== undefined && sort.value !== "manual";
-    setManualOrder(item.scope, next);
+    writeManualOrder(item.scope, next);
     if (resorts) {
       sort.set("manual");
       toast.info(t("shell.organize.switchedToManual"));
@@ -2704,6 +2980,18 @@ export function AppSidebar() {
         markThreadsUnread(completedThreadIds, rowIdByThreadId);
         clearThreadsUnread([...activeVisibleThreadIdSet]);
       });
+      const unlisted = completedThreadIds.filter((id) => !rowIdByThreadId[id]);
+      if (unlisted.length > 0) {
+        void fetchSidebarThreadRows(unlisted)
+          .then((rows) => {
+            if (!rows || Object.keys(rows).length === 0) return;
+            // a chat opened while the lookup was out is read; do not mark it again
+            const { unreadThreadIds: unread } = useChatNavigationStore.getState();
+            const still = unlisted.filter((id) => unread.has(id));
+            if (still.length > 0) markThreadsUnread(still, rows);
+          })
+          .catch(() => undefined);
+      }
     }
     previousRunningByThreadIdRef.current = runningByThreadId;
   }, [
@@ -4105,7 +4393,12 @@ export function AppSidebar() {
               {...dnd.dropZoneProps({ section: "pinned" })}
             >
               <SidebarMenu>
-                {pinnedRows.map((row) =>
+                <ProgressiveRows
+                  items={pinnedRows}
+                  pageSize={SIDEBAR_PAGE_SIZE}
+                  hasMore={chatRowLists.pinned?.hasMore}
+                  onReachEnd={chatRowLists.pinned?.loadMore}
+                  renderItem={(row) =>
                   row.kind === "project"
                     ? renderProjectFolderRow(row.project, {
                         scope: PINNED_ORDER_SCOPE,
@@ -4127,8 +4420,9 @@ export function AppSidebar() {
                           orderIds: pinnedRowIds,
                           section: "pinned",
                           sort: { value: pinnedSort, set: setPinnedSort },
-                        }),
-                )}
+                        })
+                  }
+                />
                 {pinnedRows.length === 0 ? (
                   // Every pinned page is filed elsewhere: somewhere to drag them back to.
                   <SidebarMenuItem>
@@ -4245,7 +4539,12 @@ export function AppSidebar() {
               {...dnd.dropZoneProps({ section: scope })}
             >
               <SidebarMenu>
-                {rows.map((row) =>
+                <ProgressiveRows
+                  items={rows}
+                  pageSize={SIDEBAR_PAGE_SIZE}
+                  hasMore={chatRowLists[`section:${section.id}`]?.hasMore}
+                  onReachEnd={chatRowLists[`section:${section.id}`]?.loadMore}
+                  renderItem={(row) =>
                   row.kind === "project"
                     ? renderProjectFolderRow(row.project, {
                         scope,
@@ -4262,8 +4561,9 @@ export function AppSidebar() {
                           orderIds: ids.rows,
                           section: scope,
                           sort,
-                        }),
-                )}
+                        })
+                  }
+                />
                 {rows.length === 0 ? (
                   // Gives an empty section a body to hit, as the empty Projects line does.
                   <SidebarMenuItem>
@@ -4361,14 +4661,20 @@ export function AppSidebar() {
               {...dnd.dropZoneProps({ section: "projects" })}
             >
               <SidebarMenu>
-                {visibleProjectRecords.map((project) =>
-                  renderProjectFolderRow(project, {
-                    scope: PROJECT_ORDER_SCOPE,
-                    orderedIds: projectRowIds,
-                    section: "projects",
-                    sort: { value: projectSort, set: setProjectSort },
-                  }),
-                )}
+                <ProgressiveRows
+                  items={visibleProjectRecords}
+                  pageSize={SIDEBAR_PAGE_SIZE}
+                  hasMore={moreProjectsUnlisted}
+                  onReachEnd={listMoreProjects}
+                  renderItem={(project) =>
+                    renderProjectFolderRow(project, {
+                      scope: PROJECT_ORDER_SCOPE,
+                      orderedIds: projectRowIds,
+                      section: "projects",
+                      sort: { value: projectSort, set: setProjectSort },
+                    })
+                  }
+                />
                 {/* Every project is pinned, so the section is drawn with nothing in it. The
                     line gives the body a height: without one it collapses to zero and the
                     hit test walks straight past it, so a pinned folder dragged back has
@@ -4390,7 +4696,10 @@ export function AppSidebar() {
                 {sidebarProjectRecords.length > SIDEBAR_PROJECT_LIMIT && (
                   <SidebarMenuItem>
                     <SidebarMenuButton
-                      onClick={() => setShowAllProjects((prev) => !prev)}
+                      onClick={() => {
+                        setShowAllProjects((prev) => !prev);
+                        setProjectPageLimit(SIDEBAR_PAGE_SIZE);
+                      }}
                       className="sidebar-nav-btn h-[calc(30px*var(--ui-space-scale,1))] rounded-full pl-3 pr-4 font-medium text-nav-fg-muted!"
                     >
                       <span className="text-ui-13 leading-ui-18 tracking-nav">
@@ -5269,17 +5578,24 @@ export function AppSidebar() {
       </ContextMenuTrigger>
       {renderProjectContextMenu(project)}
     </ContextMenu>
-    {expanded &&
-      visibleChats.map((chat) =>
-        renderChatSidebarItem(chat, "project", {
-          scope: projectOrderScope(project.id),
-          ids: projectChatIds,
-          section: order.section,
-          folderId: project.id,
-          blockEnd,
-          sort: { value: chatSort, set: setChatSort },
-        }),
-      )}
+    {expanded && (
+      <ProgressiveRows
+        items={visibleChats}
+        pageSize={SIDEBAR_PAGE_SIZE}
+        hasMore={showAll && folderPages(project.id)?.hasMore}
+        onReachEnd={folderPages(project.id)?.loadMore}
+        renderItem={(chat) =>
+          renderChatSidebarItem(chat, "project", {
+            scope: projectOrderScope(project.id),
+            ids: projectChatIds,
+            section: order.section,
+            folderId: project.id,
+            blockEnd,
+            sort: { value: chatSort, set: setChatSort },
+          })
+        }
+      />
+    )}
     {/* An open folder with nothing in it says so. Muted and static apart from the drop: an empty
         folder is exactly where a chat is dragged, and it has no row of its own to land on. */}
     {expanded && projectChats.length === 0 && (
@@ -5298,7 +5614,10 @@ export function AppSidebar() {
           {...dnd.dropZoneProps({ section: order.section, folderId: project.id, blockEnd })}
         >
           <SidebarMenuButton
-            onClick={() => toggleProjectShowAll(project.id)}
+            onClick={() => {
+              if (!showAll) void folderPages(project.id)?.loadMore();
+              toggleProjectShowAll(project.id);
+            }}
             // Force the muted token: .sidebar-nav-btn's own color rule outweighs a plain text utility,
             // so Show more would otherwise match the chat rows.
             className="sidebar-nav-btn h-[calc(30px*var(--ui-space-scale,1))] rounded-full pl-9 pr-4 font-medium text-nav-fg-muted!"
@@ -5861,6 +6180,8 @@ export function AppSidebar() {
                     <ProgressiveRows
                       items={sortedRecentChatItems}
                       pageSize={RECENTS_PAGE_SIZE}
+                      hasMore={recentsPages?.hasMore}
+                      onReachEnd={recentsPages?.loadMore}
                       renderItem={(item) =>
                         renderChatSidebarItem(item, "recent", {
                           scope: RECENTS_ORDER_SCOPE,
@@ -5888,9 +6209,8 @@ export function AppSidebar() {
                     />
                   </SidebarMenu>
                   {/* existing project or archived threads can leave Recents empty. */}
-                  {chatItemsLoaded &&
-                    allChatItems.length === 0 &&
-                    archivedChatItems.length === 0 && (
+                  {sidebarLooksEmpty &&
+                    !hasUnlistedChats && (
                       <p className="px-3 py-2 text-xs text-muted-foreground">
                         {t("shell.navigation.noChatsYet")}
                       </p>
@@ -5913,7 +6233,12 @@ export function AppSidebar() {
             <CollapsibleContent>
               <SidebarGroupContent className={unrailedRowPadding}>
                 <SidebarMenu>
-                  {runItems.map((run) => {
+                  <ProgressiveRows
+                    items={runItems}
+                    pageSize={SIDEBAR_PAGE_SIZE}
+                    hasMore={runsHaveMore}
+                    onReachEnd={loadMoreRuns}
+                    renderItem={(run) => {
                     // Explicit selection wins. Otherwise highlight the active job only while the "Current Run"
                     // tab is the view, keeping Configure unhighlighted even though activeJobId stays pinned.
                     const isActiveRun =
@@ -6000,7 +6325,8 @@ export function AppSidebar() {
                         </NonModalDropdownMenu>
                       </SidebarMenuItem>
                     );
-                  })}
+                    }}
+                  />
                 </SidebarMenu>
               </SidebarGroupContent>
             </CollapsibleContent>

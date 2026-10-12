@@ -50,12 +50,10 @@ export const BUDGET = {
   // The long-chat render work (#13255: deferred fences and reasoning rows) adds 33.3 KB raw / 13.1 KB
   // transfer to the eager chat chunk (6,477.1 -> 6,510.4 KB raw, 1,942.6 -> 1,955.7 KB transfer at
   // 160cb41fe, one machine and build); raised by that so main's margin stays where it was.
-  // Project sources follow-ups (#13224: queued drops, retry on failed sources, folder drops) add
-  // 6.6 KB raw / 2.0 KB transfer, mostly in the eager chat chunk (6,513.0 -> 6,519.6 KB raw,
-  // 1,956.4 -> 1,958.4 KB transfer against d4ea5a51d, one machine and build). Lazy-loading the
-  // folder walker recovered 0.5 KB raw and no transfer, so the budget is raised by that growth.
-  transferBytes: 2_007_100,
-  rawBytes: 6_687_800,
+  // Sidebar server paging adds 11.1 KB raw / 3.6 KB transfer to the first screen (6,512.1 -> 6,523.2
+  // KB raw, 1,956.2 -> 1,959.8 KB transfer at 27626031e6), raised by exactly that.
+  transferBytes: 2_008_700,
+  rawBytes: 6_692_400,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
