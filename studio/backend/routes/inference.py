@@ -18549,7 +18549,7 @@ async def _load_model_impl(
         ollama_advertised_id = (
             await asyncio.to_thread(ollama_model_ref_public_id, request.model_path)
             if resolved_ollama_path is not None
-            else None
+            else request._advertised_id
         )
         # Version switching is handled by the subprocess-based inference
         # backend -- no ensure_transformers_version() needed here.
@@ -18705,6 +18705,8 @@ async def _load_model_impl(
                     await asyncio.to_thread(acquire_for_request, CHAT)
                 if replacing:
                     account_access.join_resident("chat")
+                if request._advertised_id:
+                    backend._openai_advertised_id = request._advertised_id
                 return LoadResponse(
                     engine = request.engine,
                     engine_parallelism = request.engine_parallelism,
@@ -19321,7 +19323,7 @@ async def _load_model_impl(
             llama_backend._openai_gguf_companion_state = gguf_companion_state
             if replacing:
                 await asyncio.to_thread(note_model_loaded, llama_backend)
-            # None elsewhere: only an Ollama load has an identifier no client should be handed.
+            # Else None, or the catalog id a /models/load named: only those loads have an alias to keep.
             llama_backend._openai_advertised_id = ollama_advertised_id
 
             # Audio detection moved into load_model under _serial_load_lock (#5642).
@@ -19536,6 +19538,8 @@ async def _load_model_impl(
                 list(request.gpu_ids) if request.gpu_ids else None
             )
 
+        if request._advertised_id:
+            backend._openai_advertised_id = request._advertised_id
         logger.info(
             f"Loaded model: {model_log_label if native_grant_backed else config.identifier}"
         )
@@ -36499,6 +36503,12 @@ def _servable_catalog_rows(
     ]
 
 
+def _with_openai_residency(entry: dict) -> dict:
+    # Open WebUI's llama.cpp provider reads status.value and calls a row without one loaded (#10610).
+    loaded = bool(entry.get("loaded"))
+    return {**entry, "loaded": loaded, "status": {"value": "loaded" if loaded else "unloaded"}}
+
+
 def _audio_cpp_speech_model_objects(created: int) -> list[dict]:
     """Downloaded audio.cpp speech, music and separation GGUFs, found by header in the HF cache. The
     cache scan lists a dedicated repo as a GGUF but cannot key an umbrella folder, and none loads in
@@ -36609,39 +36619,7 @@ async def _openai_catalog_objects(quant_pins: bool = False) -> list[dict]:
     for obj in media:
         by_id.setdefault(obj["id"], obj)
 
-    if not quant_pins or not pins:
-        return list(by_id.values())
-    # Off-loop: a loaded row on a cold index reads residency from every slot.
-    return await asyncio.to_thread(_with_quant_pin_rows, list(by_id.values()), pins)
-
-
-def _with_quant_pin_rows(objects: list[dict], pins: dict[str, tuple[str, ...]]) -> list[dict]:
-    """*objects* plus, after each multi-quant repo's bare row, one ``<id>:<quant>`` row per on-disk
-    quant, as ``GET /v1/models/<id>:<quant>`` returns it: dropdown clients cannot type a pin (#9340)."""
-    from core.inference.local_model_resolver import (
-        index_is_built,
-        local_gguf_pinned_variant,
-        warm_index_soon,
-    )
-
-    # Never rebuild per listing (5 s TTL, multi-root scan); build only if it never was, or a
-    # client that lists once at connect sees no pins.
-    allow_scan = not index_is_built()
-    warm_index_soon()
-    listed = {obj["id"] for obj in objects}
-    resident_quants = functools.lru_cache(maxsize = 1)(_resident_gguf_quants)
-    out: list[dict] = []
-    for obj in objects:
-        out.append(obj)
-        if obj.get("task"):
-            continue
-        out.extend(
-            _quant_pin_object(obj, quant, resident_quants)
-            for quant in pins.get(obj["id"], ())
-            if f"{obj['id']}:{quant}" not in listed
-            and local_gguf_pinned_variant(f"{obj['id']}:{quant}", allow_scan = allow_scan) == quant
-        )
-    return out
+    return [_with_openai_residency(entry) for entry in by_id.values()]
 
 
 @studio_router.get("/loaded-models")
@@ -36738,6 +36716,10 @@ def _quant_pin_object(listed: dict, variant: str, resident_quants) -> dict:
 
 @router.get("/models/{model_id:path}")
 async def openai_retrieve_model(model_id: str, current_subject: str = Depends(get_current_subject)):
+    return _with_openai_residency(await _openai_retrieve_model_object(model_id))
+
+
+async def _openai_retrieve_model_object(model_id: str) -> dict:
     """
     OpenAI-compatible single-model retrieval endpoint (``GET /v1/models/{id}``).
 
