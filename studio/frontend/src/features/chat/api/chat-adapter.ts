@@ -71,6 +71,8 @@ function userTexts(
     .filter((message) => message?.role === "user")
     .map((message) => messageText(message.content));
 }
+import { endBrowserAgentRun } from "@/features/browser/agent/agent-store";
+import { browserAgentToolsForTurn } from "@/features/browser/agent/tools";
 import { projectHasSources } from "@/features/rag/api/rag-api";
 import {
   IMAGE_SENTINEL_TOOLS,
@@ -2291,12 +2293,14 @@ export async function buildLocalTokenCountExtras(
     codeToolsEnabled,
     userTexts(messages),
   );
+  const browserTools = browserAgentToolsForTurn();
   if (
     !toolsEnabled &&
     !codeToolsEnabled &&
     !mcpEnabledForChat &&
     !ragOn &&
     !deepResearchEnabled &&
+    browserTools.length === 0 &&
     skillTools.length === 0
   ) {
     // Explicit false, not omission: the server defaults tools on. The permission level rides
@@ -2328,6 +2332,7 @@ export async function buildLocalTokenCountExtras(
       ...(codeToolsEnabled ? ["python", "terminal", "edit_file", "view_image"] : []),
       // match the request gate so token pricing includes only sent skill tools.
       ...skillTools,
+      ...browserTools,
     ],
     mcp_enabled: mcpEnabledForChat,
     // Top level, not inside rag_scope: an archived thread puts search_conversation and its
@@ -4956,6 +4961,7 @@ export function createOpenAIStreamAdapter(
         runtime.deepResearchEnabled &&
         !options.pairId &&
         (options.modelType === undefined || options.modelType === "base");
+      const browserTools = browserAgentToolsForTurn();
       const toolConfirmationIdsByBackendId = new Map<string, string>();
       // Local tool ids ("call_0") repeat across turns and panes, so scope by pane AND thread; the
       // reader has only threadListItem.remoteId.
@@ -6777,6 +6783,7 @@ export function createOpenAIStreamAdapter(
                 ragEnabled ||
                 projectRagEnabled ||
                 skillTools.length > 0 ||
+                browserTools.length > 0 ||
                 // Armed research needs Studio's loop: deep_research is appended past every tool filter, but
                 // only for a request that asked for the loop at all.
                 deepResearchArmed)
@@ -6789,6 +6796,7 @@ export function createOpenAIStreamAdapter(
                       ...(toolsEnabled ? ["web_search"] : []),
                       ...skillTools,
                       ...studioLocalCodeTools,
+                      ...browserTools,
                       // Hosted tools with no local stand-in; their pills stay lit regardless, so listing only local
                       // names dropped Images/Fetch whenever another tool selected this branch. Search is excluded
                       // (Unsloth runs it above); Code rides along only when it resolved to the provider's sandbox.
@@ -7005,6 +7013,7 @@ export function createOpenAIStreamAdapter(
                 ragEnabled ||
                 projectRagEnabled ||
                 skillTools.length > 0 ||
+                browserTools.length > 0 ||
                 deepResearchArmed)
               ? {
                   enable_tools: true,
@@ -7018,6 +7027,7 @@ export function createOpenAIStreamAdapter(
                     ...(codeToolsEnabled
                       ? ["python", "terminal", "edit_file", "view_image"]
                       : []),
+                    ...browserTools,
                   ],
                   mcp_enabled: mcpEnabledForChat,
                   // Scope: thread_id = this thread's docs, kb_id = a KB, project_id = the thread's project
@@ -7438,6 +7448,25 @@ export function createOpenAIStreamAdapter(
                       custom: liveCustom(),
                     },
                   };
+                  continue;
+                }
+                if (toolEvent.type === "tool_output" && toolEvent.browser_action) {
+                  // A browser tool asking this tab to act; it answers on its own request, so the stream never waits.
+                  const request = toolEvent.browser_action;
+                  const userText = userTexts(survivingMessages).join("\n");
+                  void import("@/features/browser/agent/executor").then(
+                    ({ parseBrowserAction, runBrowserAction }) => {
+                      const action = parseBrowserAction(request);
+                      if (action) {
+                        void runBrowserAction(action, {
+                          runKey: cancelId,
+                          scope: threadKey,
+                          userText,
+                          signal: runSignal,
+                        });
+                      }
+                    },
+                  );
                   continue;
                 }
                 if (toolEvent.type === "tool_output") {
@@ -9052,6 +9081,7 @@ export function createOpenAIStreamAdapter(
         // serverCancel narrows both clears: runs with no resolved thread id share the "__default" key.
         runtime.setThreadRunning(cleanupKey, false, { owner: serverCancel });
         runtime.clearThreadServerCancel(cleanupKey, serverCancel);
+        if (browserTools.length > 0) endBrowserAgentRun(cancelId);
       }
     },
   } satisfies ChatModelAdapter;

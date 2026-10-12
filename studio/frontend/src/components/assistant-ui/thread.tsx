@@ -340,6 +340,7 @@ import { MicIcon } from "@/lib/mic-icon";
 import { downloadFile, isDownloadCancelled } from "@/lib/native-files";
 import { toast } from "@/lib/toast";
 import { Tick02Icon } from "@/lib/tick-icon";
+import { BrowserAgentMenuItem, BrowserAgentPill } from "@/features/browser/agent/composer-toggle";
 import {
   BranchNextIcon,
   BranchPrevIcon,
@@ -5471,6 +5472,7 @@ const Composer: FC<{
               ) : null}
               <WebSearchToggle />
               <CodeToolsToggle />
+              <BrowserAgentPill glyph={(icon) => <PillGlyph>{icon}</PillGlyph>} />
               <ImagesToggle />
               <KnowledgeBaseComposerButton side={effectiveMenuSide} />
               {mcpEnabledForChat ? (
@@ -7043,6 +7045,7 @@ const ComposerToolsMenu: FC<{
             />
           ) : null}
         </DropdownMenuItem>
+        <BrowserAgentMenuItem />
         {researchAvailable ? (
           <DropdownMenuItem
             disabled={researchDisabled && !deepResearchEnabled}
