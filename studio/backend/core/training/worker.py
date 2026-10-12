@@ -451,6 +451,13 @@ def _verify_config_pins(config: dict, event_queue: Any) -> bool:
     return True
 
 
+def _mlx_diffusion_lm_error(config: dict, model_load_target: str) -> str | None:
+    from utils.models.diffusion_lm import mlx_refusal
+    return mlx_refusal(
+        model_load_target, _worker_hf_token(config), revision = config.get("model_revision")
+    )
+
+
 def _validate_training_worker_config(config: dict, event_queue: Any) -> bool:
     if not _verify_config_pins(config, event_queue):
         return False
@@ -773,6 +780,19 @@ def _pre_detect_training_model(
         load_in_4bit = _pre_detect_load_in_4bit(config, model_load_name, hf_token),
     )
     _check_finetune_targets_after_detect(trainer, config)
+    _apply_diffusion_lm_overrides(trainer, config)
+
+
+def _apply_diffusion_lm_overrides(trainer, config: dict) -> None:
+    """Text-diffusion runs never pack: packed rows would share one bidirectional attention window. Set before
+    the row bound and online tokenization read the flag, so their accounting matches what trains."""
+    profile = getattr(trainer, "diffusion_lm_profile", None)
+    if not profile:
+        return
+    config["diffusion_lm_profile"] = profile
+    if config.get("packing"):
+        config["packing"] = False
+        logger.info("Text-diffusion model (%s): sequence packing turned off", profile)
 
 
 _NOTHING_TO_TRAIN = (
@@ -3763,6 +3783,12 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) -> 
 
     _hw.detect_hardware()
     if mlx_backend_requested or should_use_mlx_training_backend(device = _hw.DEVICE):
+        diffusion_error = _mlx_diffusion_lm_error(config, model_load_target)
+        if diffusion_error:
+            event_queue.put(
+                {"type": "error", "error": diffusion_error, "stack": "", "ts": time.time()}
+            )
+            return
         run_mlx_training_process(
             event_queue = event_queue,
             stop_queue = stop_queue,
@@ -4293,6 +4319,24 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) -> 
             }
         )
         return
+
+    if config.get("offload_layers"):
+        from utils.models.diffusion_lm import diffusion_lm_profile_for_model
+
+        # The diffusion load has no block swapping; off before the budget below sizes itself to offloading.
+        _diffusion = diffusion_lm_profile_for_model(
+            model_load_target, _worker_hf_token(config), revision = config.get("model_revision")
+        )
+        if _diffusion:
+            config["offload_layers"] = 0
+            event_queue.put(
+                {
+                    "type": "warning",
+                    "message": f"Layer offloading is not available for text-diffusion models ({_diffusion}); "
+                    "training without it.",
+                    "ts": time.time(),
+                }
+            )
 
     # Offload layers sizes "auto" to what the allocator may use, so a budget makes the run fit in it,
     # and two runs on one card can each take their share.
