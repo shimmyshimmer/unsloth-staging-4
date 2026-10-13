@@ -5,6 +5,7 @@ import { generationFailureLogsAction } from "@/features/settings/lib/view-logs-a
 import { readImageModel, rememberImageModel, matchesRememberedModel, componentFilesMatch, type RememberedImageModel } from "./image-model-recall";
 import { componentFileFields, splitComponentFileList } from "./component-files";
 import {
+  type DragEvent,
   type ReactNode,
   type SetStateAction,
   useCallback,
@@ -32,6 +33,11 @@ import { MediaViewer } from "@/components/media-viewer";
 import { shortPrompt } from "@/lib/prompt-text";
 
 import { ImageDropzone } from "@/components/image-dropzone";
+import {
+  readNativeAttachmentFile,
+  registerNativeAttachmentPath,
+  useNativeDropTarget,
+} from "@/features/native-intents";
 import { GuidedTour, useGuidedTourController } from "@/features/tour";
 import { buildImagesTourSteps } from "./tour";
 import { Button } from "@/components/ui/button";
@@ -39,6 +45,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
@@ -262,6 +269,17 @@ import {
   shouldReportGenerateError,
   stopButtonLabel,
 } from "./lib/generation-stop";
+import { drawInfoStamp, infoStampText } from "./lib/info-stamp";
+import {
+  copyPngTextChunks,
+  importedRecipe,
+  pngRecipe,
+  readEmbeddedRecipe,
+  recipeSettings,
+  withJpegExif,
+  withWebpExif,
+} from "./lib/image-metadata";
+import { useLibrarySettingsStore } from "@/features/library/settings-store";
 import {
   ALLOW_OVERSIZED_HINT,
   ALLOW_OVERSIZED_LABEL,
@@ -507,11 +525,14 @@ function exportFilename(image: GalleryImage, format: ImageExportFormat = "png"):
   return `Unsloth_${stamp}_${image.seed}${suffix}.${ext}`;
 }
 
-// PNG saves the stored bytes verbatim, keeping the embedded recipe; JPEG / WebP re-encode
-// client-side, JPEG flattened onto white.
-async function reencodeImage(
+// Re-encoded client-side (JPEG flattened onto white), with the info stamp when it is on. Every
+// format carries the stored recipe: PNG keeps its text chunks, JPEG / WebP get it as EXIF.
+async function encodeExport(
   src: string,
-  format: Exclude<ImageExportFormat, "png">,
+  original: Uint8Array,
+  image: GalleryImage,
+  format: ImageExportFormat,
+  stamp: boolean,
 ): Promise<Blob> {
   const el = new Image();
   el.decoding = "async";
@@ -529,6 +550,9 @@ async function reencodeImage(
     ctx.fillRect(0, 0, canvas.width, canvas.height);
   }
   ctx.drawImage(el, 0, 0);
+  if (stamp) {
+    drawInfoStamp(ctx, canvas.width, canvas.height, infoStampText(image));
+  }
   const blob = await new Promise<Blob | null>((resolve) =>
     canvas.toBlob(resolve, `image/${format}`, 0.95),
   );
@@ -540,39 +564,55 @@ async function reencodeImage(
     // failed conversion and use a matching .png name.
     throw new Error(`${format} encoding is unavailable`);
   }
-  return blob;
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const recipe = pngRecipe(original);
+  const out =
+    format === "png"
+      ? copyPngTextChunks(original, bytes)
+      : format === "jpeg"
+        ? withJpegExif(bytes, recipe)
+        : withWebpExif(bytes, recipe, canvas.width, canvas.height);
+  return new Blob([out], { type: `image/${format}` });
 }
 
 async function downloadImage(
-  src: string,
   image: GalleryImage,
   format: ImageExportFormat = "png",
+  src?: string,
 ) {
-  let outputFormat = format;
-  let outputBlob: Blob | null = null;
-
-  if (format !== "png") {
-    try {
-      outputBlob = await reencodeImage(src, format);
-    } catch {
-      // Conversion failed, so preserve the original PNG instead.
-      outputFormat = "png";
-      outputBlob = null;
-    }
-  }
-
-  const filename = exportFilename(image, outputFormat);
+  const stamp = useLibrarySettingsStore.getState().imageInfoStamp;
+  let ownedUrl: string | null = null;
   try {
-    if (outputBlob) {
-      await downloadFile(outputBlob, filename, outputBlob.type);
-    } else if (isTauri) {
-      // WebKit can display the cached object URL but fail to fetch it again, so re-fetch the
-      // authenticated original for the native save.
-      const originalBlob = await fetchGalleryBlob(image.url);
-      await downloadFile(originalBlob, filename, originalBlob.type);
+    let output: Blob;
+    let outputFormat = format;
+    if (format === "png" && !stamp) {
+      // The stored bytes verbatim. WebKit can display the cached object URL but fail to fetch it
+      // again, so the native save re-fetches the authenticated original.
+      if (src && !isTauri) {
+        const filename = exportFilename(image, "png");
+        await downloadUrl(src, filename);
+        return;
+      }
+      output = await fetchGalleryBlob(image.url);
     } else {
-      await downloadUrl(src, filename);
+      const original = await fetchGalleryBlob(image.url);
+      const source = src ?? (ownedUrl = URL.createObjectURL(original));
+      try {
+        output = await encodeExport(
+          source,
+          new Uint8Array(await original.arrayBuffer()),
+          image,
+          format,
+          stamp,
+        );
+      } catch {
+        // Conversion failed, so preserve the original PNG instead.
+        outputFormat = "png";
+        output = original;
+      }
     }
+    const filename = exportFilename(image, outputFormat);
+    await downloadFile(output, filename, output.type || "image/png");
     if (isTauri) {
       toast.success("Image saved", { description: filename });
     }
@@ -583,6 +623,10 @@ async function downloadImage(
     toast.error("Could not save image", {
       description: error instanceof Error ? error.message : undefined,
     });
+  } finally {
+    if (ownedUrl) {
+      URL.revokeObjectURL(ownedUrl);
+    }
   }
 }
 
@@ -1429,6 +1473,7 @@ export function ImagesPage({
 }) {
   const t = useT();
   const initialReadySent = useRef(false);
+  const imageInfoStamp = useLibrarySettingsStore((state) => state.imageInfoStamp);
   const [rememberedModel, setRememberedModel] = useState(readImageModel);
   const pendingRecalledGeneration = useRef<{ model: RememberedImageModel; load: number; workflow: WorkflowId; allowOversized?: boolean } | null>(null);
   const { isMobile, pinned } = useSidebar();
@@ -2393,24 +2438,8 @@ export function ImagesPage({
     },
     [resyncWindow, loadGallery],
   );
-  // One-click download of the original PNG.
   const handleQuickDownload = useCallback(
-    async (image: GalleryImage) => {
-      const src = srcById[image.id];
-      if (src) {
-        await downloadImage(src, image, "png");
-        return;
-      }
-      try {
-        const blob = await fetchGalleryBlob(image.url);
-        await downloadFile(blob, exportFilename(image, "png"), blob.type);
-      } catch (error) {
-        if (isDownloadCancelled(error)) return;
-        toast.error("Could not save image", {
-          description: error instanceof Error ? error.message : undefined,
-        });
-      }
-    },
+    (image: GalleryImage) => downloadImage(image, "png", srcById[image.id]),
     [srcById],
   );
   const stripReorder = useStripReorder((id, afterId) => void handleMove(id, afterId));
@@ -2519,6 +2548,88 @@ export function ImagesPage({
       toast.success("Settings restored to inputs", rescaled);
     }
   }, [setPromptFor, setWorkflow, sizeLimits]);
+
+  // Like dropping an image on ComfyUI: restore the settings a file carries. Unsloth's own recipe
+  // comes first; an AUTOMATIC1111-style parameters block is the fallback.
+  const importFileRef = useRef<HTMLInputElement>(null);
+  const importSettingsFromFile = useCallback(
+    async (file: File | Uint8Array) => {
+      let recipe = null;
+      try {
+        const bytes = file instanceof Uint8Array ? file : new Uint8Array(await file.arrayBuffer());
+        recipe = importedRecipe(readEmbeddedRecipe(bytes));
+      } catch {
+        recipe = null;
+      }
+      if (!recipe) {
+        toast.error("No generation settings found in this image", {
+          description: "Images saved by Unsloth, ComfyUI, or tools that write a parameters block can be loaded.",
+        });
+        return;
+      }
+      const settings = recipeSettings(recipe, { width, height, steps, guidance });
+      const localized = settings.localized_edit;
+      restoreSettings({
+        ...settings,
+        id: "",
+        url: "",
+        seed: settings.seed ?? 0,
+        batch_index: 0,
+        created_at: 0,
+        localized_edit:
+          localized === "annotate" || localized === "paint" || localized === "mask" ? localized : null,
+      });
+      if (settings.seed === null) setSeed("");
+      const loaded = status?.display_repo_id ?? status?.repo_id ?? null;
+      if (settings.model && settings.model !== loaded) {
+        toast(`Made with ${settings.model}`, {
+          description: "Load that model to reproduce this image.",
+        });
+      }
+    },
+    [restoreSettings, width, height, steps, guidance, status],
+  );
+  // Desktop: Tauri delivers OS drops as paths and suppresses the DOM drop event.
+  const importNativePath = useCallback(
+    async (path: string | undefined) => {
+      if (!path) return;
+      if (!["png", "jpg", "jpeg", "webp"].includes(path.split(".").pop()?.toLowerCase() ?? "")) {
+        toast.error("Drop a PNG, JPEG or WebP image to load its settings");
+        return;
+      }
+      try {
+        const intent = await registerNativeAttachmentPath(path);
+        const file = await readNativeAttachmentFile(intent.path.token);
+        await importSettingsFromFile(Uint8Array.from(atob(file.base64), (c) => c.charCodeAt(0)));
+      } catch (error) {
+        toast.error("Could not read the image", {
+          description: error instanceof Error ? error.message : String(error),
+        });
+      }
+    },
+    [importSettingsFromFile],
+  );
+  const previewDropRef = useNativeDropTarget({ onDrop: (paths) => void importNativePath(paths[0]) });
+  const onImportDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
+    if (event.dataTransfer.types.includes("Files")) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+    }
+  }, []);
+  const onImportDrop = useCallback(
+    (event: DragEvent<HTMLDivElement>) => {
+      if (!event.dataTransfer.types.includes("Files")) return;
+      // Claimed even for a file this cannot read, or the browser navigates away to it.
+      event.preventDefault();
+      const file = Array.from(event.dataTransfer.files).find((f) => f.type.startsWith("image/"));
+      if (file) {
+        void importSettingsFromFile(file);
+      } else {
+        toast.error("Drop a PNG, JPEG or WebP image to load its settings");
+      }
+    },
+    [importSettingsFromFile],
+  );
 
   // A locked ratio keeps the paired dimension in step; "custom" frees both, Flip swaps W/H. ratioHW is h/w for [a,b].
   const ratioHW = (a: number, b: number) => (portrait ? a / b : b / a);
@@ -5040,6 +5151,7 @@ export function ImagesPage({
                   onSelect={imagePresets.selectPreset}
                   onSave={imagePresets.savePreset}
                   onDelete={imagePresets.deletePreset}
+                  onImportFromImage={() => importFileRef.current?.click()}
                 />
               )}
             </div>
@@ -5718,9 +5830,24 @@ export function ImagesPage({
         </div>
 
         <div
+          ref={previewDropRef}
           data-tour="images-preview"
           className="relative flex min-h-[60dvh] min-w-0 flex-1 flex-col overflow-hidden @[50rem]:min-h-0"
+          onDragOver={onImportDragOver}
+          onDrop={onImportDrop}
         >
+          <input
+            ref={importFileRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            className="hidden"
+            data-testid="images-import-settings-input"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.target.value = "";
+              if (file) void importSettingsFromFile(file);
+            }}
+          />
           {viewerImage && viewerSrc && (
             <MediaViewer
               open={true}
@@ -5814,19 +5941,27 @@ export function ImagesPage({
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
                       <DropdownMenuItem
-                        onClick={() => void downloadImage(selectedSrc, selected, "png")}
+                        onClick={() => void downloadImage(selected, "png", selectedSrc)}
                       >
-                        PNG (original, keeps recipe)
+                        PNG (lossless)
                       </DropdownMenuItem>
                       <DropdownMenuItem
-                        onClick={() => void downloadImage(selectedSrc, selected, "jpeg")}
+                        onClick={() => void downloadImage(selected, "jpeg", selectedSrc)}
                       >
                         JPEG (smaller)
                       </DropdownMenuItem>
                       <DropdownMenuItem
-                        onClick={() => void downloadImage(selectedSrc, selected, "webp")}
+                        onClick={() => void downloadImage(selected, "webp", selectedSrc)}
                       >
                         WebP
+                      </DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        onClick={() => useSettingsDialogStore.getState().openDialog("library")}
+                        className="justify-between gap-4 text-muted-foreground"
+                      >
+                        Info stamp
+                        <span className="text-xs">{imageInfoStamp ? "On" : "Off"}</span>
                       </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
