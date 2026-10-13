@@ -170,6 +170,36 @@ def transcribe_window(
     return (text[0] if text else ""), consumed
 
 
+class _MlxSttModel:
+    def __init__(self, model) -> None:
+        self.model = model
+
+
+def load_mlx_stt(
+    snapshot_path: str,
+    device: str,
+    cancel_event = None,
+) -> _MlxSttModel:
+    import mlx.core as mx
+    from mlx_audio.stt import load
+
+    if device == "cpu":
+        mx.set_default_device(mx.cpu)
+    model = load(str(snapshot_path))
+    _raise_if_cancelled(cancel_event)
+    return _MlxSttModel(model)
+
+
+def transcribe_mlx_window(engine: _MlxSttModel, pcm: bytes) -> tuple:
+    # Language is left to the model, as Qwen3-ASR does on the llama.cpp engine.
+    import numpy as np
+
+    segment = np.frombuffer(pcm, dtype = np.float32)
+    result = engine.model.generate(segment)
+    text = getattr(result, "text", result)
+    return (text if isinstance(text, str) else ""), len(segment)
+
+
 def _complete_segment_indices(tokens: list, generation_config) -> tuple:
     # whisper's long-form seek decodes a segment cut off by the window again from the next window
     timestamp_begin = generation_config.no_timestamps_token_id + 1
@@ -271,7 +301,18 @@ def run_stt_worker(
             continue
         kind = command.get("type")
         try:
-            if kind == "load":
+            if kind == "load" and command.get("runtime") == "mlx":
+                engine = load_mlx_stt(command["snapshot_path"], command["device"], cancel_event)
+                _send(
+                    resp_queue,
+                    {
+                        "type": "loaded",
+                        "device": command["device"],
+                        "is_multilingual": None,
+                        "supports_timestamps": False,
+                    },
+                )
+            elif kind == "load":
                 model, processor = load_whisper(
                     command["snapshot_path"],
                     command["device"],
@@ -297,13 +338,16 @@ def run_stt_worker(
                 if engine is None:
                     raise SttWorkerError("The dictation worker has no model loaded.")
                 cancellable = bool(command.get("cancellable"))
-                text, consumed = transcribe_window(
-                    engine[0],
-                    engine[1],
-                    command["audio"],
-                    command.get("generate_kwargs") or {},
-                    cancel_event if cancellable else None,
-                )
+                if isinstance(engine, _MlxSttModel):
+                    text, consumed = transcribe_mlx_window(engine, command["audio"])
+                else:
+                    text, consumed = transcribe_window(
+                        engine[0],
+                        engine[1],
+                        command["audio"],
+                        command.get("generate_kwargs") or {},
+                        cancel_event if cancellable else None,
+                    )
                 if cancellable and cancel_event.is_set():
                     from core.inference.stt_sidecar import SttTranscriptionCancelledError
                     raise SttTranscriptionCancelledError("Transcription cancelled.")
@@ -369,6 +413,7 @@ class WhisperWorker:
         device: str,
         dtype_name: str,
         cancel_event: Optional[threading.Event] = None,
+        runtime: Optional[str] = None,
     ) -> None:
         """Spawn the child and load the model, or raise having killed it."""
         from utils.hf_cache_settings import child_environment_for_spawn, get_hf_cache_paths
@@ -444,14 +489,15 @@ class WhisperWorker:
             "STT worker started (pid=%s) for %s on %s", _spawned_proc.pid, snapshot_path, device
         )
         try:
-            self._send(
-                {
-                    "type": "load",
-                    "snapshot_path": str(snapshot_path),
-                    "device": device,
-                    "dtype": dtype_name,
-                }
-            )
+            load_command = {
+                "type": "load",
+                "snapshot_path": str(snapshot_path),
+                "device": device,
+                "dtype": dtype_name,
+            }
+            if runtime is not None:
+                load_command["runtime"] = runtime
+            self._send(load_command)
             response = self._await("loaded", _LOAD_TIMEOUT_SECONDS, cancel_event, "load")
         except BaseException as exc:
             # Classify before close(), which reaps the child and drops the handle.
