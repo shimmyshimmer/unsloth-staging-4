@@ -13,8 +13,19 @@ import {
 } from "../utils/conversation-markdown";
 import { allRecordedSandboxSessionIds } from "../utils/recorded-sandbox-session";
 import { liveThreadBranch } from "../utils/live-thread-head";
-import { forkChatThread } from "../api/chat-api";
-import { settleThreadScopedSettingsForCopy } from "../stores/chat-runtime-store";
+import {
+  forkChatThread,
+  getInferenceStatus,
+  streamChatCompletions,
+  updateChatThread,
+} from "../api/chat-api";
+import { parseExternalModelId } from "../external-providers";
+import { disposableTimeoutSignal } from "../../hub/lib/abort-signals";
+import { normalizeModelIdentity } from "../../hub/lib/model-identity";
+import {
+  settleThreadScopedSettingsForCopy,
+  useChatRuntimeStore,
+} from "../stores/chat-runtime-store";
 import type { SidebarItem } from "../hooks/use-chat-sidebar-items";
 import {
   exportConversationCsv,
@@ -23,7 +34,21 @@ import {
   exportConversationRawJsonl,
   exportConversationShareGPT,
 } from "../prompt-storage/prompt-storage-dialog";
-import { listStoredChatMessages } from "../utils/chat-history-storage";
+import {
+  getStoredChatThread,
+  listStoredChatMessages,
+  listStoredChatThreads,
+} from "../utils/chat-history-storage";
+import { savedBranchHead } from "../utils/branch-head";
+import { orderByParentChain } from "../utils/message-order";
+import {
+  answeringCheckpoint,
+  buildTitleRefreshRequest,
+  heuristicChatTitle,
+  titleCheckpoint,
+  titleFromStream,
+  titleRefreshExcerpt,
+} from "../utils/chat-title";
 
 export type ConversationExportFormat =
   | "raw-jsonl"
@@ -108,6 +133,155 @@ function forkRefused(): Error {
     new Error("This chat is still generating. Fork it once it finishes."),
     { unslothForkRefused: true },
   );
+}
+
+export type RegenerateTitleOutcome =
+  | "renamed"
+  | "unchanged"
+  | "empty"
+  | "busy"
+  | "failed";
+
+const regeneratingTitles = new Set<string>();
+// Past this, the title is picked from the messages instead.
+const TITLE_MODEL_WAIT_MS = 15_000;
+// A stalled status check would otherwise hold the loading toast and the busy mark for good.
+const TITLE_STATUS_WAIT_MS = 5_000;
+// Past the model's wait and the status check, with room for the reads and the write.
+const TITLE_REGENERATE_DEADLINE_MS = 30_000;
+
+async function titleFromModel(checkpoint: string, excerpt: string): Promise<string | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TITLE_MODEL_WAIT_MS);
+  // The wait covers building the request too: a stored provider key is encrypted through the backend first.
+  const timedOut = new Promise<never>((_, reject) => {
+    controller.signal.addEventListener("abort", () => reject(new Error("title request timed out")), { once: true });
+  });
+  timedOut.catch(() => undefined);
+  try {
+    const request = await Promise.race([buildTitleRefreshRequest(checkpoint, excerpt), timedOut]);
+    if (!request) return null;
+    return await Promise.race([titleFromStream(streamChatCompletions(request, controller.signal)), timedOut]);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** A local model is asked only while it is serving: a request naming an idle-unloaded one makes the
+ *  backend load it again, multi-GB for a few words. */
+async function titleModelServing(checkpoint: string): Promise<boolean> {
+  if (parseExternalModelId(checkpoint) !== null) return true;
+  // The helper, not AbortSignal.timeout: WebKitGTK before 2.38 has none.
+  const wait = disposableTimeoutSignal(TITLE_STATUS_WAIT_MS);
+  try {
+    // Scoped to the slot serving it, which need not be the primary one.
+    // Raced, not only signalled: a 401 first awaits a token refresh that takes no signal.
+    const timedOut = new Promise<never>((_, reject) => {
+      wait.signal.addEventListener("abort", () => reject(new Error("status check timed out")), { once: true });
+    });
+    timedOut.catch(() => undefined);
+    const status = await Promise.race([getInferenceStatus(wait.signal, checkpoint), timedOut]);
+    if (!status.active_model || status.is_audio || status.is_diffusion) return false;
+    const want = normalizeModelIdentity(checkpoint);
+    return [status.model_identifier, status.active_model, ...(status.serving_checkpoints ?? [])].some(
+      (id) => !!id && (id === checkpoint || normalizeModelIdentity(id) === want),
+    );
+  } catch {
+    return false;
+  } finally {
+    wait.dispose();
+  }
+}
+
+/** Asks the connection that answered when it is external; a locally answered chat asks the selected
+ *  local model, and only while it is serving, so its messages never reach a provider they were not
+ *  sent to. Else the title is picked from the messages. A comparison's panes share user turns, so one
+ *  is read. */
+export async function regenerateChatTitle(
+  item: SidebarItem,
+): Promise<RegenerateTitleOutcome> {
+  if (regeneratingTitles.has(item.id)) return "busy";
+  regeneratingTitles.add(item.id);
+  // One deadline over every step (history reads, token refresh, status, model): whichever stalls,
+  // the busy mark and the loading toast are released.
+  // Past the deadline the run may still finish, so it must not write: a retry may already own the chat.
+  const run = { expired: false };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<RegenerateTitleOutcome>((resolve) => {
+    timer = setTimeout(() => {
+      run.expired = true;
+      resolve("failed");
+    }, TITLE_REGENERATE_DEADLINE_MS);
+  });
+  try {
+    return await Promise.race([regenerateChatTitleNow(item, run), deadline]);
+  } finally {
+    clearTimeout(timer);
+    regeneratingTitles.delete(item.id);
+  }
+}
+
+async function regenerateChatTitleNow(
+  item: SidebarItem,
+  run: { expired: boolean },
+): Promise<RegenerateTitleOutcome> {
+  try {
+    const threadId = getSidebarItemThreadIds(item)[0];
+    const liveBranch = liveThreadBranch(threadId);
+    const { params, modelLoading } = useChatRuntimeStore.getState();
+    const selected = !modelLoading ? params.checkpoint : "";
+    // A comparison's panes can carry different titles (a restored backup keeps each), so each
+    // pane is guarded with its own.
+    const [startTitle, raw, panes] = await Promise.all([
+      getStoredChatThread(threadId).then((thread) => thread?.title),
+      listStoredChatMessages(threadId),
+      item.type === "single"
+        ? Promise.resolve(null)
+        : listStoredChatThreads({ pairId: item.id, includeArchived: true }),
+    ]);
+    // The branch on screen, else the one reopening the chat shows, as the exports read it.
+    const storedIds = new Set(raw.map((m) => m.id));
+    const headId = liveBranch?.length
+      ? ([...liveBranch].reverse().find((id) => storedIds.has(id)) ?? null)
+      : savedBranchHead(threadId, raw);
+    const branch = raw.some((m) => m.parentId != null)
+      ? orderByParentChain(raw, { includeSiblings: false, headId })
+      : raw;
+    const excerpt = titleRefreshExcerpt(branch);
+    if (!excerpt) return "empty";
+    // Only a branch that ends in a stamped answer names a recipient: an unstamped one (stopped,
+    // interrupted) or a trailing user turn (its answer deleted) must not fall back to an older
+    // answer's provider, which never saw the later turns.
+    const lastMessage = branch.at(-1);
+    const answeredWith =
+      lastMessage?.role === "assistant" ? answeringCheckpoint(lastMessage.metadata?.custom) : "";
+    const checkpoint = titleCheckpoint(answeredWith, selected);
+    const serving = checkpoint ? await titleModelServing(checkpoint) : false;
+    const title =
+      (serving ? await titleFromModel(checkpoint, excerpt) : null) ?? heuristicChatTitle(branch);
+    if (!title) return "empty";
+    // Every pane already has it: a comparison's panes can differ, so the first one alone can't say.
+    if (panes ? panes.every((pane) => pane.title === title) : title === startTitle) return "unchanged";
+    if (run.expired) return "failed";
+    const targets = panes
+      ? [...new Map(panes.map((pane) => [pane.id, pane.title])).entries()]
+      : [[threadId, startTitle] as const];
+    try {
+      // Guarded: a rename that lands while the title is generated wins (409).
+      await Promise.all(
+        targets.map(([id, before]) =>
+          updateChatThread(id, { title }, { expectedTitle: before, preserveTitleModifiedAt: true }),
+        ),
+      );
+    } catch {
+      return (await getStoredChatThread(threadId))?.title !== startTitle ? "unchanged" : "failed";
+    }
+    return "renamed";
+  } catch {
+    return "failed";
+  }
 }
 
 /** The sandbox sessions this chat's stored tool results name, if any. */
