@@ -841,6 +841,7 @@ export interface OpenAIChatChunk {
     latest_turn_role?: string;
     // prompt share of context_length after the reply reserve, calculated by the fit
     prompt_target?: number;
+    reason?: string;
   };
 }
 

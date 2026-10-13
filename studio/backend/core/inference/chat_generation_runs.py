@@ -399,6 +399,40 @@ _ADMISSION_WAIT_MARKER = ": admission-wait"
 # Leaving the queue. Renewed unconditionally: wait renewals are rate limited, and the lease equals the first-token
 # timeout, so any age carried in is negative margin.
 _ADMISSION_DONE_MARKER = ": admission-done"
+# The pause comments, same origin. `_SSEDecoder` keeps data lines only, so a durable follower
+# never sees them and a paused chat simply stopped and restarted minutes later.
+_PREEMPT_PAUSED_MARKER = ": preempt-paused"
+_PREEMPT_RESUMED_MARKER = ": preempt-resumed"
+_PREEMPT_KEEPALIVE_MARKER = ": preempt-keepalive"
+
+
+_ADMISSION_STATUS_BY_MARKER = {
+    _ADMISSION_WAIT_MARKER: "waiting",
+    _ADMISSION_DONE_MARKER: "admitted",
+    _PREEMPT_PAUSED_MARKER: "paused",
+    _PREEMPT_RESUMED_MARKER: "resumed",
+}
+
+
+def _admission_status_chunks(text: str, last: list | None = None) -> list[dict]:
+    """The queue, pause and resume comments in one piece of the upstream stream, as chunks a
+    durable follower renders the way the legacy stream renders the comments.
+
+    ``last`` holds the status relayed before and is updated: the wait comment repeats every
+    keepalive while queued, and only a change is worth an event."""
+    chunks: list[dict] = []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        status = _ADMISSION_STATUS_BY_MARKER.get(line.strip())
+        if status is None:
+            continue
+        if last is not None:
+            if last and last[0] == status:
+                continue
+            last[:] = [status]
+        chunks.append({"_admissionStatus": status})
+    return chunks
+
+
 # A server-side tool still running. Rate limited like the wait marker.
 _TOOL_HEARTBEAT_MARKER = ": tool-heartbeat"
 # Prefill advancing while prompt_progress is dropped; renews the lease like the tool heartbeat.
@@ -780,6 +814,7 @@ class ChatGenerationSupervisor:
                 raise RuntimeError("Local generation did not return an event stream")
             decoder = _SSEDecoder()
             last_keepalive = time.monotonic()
+            last_status: list = []
             next_raw_task = asyncio.create_task(iterator.__anext__())
             while True:
                 timeout = (
@@ -812,6 +847,7 @@ class ChatGenerationSupervisor:
                     await self._try_touch_progress(run_id)
                 elif (
                     _ADMISSION_WAIT_MARKER in text
+                    or _PREEMPT_KEEPALIVE_MARKER in text
                     or _TOOL_HEARTBEAT_MARKER in text
                     or _PREFILL_PROGRESS_MARKER in text
                 ):
@@ -819,6 +855,15 @@ class ChatGenerationSupervisor:
                     if now_s - last_keepalive >= _renew_interval_seconds():
                         last_keepalive = now_s
                         await self._try_touch_progress(run_id)
+                status_chunks = _admission_status_chunks(text, last_status)
+                if status_chunks:
+                    now_ms = db.now_ms()
+                    pending.extend(("chunk", chunk, now_ms) for chunk in status_chunks)
+                    await asyncio.to_thread(db.append_events, run_id, worker_token, pending)
+                    pending = []
+                    last_flush = time.monotonic()
+                    last_keepalive = last_flush
+                    await self._try_touch_progress(run_id)
                 for encoded in decoder.feed(text):
                     if encoded == "[DONE]":
                         saw_done = True
