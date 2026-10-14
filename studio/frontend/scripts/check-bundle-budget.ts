@@ -92,10 +92,17 @@ export const BUDGET = {
   // +806 B raw / +311 B transfer: its training field and strings); the maximized window layout fix in the
   // app provider (#13647) 539 B raw, the + menu reorder (#13679, measured together with #13659) 711 B raw,
   // and #13703 / #13700 the last 61 B. Raised by that growth so main's margin stays where it was.
-  // The chat menu's Compact conversation item adds 1.6 KB raw / 0.3 KB transfer to the eager chat chunk
-  // (6,741,807 -> 6,743,381 B raw, 2,021,316 -> 2,021,655 B transfer against 2a03c22812), raised by that.
-  transferBytes: 2_027_652,
-  rawBytes: 6_746_927,
+  // The paused and queued chat states (admission status, the paused continuation reason) add 2.3 KB
+  // raw / 1.0 KB transfer to the eager chat chunk (6,570.6 -> 6,572.9 KB raw, 1,975.5 -> 1,976.5 KB
+  // transfer against b8d76e169, one machine and build). They render on the first chat screen, so
+  // raised by that.
+  // The exact concurrency setting, its chat chip and their strings in every eager locale add 4.5 KB
+  // raw / 1.2 KB transfer to the eager settings and chat chunks (6,572.9 -> 6,577.4 KB raw,
+  // 1,976.5 -> 1,977.7 KB transfer against bfab55021, one machine and build), raised by that.
+  // Together they measure 7,058 B raw / 2,903 B transfer against c77695db2 (6,743,283 -> 6,750,341 B
+  // raw, 2,026,381 -> 2,029,284 B transfer, one machine and build).
+  transferBytes: 2_030_216,
+  rawBytes: 6_752_411,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
