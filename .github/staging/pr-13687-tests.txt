@@ -1,0 +1,4 @@
+studio/backend/tests/test_kernel_install.py
+studio/backend/tests/test_nudge_tool_calls_wiring.py
+studio/backend/tests/test_pdf_ocr_regressions.py
+studio/backend/tests/test_sandbox_files_and_storage_roots.py
