@@ -18,6 +18,9 @@ import {
   type CapabilityKey,
   detectBaseModel,
   detectCapabilities,
+  generationKinds,
+  HUB_CAPABILITY_FILTERS,
+  type HubCapabilityFilter,
 } from "./model-capabilities";
 export {
   detectResultFormat,
@@ -32,15 +35,17 @@ export {
 export { isGgufLike } from "./hf-model-meta";
 
 export const CAPABILITY_FILTER_OPTIONS: ReadonlyArray<{
-  value: CapabilityFilter;
+  value: HubCapabilityFilter;
   label: string;
 }> = [
-  { value: "all", label: "All capabilities" },
+  // Models with none of the others, so ticking every box lists every model.
+  { value: "text", label: "Text only" },
   { value: "reasoning", label: "Reasoning" },
   { value: "vision", label: "Vision" },
   { value: "audio", label: "Audio" },
   { value: "embedding", label: "Embeddings" },
-  { value: "diffusion", label: "Image/video gen" },
+  { value: "image-gen", label: "Image gen" },
+  { value: "video-gen", label: "Video gen" },
 ];
 
 export const FORMAT_FILTER_OPTIONS: ReadonlyArray<{
@@ -265,6 +270,30 @@ export function buildDiscoverRows(
       ),
     };
   });
+}
+
+/** One Hub filter pick against a row; image and video gen split the shared "diffusion" capability. */
+export function matchesHubCapability(
+  row: {
+    capabilities: Array<{ key: CapabilityKey }>;
+    result: Pick<HfModelResult, "tags" | "pipelineTag" | "id">;
+  },
+  key: HubCapabilityFilter,
+): boolean {
+  if (key === "text") {
+    return !HUB_CAPABILITY_FILTERS.some(
+      (other) => other !== "text" && matchesHubCapability(row, other),
+    );
+  }
+  if (key !== "image-gen" && key !== "video-gen")
+    return matchesCapability(row.capabilities, key);
+  if (!matchesCapability(row.capabilities, "diffusion")) return false;
+  const kinds = generationKinds(
+    row.result.tags,
+    row.result.pipelineTag,
+    row.result.id,
+  );
+  return key === "image-gen" ? kinds.image : kinds.video;
 }
 
 export function matchesCapability(

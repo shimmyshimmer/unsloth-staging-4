@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import {
@@ -14,6 +13,7 @@ import { useHubSource } from "@/lib/hf-endpoint";
 import { cn } from "@/lib/utils";
 import {
   AiChipIcon,
+  ArrowUpDownIcon,
   CancelCircleIcon,
   Database02Icon,
   Delete02Icon,
@@ -21,6 +21,7 @@ import {
   Search01Icon,
   SlidersHorizontalIcon,
   SparklesIcon,
+  Tick02Icon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { memo, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -30,18 +31,18 @@ import {
   removeRecentSearch,
   useRecentSearches,
 } from "../lib/recent-searches";
-import {
-  CAPABILITY_FILTER_OPTIONS,
-  FORMAT_FILTER_OPTIONS,
-} from "../lib/view-models";
+import { FORMAT_FILTER_OPTIONS } from "../lib/view-models";
 import type {
-  CapabilityFilter,
   ModelFormatFilter,
   ModelsTab,
   ResourceTypeFilter,
 } from "../types";
+import type { HubCapabilityFilter } from "../lib/model-capabilities";
 import { type HubOption, HubOptionMenu } from "./hub-option-menu";
-import type { ModelSearchFilters } from "../lib/model-search-filters";
+import type {
+  HubUploader,
+  ModelSearchFilters,
+} from "../lib/model-search-filters";
 import { ModelSearchFiltersControl } from "./model-search-filters";
 import { RecentSearches } from "./recent-searches";
 
@@ -72,8 +73,8 @@ export const ModelsToolbar = memo(function ModelsToolbar({
   onResourceTypeChange,
   formatFilter,
   onFormatFilterChange,
-  capabilityFilter,
-  onCapabilityFilterChange,
+  capabilityFilters,
+  onCapabilityFiltersChange,
   fitOnDeviceOnly,
   onFitOnDeviceOnlyChange,
   onManageLocalFolders,
@@ -82,9 +83,16 @@ export const ModelsToolbar = memo(function ModelsToolbar({
   npuAvailable = false,
   searchFilters,
   onSearchFiltersChange,
+  uploaders,
+  uploadersChanged,
+  onUploadersChange,
 }: {
   searchFilters: ModelSearchFilters;
   onSearchFiltersChange: (value: ModelSearchFilters) => void;
+  uploaders: readonly HubUploader[];
+  /** False while the default applies (Unsloth's uploads, or every uploader for a search). */
+  uploadersChanged: boolean;
+  onUploadersChange: (value: HubUploader[]) => void;
   tab: ModelsTab;
   onTabChange: (tab: ModelsTab) => void;
   query: string;
@@ -96,8 +104,9 @@ export const ModelsToolbar = memo(function ModelsToolbar({
   onResourceTypeChange: (value: ResourceTypeFilter) => void;
   formatFilter: ModelFormatFilter;
   onFormatFilterChange: (value: ModelFormatFilter) => void;
-  capabilityFilter: CapabilityFilter;
-  onCapabilityFilterChange: (value: CapabilityFilter) => void;
+  /** None picked means every capability. */
+  capabilityFilters: HubCapabilityFilter[];
+  onCapabilityFiltersChange: (value: HubCapabilityFilter[]) => void;
   /** Shared with the chat model selector: hide models over the device budget. */
   fitOnDeviceOnly: boolean;
   onFitOnDeviceOnlyChange: (value: boolean) => void;
@@ -214,15 +223,10 @@ export const ModelsToolbar = memo(function ModelsToolbar({
     }
     return options;
   }, [tab, npuAvailable]);
-  const capabilityOptions = useMemo<HubOption<CapabilityFilter>[]>(
-    () =>
-      CAPABILITY_FILTER_OPTIONS.map((option) => ({
-        value: option.value,
-        label: option.label,
-      })),
-    [],
-  );
   const hubSource = useHubSource();
+  const showCapabilities = isDiscover && !isDataset && !npuList;
+  // The size and publisher limits are Hub search parameters, so only where it runs.
+  const showModelFilters = showCapabilities && hubSource !== "modelscope";
   const sortOptions = useMemo<HubOption<HfSortKey>[]>(
     () =>
       SORT_OPTIONS.filter(
@@ -436,27 +440,9 @@ export const ModelsToolbar = memo(function ModelsToolbar({
               }
             }}
             ariaLabel="Format filter"
-            className={cn(triggerBase, "w-[calc(144px*var(--ui-space-scale,1))]")}
-          />
-        )}
-
-        {tab === "discover" && !isDataset && !npuList && (
-          <HubOptionMenu
-            value={capabilityFilter}
-            options={capabilityOptions}
-            onValueChange={onCapabilityFilterChange}
-            ariaLabel="Capability filter"
-            className={cn(triggerBase, "w-[calc(128px*var(--ui-space-scale,1))]")}
-          />
-        )}
-
-        {isDiscover && !isDataset && !npuList && hubSource !== "modelscope" && (
-          <ModelSearchFiltersControl
-            value={searchFilters}
-            onChange={onSearchFiltersChange}
             className={cn(
               triggerBase,
-              "relative inline-flex size-9 shrink-0 items-center justify-center rounded-full p-0",
+              "w-[calc(144px*var(--ui-space-scale,1))]",
             )}
           />
         )}
@@ -467,7 +453,23 @@ export const ModelsToolbar = memo(function ModelsToolbar({
             options={sortOptions}
             onValueChange={onSortChange}
             ariaLabel="Sort models"
-            className={cn(triggerBase, "w-[calc(128px*var(--ui-space-scale,1))]")}
+            className={cn(
+              triggerBase,
+              "w-[calc(128px*var(--ui-space-scale,1))]",
+            )}
+            triggerContent={
+              <span className="flex items-center gap-1">
+                <HugeiconsIcon
+                  icon={ArrowUpDownIcon}
+                  strokeWidth={1.75}
+                  className="size-3.5 shrink-0 text-foreground"
+                />
+                <span className="truncate">
+                  {sortOptions.find((option) => option.value === sortBy)
+                    ?.label ?? sortBy}
+                </span>
+              </span>
+            }
             footer={
               isDataset ? undefined : (
                 <Tooltip>
@@ -477,15 +479,18 @@ export const ModelsToolbar = memo(function ModelsToolbar({
                       role="checkbox"
                       aria-checked={fitOnDeviceOnly}
                       onClick={() => onFitOnDeviceOnlyChange(!fitOnDeviceOnly)}
-                      className="flex w-full cursor-pointer select-none items-center gap-2 rounded-[10px] px-3 py-2 text-left text-ui-12p5 text-muted-foreground transition-colors hover:text-foreground"
+                      className={cn(
+                        "hub-menu-row relative flex w-full cursor-pointer select-none items-center py-2 pr-9 pl-3 text-left text-sm",
+                      )}
                     >
-                      <Checkbox
-                        checked={fitOnDeviceOnly}
-                        tabIndex={-1}
-                        aria-hidden={true}
-                        className="pointer-events-none size-3.5 rounded-full [&_svg]:!size-2.5"
-                      />
                       Only show models that fit
+                      {fitOnDeviceOnly && (
+                        <HugeiconsIcon
+                          icon={Tick02Icon}
+                          strokeWidth={2}
+                          className="pointer-events-none absolute right-3 size-4"
+                        />
+                      )}
                     </button>
                   </TooltipTrigger>
                   <TooltipContent side="bottom">
@@ -495,6 +500,23 @@ export const ModelsToolbar = memo(function ModelsToolbar({
                 </Tooltip>
               )
             }
+          />
+        )}
+
+        {showCapabilities && (
+          <ModelSearchFiltersControl
+            value={searchFilters}
+            onChange={onSearchFiltersChange}
+            capabilities={capabilityFilters}
+            onCapabilitiesChange={onCapabilityFiltersChange}
+            uploaders={uploaders}
+            uploadersChanged={uploadersChanged}
+            onUploadersChange={onUploadersChange}
+            showModelFilters={showModelFilters}
+            className={cn(
+              triggerBase,
+              "relative inline-flex size-9 shrink-0 items-center justify-center rounded-full p-0",
+            )}
           />
         )}
 
