@@ -45,6 +45,9 @@ type BrowserAgentState = {
   setHistoryAccess: (access: HistoryAccess) => void;
   scriptAccess: ScriptAccess;
   setScriptAccess: (access: ScriptAccess) => void;
+  /** Draw a pointer in the page where the agent clicks, types and drags. */
+  showCursor: boolean;
+  setShowCursor: (show: boolean) => void;
   /** By chat key (browser store `chat`). */
   chats: Record<string, AgentChat>;
 };
@@ -69,6 +72,8 @@ export const useBrowserAgentStore = create<BrowserAgentState>()(
       setHistoryAccess: (historyAccess) => set({ historyAccess }),
       scriptAccess: "ask",
       setScriptAccess: (scriptAccess) => set({ scriptAccess }),
+      showCursor: true,
+      setShowCursor: (showCursor) => set({ showCursor }),
       chats: {},
     }),
     {
@@ -81,6 +86,7 @@ export const useBrowserAgentStore = create<BrowserAgentState>()(
         permissions: state.permissions,
         historyAccess: state.historyAccess,
         scriptAccess: state.scriptAccess,
+        showCursor: state.showCursor,
       }),
       // Checked on the way in: storage another build wrote must never read as "allow".
       merge: (persisted, current) => {
@@ -91,6 +97,7 @@ export const useBrowserAgentStore = create<BrowserAgentState>()(
           permissions: checkedPermissions(saved.permissions),
           historyAccess: saved.historyAccess === "allow" || saved.historyAccess === "never" ? saved.historyAccess : "ask",
           scriptAccess: saved.scriptAccess === "never" ? "never" : "ask",
+          showCursor: saved.showCursor !== false,
         };
       },
     },
