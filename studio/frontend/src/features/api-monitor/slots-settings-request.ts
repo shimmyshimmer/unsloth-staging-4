@@ -61,6 +61,7 @@ export function runSettingsRequest(
     requestId,
     id: resident.checkpoint,
     focus: "advanced",
+    standalone: true,
     meta: {
       source: "local",
       isLora: resident.isLora,
@@ -70,6 +71,27 @@ export function runSettingsRequest(
       nativePathExpiresAtMs: resident.nativePathExpiresAtMs,
       isGguf: resident.isGguf,
       isDiffusion: resident.isDiffusion,
+      isDownloaded: true,
+    },
+  };
+}
+
+/** Run settings for a model kept loaded beside the resident: what the picker's own row gear opens,
+ *  so Run saves its settings and reloads that model. */
+export function keptRunSettingsRequest(
+  model: { checkpoint: string; quant: string | null },
+  requestId: string,
+): ModelConfigHandoffRequest {
+  return {
+    requestId,
+    id: model.checkpoint,
+    focus: "advanced",
+    standalone: true,
+    meta: {
+      source: "local",
+      isLora: false,
+      ggufVariant: model.quant ?? undefined,
+      isGguf: model.quant != null,
       isDownloaded: true,
     },
   };
