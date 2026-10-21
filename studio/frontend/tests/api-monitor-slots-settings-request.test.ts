@@ -10,6 +10,7 @@ import { registerBundlerResolver } from "./helpers/kit.ts";
 registerBundlerResolver();
 
 const {
+  keptRunSettingsRequest,
   residentHasRunSettings,
   residentHasSlotsSetting,
   residentMatchesMonitor,
@@ -71,6 +72,7 @@ test("a GGUF resident opens its Run settings on Parallel Slots, as Chat's reload
     requestId: "req-1",
     id: "unsloth/Qwen3-4B-GGUF",
     focus: "parallelSlots",
+    standalone: true,
     meta: {
       source: "local",
       isLora: false,
@@ -134,4 +136,24 @@ test("the readout is offered only when the picker takes the target for the monit
     false,
   );
   assert.equal(residentMatchesMonitor(null, monitor), false);
+});
+
+test("a kept model's settings open on its own checkpoint and quant", () => {
+  const gguf = keptRunSettingsRequest(
+    { checkpoint: "unsloth/gemma-3-270m-it-GGUF", quant: "Q4_K_M" },
+    "kept",
+  );
+  assert.equal(gguf.id, "unsloth/gemma-3-270m-it-GGUF");
+  assert.equal(gguf.focus, "advanced");
+  assert.equal(gguf.meta.ggufVariant, "Q4_K_M");
+  assert.equal(gguf.meta.isGguf, true);
+  // Opened from the model's row, so Run settings has no list to go back to.
+  assert.equal(gguf.standalone, true);
+  assert.equal(runSettingsRequest(GGUF, "live")?.standalone, true);
+  const safetensors = keptRunSettingsRequest(
+    { checkpoint: "unsloth/Qwen3-0.6B", quant: null },
+    "kept",
+  );
+  assert.equal(safetensors.meta.ggufVariant, undefined);
+  assert.equal(safetensors.meta.isGguf, false);
 });
