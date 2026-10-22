@@ -45,6 +45,11 @@ _preview_swap_generation = 0
 # entry and rejects if a swap was in progress.
 _preview_swap_inflight = 0
 _last_active = time.monotonic()
+# _last_active minus scheduled runs and their swaps: one run must not make the next look attended.
+_last_attended = _last_active
+_unattended: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "keepwarm_unattended", default = False
+)
 # The (id, quant) idle-unload last freed, so an alias/unknown request that would otherwise 503 against an empty backend
 # can reload it (set on unload, cleared on reload). The quant lets the reload restore the exact freed variant.
 _last_unloaded_model = None
@@ -162,11 +167,18 @@ def _note_start(is_preview: bool = False) -> None:
             _preview_inflight += 1
 
 
+def _stamp_active() -> None:
+    global _last_active, _last_attended
+    _last_active = time.monotonic()
+    if not _unattended.get():
+        _last_attended = _last_active
+
+
 def _note_end(is_preview: bool = False) -> None:
-    global _inflight, _last_active, _preview_inflight
+    global _inflight, _preview_inflight
     with _lock:
         _inflight = max(0, _inflight - 1)
-        _last_active = time.monotonic()
+        _stamp_active()
         if is_preview:
             _preview_inflight = max(0, _preview_inflight - 1)
 
@@ -225,11 +237,39 @@ def _is_idle(ttl_seconds: float) -> bool:
         return _inflight == 0 and _pending == 0 and (time.monotonic() - _last_active) >= ttl_seconds
 
 
+def idle_for(seconds: float) -> bool:
+    """Nothing in flight or waiting, and nobody's inference request or model load for ``seconds``:
+    work that is nobody's request (a scheduled task) may swap the loaded model."""
+    with _lock:
+        return _inflight == 0 and _pending == 0 and (time.monotonic() - _last_attended) >= seconds
+
+
+def attended_stamp() -> float:
+    """Changes whenever someone's inference request ends or their model load lands."""
+    with _lock:
+        return _last_attended
+
+
+def inference_in_flight() -> bool:
+    with _lock:
+        return _inflight > 0 or _pending > 0
+
+
+@contextlib.contextmanager
+def unattended_activity():
+    """Mark the inference and loads made inside as Unsloth's own, for idle_for(). The mark follows
+    the context into to_thread() and the tasks created in it."""
+    token = _unattended.set(True)
+    try:
+        yield
+    finally:
+        _unattended.reset(token)
+
+
 def _note_activity() -> None:
     """Stamp activity, e.g. on a (re)load, so the model survives at least one TTL."""
-    global _last_active
     with _lock:
-        _last_active = time.monotonic()
+        _stamp_active()
 
 
 def other_inference_request_count(
@@ -470,6 +510,16 @@ def untrack_admitted_inference(scope) -> None:
     if not isinstance(scope, dict) or not scope.pop(_ADMITTED_SCOPE_KEY, False):
         return
     _note_admitted_end()
+
+
+def end_in_process_request(scope, answered: bool) -> None:
+    """For a request produced in-process (a scheduled task's run), what LlamaKeepWarmMiddleware does
+    when an HTTP one ends, as this one never passes through it: an answer from the local model
+    adopts it for Unsloth, and the admitted-inference count it took is given back, or preview
+    loads stay refused as busy. Idempotent."""
+    if answered and isinstance(scope, dict) and scope.get(_ADMITTED_SCOPE_KEY):
+        _claim_non_preview_slot()
+    untrack_admitted_inference(scope)
 
 
 def begin_preview_serializer_wait(scope) -> bool:
@@ -829,6 +879,18 @@ def _loaded_identity(backend):
     identity = (backend.model_identifier, getattr(backend, "hf_variant", None), advertised)
     companion_roots = tuple(getattr(backend, "_openai_gguf_companion_roots", ()) or ())
     return (*identity, companion_roots) if companion_roots else identity
+
+
+def loaded_identity():
+    """What a reload needs to bring back the loaded GGUF exactly (path, quant, the advertised id
+    its saved launch settings are keyed by), or None when none is loaded."""
+    from routes.inference import get_llama_cpp_backend
+    return _loaded_identity(get_llama_cpp_backend())
+
+
+def stash_for_reload(identity) -> None:
+    """Let the next reload-only request bring ``identity`` back, as after an idle unload."""
+    _set_last_unloaded(identity)
 
 
 def _note_idle_unload_event(freed, reason: str = "idle") -> None:

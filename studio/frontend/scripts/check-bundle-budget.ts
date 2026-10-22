@@ -387,8 +387,13 @@ export const BUDGET = {
   // at c5a9fe021: 6,912,687 B raw / 2,082,221 B transfer (Node 24, 97 chunks). Raised to that plus about 200 B.
   // The MLX PLE and expert offload controls (#14326): +7,406 B raw / +2,073 B transfer, plus about 500 B raw
   // (a CI build measured about 100 B over a local one). Raised by that.
-  transferBytes: 2_084_696,
-  rawBytes: 6_920_821,
+  // Scheduled tasks (#13871): the results poll that announces finished runs on any page with its per-account
+  // record and API client, the unseen-run dots, the scheduled-chat marks in Recents and over its prompt, the
+  // sidebar's new-task "+", the model-load question queue (the question itself is lazy) and the English strings;
+  // the Scheduled page and its dialog are lazy. Merged with main at 4e2838ec5f: 6,938,155 B raw / 2,089,748 B
+  // transfer (Node 26, 97 chunks). Raised to that build plus the same 160 B raw / 189 B transfer margin.
+  transferBytes: 2_089_937,
+  rawBytes: 6_938_315,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
