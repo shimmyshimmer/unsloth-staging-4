@@ -159,6 +159,13 @@ _WRITABLE_RUNTIME_SUBTREES = tuple(
 )
 
 
+# The user-storage mounts among those. A root Studio was configured with (a registered model folder,
+# the HF cache) can live on such a drive, and is still covered under it.
+_USER_STORAGE_MOUNTS = tuple(
+    os.path.normcase(part) for part in ("/run/media", "/run/mount", "/run/host")
+)
+
+
 # Pseudo-devices a command legitimately writes to (`2> /dev/null`); the rest of /dev is read-silent but not
 # write-silent.
 _WRITE_SILENT_DEVICE_NODES = (
@@ -491,6 +498,13 @@ def _contained_in(candidate: str, roots) -> bool:
     return any(candidate == root or candidate.startswith(root + os.sep) for root in roots)
 
 
+def _uncovered_runtime_subtree(path: str, roots) -> bool:
+    """*path* is in a writable runtime subtree that no silent root on user storage covers."""
+    return _contained_in(path, _WRITABLE_RUNTIME_SUBTREES) and not _contained_in(
+        path, tuple(root for root in roots if _contained_in(root, _USER_STORAGE_MOUNTS))
+    )
+
+
 def _resolved_fs_text(text: str) -> str:
     """*text* with its symlinked components resolved, folded the way the roots are."""
     try:
@@ -574,13 +588,13 @@ def _path_needs_approval(text, *, writing: bool = False) -> bool:
     # A writable subtree of an otherwise system root. `/dev/shm` and `/run/user/<uid>` are tmpfs the
     # user's own processes write into, so a read there is a read of somebody's data, not of the
     # machine's configuration. Checked before containment, so the enclosing root cannot cover them.
-    if any(
-        candidate == root or candidate.startswith(root + os.sep)
-        for root in _WRITABLE_RUNTIME_SUBTREES
-    ):
-        return True
+    # The one exception is a silent root that itself sits INSIDE /run/media, /run/mount or /run/host:
+    # a model folder registered on an external drive, or an HF cache moved there. Only such a root
+    # covers the candidate; `/run` itself never does, and the checks below still run.
     read_roots, write_roots = _silent_roots()
     roots = write_roots if writing else read_roots
+    if _uncovered_runtime_subtree(candidate, roots):
+        return True
     if not _contained_in(candidate, roots):
         return True
     # On a managed install the shared projects and tmp bases hold every account's own subtree, so a
@@ -594,10 +608,21 @@ def _path_needs_approval(text, *, writing: bool = False) -> bool:
     # allowed rather than on every token. A link planted between this and the open is not covered;
     # that TOCTOU gap is the OS sandbox's to close.
     resolved = _resolved_fs_text(candidate)
-    # Against the RESOLVED roots as well: a root that is itself a symlink (a sandbox under a
-    # macOS `/tmp`, `/dev/stdout`) would otherwise reject everything under it.
-    if resolved != candidate and not _contained_in(resolved, roots):
-        if not _contained_in(resolved, tuple(_resolved_fs_text(r) for r in roots)):
+    if resolved != candidate:
+        # Against the RESOLVED roots as well: a root that is itself a symlink (a sandbox under a
+        # macOS `/tmp`, `/dev/stdout`, `/models -> /run/media/...`) would otherwise reject everything under it.
+        if not _contained_in(resolved, roots) or _contained_in(
+            resolved, _WRITABLE_RUNTIME_SUBTREES
+        ):
+            roots = roots + tuple(_resolved_fs_text(r) for r in roots)
+        if not _contained_in(resolved, roots):
+            return True
+        # The same carve-out for the target: a link inside a silent root (a registered folder on a drive
+        # included) can point into /run/user or elsewhere on the drive, which the broad `/run` root holds.
+        if _uncovered_runtime_subtree(resolved, roots):
+            return True
+        # And the account segment: a link can hide `Accounts/<other>/...` behind an innocent name.
+        if _names_a_managed_account_subtree(resolved):
             return True
     # Inside a silent root, so only a credential underneath one still asks. Running the (superlinear) credential
     # scan only here, rather than on every operand, keeps the ordering guarantee at a fraction of the cost:
