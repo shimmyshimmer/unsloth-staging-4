@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import concurrent.futures
+import contextvars
 import hashlib
 import importlib
 import ipaddress
@@ -138,6 +139,141 @@ def _public_http_client_factory(**kwargs):
     if kwargs.get("timeout") is None:
         kwargs["timeout"] = http.Timeout(30.0, read = 300.0)
     return client_type(**kwargs)
+
+
+def _tool_http_client_factory(**kwargs):
+    """No read cap: _race_tool_call enforces each call's budget, which the SDK's 300s read timeout would cut short."""
+    if _managed_mcp_restricted():
+        client = _public_http_client_factory(**kwargs)
+    else:
+        from mcp.shared._httpx_utils import create_mcp_http_client
+        kwargs.pop("follow_redirects", None)  # create_mcp_http_client sets its own redirect policy
+        client = create_mcp_http_client(**kwargs)
+    t = client.timeout
+    client.timeout = type(t)(connect = t.connect, read = None, write = t.write, pool = t.pool)
+    tracker = _SESSION_POSTS.get()
+    if tracker is not None:
+        tracker.install(client)
+    return client
+
+
+class _PostSlot:
+    __slots__ = ("key", "token")
+
+    def __init__(self, key):
+        self.key, self.token = key, None
+
+
+class _PostTracker:
+    """POSTs open on a cached session's httpx client, each bound to the dispatch that sent it, so only a still-open
+    reply of an abandoned call counts against the session."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.open: set = set()
+        self.waiting: list = []  # dispatches whose POST is not sent yet, FIFO per (method, target)
+        self.abandoned: dict = {}  # open POST token -> when its call was abandoned
+        self.installed = False
+
+    def expect(self, key: Optional[tuple]) -> _PostSlot:
+        slot = _PostSlot(key)
+        if key is not None:
+            with self.lock:
+                self.waiting.append(slot)
+        return slot
+
+    def settle(self, slot: _PostSlot, abandoned: bool) -> None:
+        with self.lock:
+            if slot in self.waiting:
+                self.waiting.remove(slot)
+            if abandoned and slot.token in self.open:
+                self.abandoned[slot.token] = time.monotonic()
+
+    def pending(self) -> Optional[tuple]:
+        """(oldest abandonment time, count) of abandoned replies still open, else None."""
+        with self.lock:
+            if not self.abandoned:
+                return None
+            return min(self.abandoned.values()), len(self.abandoned)
+
+    def _sent(self, token, key) -> None:
+        with self.lock:
+            self.open.add(token)
+            for slot in self.waiting:
+                if slot.key == key:
+                    slot.token = token
+                    self.waiting.remove(slot)
+                    break
+
+    def _closed(self, token) -> None:
+        with self.lock:
+            self.open.discard(token)
+            self.abandoned.pop(token, None)
+
+    def install(self, client) -> None:
+        http = importlib.import_module(type(client).__module__.split(".")[0])
+        tracker = self
+
+        class Stream(http.AsyncByteStream):
+            def __init__(self, inner, token):
+                self.inner, self.token = inner, token
+
+            async def __aiter__(self):
+                async for chunk in self.inner:
+                    yield chunk
+
+            async def aclose(self):
+                try:
+                    await self.inner.aclose()
+                finally:
+                    tracker._closed(self.token)
+
+        class Transport(http.AsyncBaseTransport):
+            def __init__(self, inner):
+                self.inner = inner
+
+            async def handle_async_request(self, request):
+                if request.method != "POST":
+                    return await self.inner.handle_async_request(request)
+                token = object()
+                tracker._sent(token, _rpc_target(request))
+                try:
+                    response = await self.inner.handle_async_request(request)
+                except BaseException:
+                    tracker._closed(token)
+                    raise
+                response.stream = Stream(response.stream, token)
+                return response
+
+            async def aclose(self):
+                await self.inner.aclose()
+
+        # httpx has no public hook for a request ending without a response; unwrappable clients keep the deadline.
+        if not hasattr(client, "_transport") or not isinstance(
+            getattr(client, "_mounts", None), dict
+        ):
+            return
+        client._transport = Transport(client._transport)
+        client._mounts = {k: (v if v is None else Transport(v)) for k, v in client._mounts.items()}
+        self.installed = True
+
+
+def _rpc_target(request) -> Optional[tuple]:
+    """(JSON-RPC method, tool name or URI) of a request POST, else None."""
+    try:
+        msg = json.loads(request.content)
+        if "id" not in msg or "method" not in msg:
+            return None
+        params = msg.get("params") or {}
+        return msg["method"], params.get("name") or params.get("uri")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# Set by _McpSession.connect so _tool_http_client_factory can hook the client the SDK builds for that session.
+_SESSION_POSTS: contextvars.ContextVar[Optional[_PostTracker]] = contextvars.ContextVar(
+    "mcp_session_posts", default = None
+)
 
 
 def is_stdio(address: str) -> bool:
@@ -627,12 +763,16 @@ def _client(
     transport_cls = (
         SSETransport if infer_transport_type_from_url(url) == "sse" else StreamableHttpTransport
     )
-    kwargs = {}
-    if _managed_mcp_restricted():
-        kwargs["httpx_client_factory"] = _public_http_client_factory
-        if auth is not None:
-            auth.httpx_client_factory = _public_http_client_factory
-    return Client(transport_cls(url = url, headers = headers or None, auth = auth, **kwargs))
+    if _managed_mcp_restricted() and auth is not None:
+        auth.httpx_client_factory = _public_http_client_factory
+    return Client(
+        transport_cls(
+            url = url,
+            headers = headers or None,
+            auth = auth,
+            httpx_client_factory = _tool_http_client_factory,
+        )
+    )
 
 
 def oauth_client_kwargs(row: dict) -> dict:
@@ -652,6 +792,9 @@ _SESSION_CLOSE_TIMEOUT = 10.0
 _SESSION_WEDGE_MARGIN = 15.0
 _SESSION_LIVENESS_TIMEOUT = 5.0
 _CANCEL_UNWIND_TIMEOUT = 2.0
+# With no read cap, a still-open abandoned reply is bounded by retiring its session after the old cap or a pile-up.
+_ABANDONED_REPLY_TIMEOUT = 300.0
+_MAX_ABANDONED_REPLIES = 8
 # An HTTP session idle this long is re-proved with tools/list before the next dispatch: the server may have expired it
 # (MCP says a server MAY terminate a session at any time), and no HTTP transport exposes a liveness probe we can ask
 # instead -- see _transport_dead.
@@ -854,6 +997,9 @@ class _McpSession:
         self.closed = threading.Event()
         self.defunct = False  # discarded; close once in_flight drains (see _retire)
         self.dirty = False  # a call was abandoned on it; ping before reuse
+        self.abandoned_at: Optional[float] = None
+        self.abandoned = 0
+        self.posts = _PostTracker()
         self._close_lock = threading.Lock()
         self.call_lock = threading.Lock()
         # One stdio subprocess is one ordered byte stream, so overlapping calls must not interleave on it. HTTP has no
@@ -875,6 +1021,31 @@ class _McpSession:
         self._thread = account_thread(target = self._run_loop, name = "mcp-session", daemon = True)
         self._thread.start()
 
+    def note_abandoned(self, slot: _PostSlot) -> None:
+        """Record a call abandoned mid-flight on an HTTP transport (stdio has no reply socket to leak)."""
+        if is_stdio(self.url):
+            return
+        if self.posts.installed:
+            self.posts.settle(slot, abandoned = True)
+            return
+        if self.abandoned_at is None:
+            self.abandoned_at = time.monotonic()
+        self.abandoned += 1
+
+    def abandoned_overdue(self, now: Optional[float] = None) -> bool:
+        """Whether still-open abandoned replies require closing the session rather than probing it."""
+        now = time.monotonic() if now is None else now
+        if self.posts.installed:
+            pending = self.posts.pending()
+            if pending is None:
+                return False
+            oldest, count = pending
+        elif self.abandoned_at is None:
+            return False
+        else:
+            oldest, count = self.abandoned_at, self.abandoned
+        return count >= _MAX_ABANDONED_REPLIES or now - oldest >= _ABANDONED_REPLY_TIMEOUT
+
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self.loop)
         try:
@@ -884,6 +1055,7 @@ class _McpSession:
 
     def connect(self, timeout: Optional[float], cancel_event) -> None:
         async def _open():
+            _SESSION_POSTS.set(self.posts)
             client = _client(self.url, self.headers)
             await client.__aenter__()
             # Publish on the loop thread with no await in between: if an abort races a just-completed connect, close()
@@ -1460,7 +1632,8 @@ def _reap_idle_sessions(now: Optional[float] = None) -> None:
         expired = [
             key
             for key, session in _mcp_sessions.items()
-            if session.in_flight == 0 and now - session.last_used >= _SESSION_IDLE_TTL
+            if session.in_flight == 0
+            and (now - session.last_used >= _SESSION_IDLE_TTL or session.abandoned_overdue(now))
         ]
         sessions = [_mcp_sessions.pop(key) for key in expired]
         for key in expired:
@@ -2051,9 +2224,12 @@ def _call_session_tool(
     config_check,
     use_oauth: bool = False,
     dispatch = None,
+    rpc: Optional[tuple] = None,
 ) -> Any:
     if cancel_event is not None and cancel_event.is_set():
         raise _MCPCancelled
+    if dispatch is None:
+        rpc = ("tools/call", name)
     # One deadline covers the key-lock wait, connect, call-lock wait, and the call itself, matching the one-shot path
     # where the caller's timeout wrapped connect plus call in a single window.
     deadline = None if timeout is None else time.monotonic() + timeout
@@ -2102,6 +2278,7 @@ def _call_session_tool(
                 _drop_session(key, session)
             raise
         discard_session = ephemeral
+        slot = None
         retry = False
         try:
             # We may have waited on the call lock while another caller's timeout retired this session, a server
@@ -2129,6 +2306,13 @@ def _call_session_tool(
                     retry = True
                 else:
                     raise RuntimeError("MCP server connection is not available")
+            elif session.abandoned_overdue():
+                # A probe would prove the server is up, not that the abandoned POSTs closed.
+                discard_session = True
+                if attempt == 0:
+                    retry = True
+                else:
+                    raise RuntimeError("MCP server session was retired during the call")
             elif (
                 session.dirty or _needs_idle_recheck(session, idle_for, _remaining())
             ) and not _session_responsive(
@@ -2154,6 +2338,7 @@ def _call_session_tool(
                     # Only a cached session is worth waiting on.
                     0.0 if ephemeral else _CANCEL_UNWIND_TIMEOUT,
                 )
+                slot = session.posts.expect(rpc)
                 out = session.run(coro, rem)
                 # A completed round trip proves the transport better than any probe could, so it resets the idle clock
                 # the recheck reads.
@@ -2163,6 +2348,8 @@ def _call_session_tool(
             # Keep the session so a Stop doesn't destroy the server's state; the SDK drops the abandoned reply, and
             # reuse is gated on a live probe.
             session.dirty = True
+            if not ephemeral and slot is not None:
+                session.note_abandoned(slot)
             raise
         except _SessionWedged:
             discard_session = True
@@ -2191,6 +2378,8 @@ def _call_session_tool(
                 discard_session = True
             raise
         finally:
+            if slot is not None:
+                session.posts.settle(slot, abandoned = False)
             # Remove from the cache and mark defunct BEFORE giving up the borrow, so no other caller can check this
             # session out after it failed. The order matters more now that HTTP callers do not queue on call_lock:
             # released first, a concurrent same-scope call could check out the broken transport while it was still
@@ -2317,9 +2506,11 @@ def _ui_request_sync(
     cancel_event = None,
     scope = None,
     config_check = None,
+    rpc = None,
     **oauth,
 ) -> Any:
-    """``dispatch(client)`` on the transport call_tool_sync would pick for this scope."""
+    """``dispatch(client)`` on the transport call_tool_sync would pick for this scope. ``rpc`` is the request's
+    (JSON-RPC method, tool name or URI), which ties an abandoned reply to its POST."""
 
     async def _one_shot() -> Any:
         # As the session branch: an edit during discovery must not reach the old endpoint.
@@ -2334,7 +2525,7 @@ def _ui_request_sync(
     session_args = (url, headers, label, {}, timeout, cancel_event, scope, config_check, use_oauth)
     try:
         if is_stdio(url) or (scope and not use_oauth):
-            return _call_session_tool(*session_args, dispatch = dispatch)
+            return _call_session_tool(*session_args, dispatch = dispatch, rpc = rpc)
         return asyncio.run(_race_tool_call(_one_shot(), timeout, cancel_event))
     except _MCPCancelled as exc:
         raise TimeoutError(f"{label} was cancelled") from exc
@@ -2344,13 +2535,19 @@ def call_tool_structured_sync(
     url: str, headers: Optional[dict], name: str, args: dict, **kw
 ) -> dict:
     dispatch = lambda client: client.call_tool(name, args, raise_on_error = False)  # noqa: E731
-    return _structured_result(_ui_request_sync(url, headers, f"MCP tool '{name}'", dispatch, **kw))
+    label = f"MCP tool '{name}'"
+    return _structured_result(
+        _ui_request_sync(url, headers, label, dispatch, rpc = ("tools/call", name), **kw)
+    )
 
 
 def read_resource_sync(url: str, headers: Optional[dict], uri: str, **kw) -> dict:
     dispatch = lambda client: client.read_resource(uri)  # noqa: E731
     return _resource_contents(
-        _ui_request_sync(url, headers, f"MCP resource '{uri}'", dispatch, **kw), uri
+        _ui_request_sync(
+            url, headers, f"MCP resource '{uri}'", dispatch, rpc = ("resources/read", uri), **kw
+        ),
+        uri,
     )
 
 
