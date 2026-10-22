@@ -3136,6 +3136,7 @@ export const ru = {
       relativeNever: "никогда",
       relativeJustNow: "только что",
       expired: "истёк",
+      expiredStatus: "Истёк",
       today: "сегодня",
       created: "Создан {value}",
       used: "Использование: {value}",

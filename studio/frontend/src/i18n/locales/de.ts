@@ -3167,6 +3167,7 @@ export const de = {
       relativeNever: "nie",
       relativeJustNow: "gerade eben",
       expired: "abgelaufen",
+      expiredStatus: "Abgelaufen",
       today: "heute",
       created: "Erstellt {value}",
       used: "Verwendet {value}",

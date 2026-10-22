@@ -367,8 +367,10 @@ export const BUDGET = {
   // 2,073,188 -> 2,074,915 B transfer against b2ba86a514, Node 26, 98 chunks). Raised by that.
   // Run settings save state and Advanced groups (#14589) merged with main at 8bcbf837bd: 6,725.4 KB raw /
   // 2,026.7 KB transfer (Node 24, 98 chunks). Raised to that plus about 200 B.
-  transferBytes: 2_075_550,
-  rawBytes: 6_887_000,
+  // Settings API / Remote / LAN strings in the eager English locale (#14596): +283 B raw / +90 B transfer
+  // (6,879,345 -> 6,879,628 raw, 2,071,823 -> 2,071,913 transfer at 77e742c8e2, Node 26). Raised by that.
+  transferBytes: 2_075_640,
+  rawBytes: 6_887_283,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the

@@ -3168,6 +3168,7 @@ export const fr = {
       relativeNever: "jamais",
       relativeJustNow: "à l'instant",
       expired: "expiré",
+      expiredStatus: "Expiré",
       today: "aujourd'hui",
       created: "Créé {value}",
       used: "Utilisé {value}",
