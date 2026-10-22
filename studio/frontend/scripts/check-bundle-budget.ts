@@ -365,10 +365,11 @@ export const BUDGET = {
   // Shortcut fixes (#14597): stop action, isModEnter, zoom guard and strings in the eager locales:
   // +3,339 B raw / +1,727 B transfer (6,881,936 -> 6,885,275 B raw,
   // 2,073,188 -> 2,074,915 B transfer against b2ba86a514, Node 26, 98 chunks). Raised by that.
-  // Run settings save state and Advanced groups (#14589) merged with main at 8bcbf837bd: 6,725.4 KB raw /
-  // 2,026.7 KB transfer (Node 24, 98 chunks). Raised to that plus about 200 B.
-  transferBytes: 2_075_550,
-  rawBytes: 6_887_000,
+  // Apple unified-memory fit hint (#14598) in the eager GPU info hook and fit check:
+  // +1,048 B raw / +390 B transfer (6,885,298 -> 6,886,346 B raw,
+  // 2,074,890 -> 2,075,280 B transfer against 8bcbf837bd, Node 26, 98 chunks). Raised by that.
+  transferBytes: 2_075_426,
+  rawBytes: 6_886_498,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
