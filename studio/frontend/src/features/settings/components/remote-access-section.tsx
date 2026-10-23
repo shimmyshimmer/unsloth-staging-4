@@ -401,7 +401,7 @@ export function RemoteAccessSection() {
         <Button
           type="button"
           size="sm"
-          variant={stopAction ? "outline" : "dark"}
+          variant={stopAction ? "outline" : "default"}
           className="shrink-0"
           onClick={stopAction ? stop : start}
           disabled={actionDisabled}
