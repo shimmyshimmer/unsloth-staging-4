@@ -1,0 +1,6 @@
+studio/backend/tests/test_kernel_install.py
+studio/backend/tests/test_logging_middleware.py
+studio/backend/tests/test_pdf_ocr_regressions.py
+studio/backend/tests/test_saved_image_metadata_precision_contract.py
+studio/backend/tests/test_train_precision_scheme_contract.py
+studio/backend/tests/test_video_resolution_preset_contract.py
