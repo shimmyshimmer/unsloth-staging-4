@@ -1,7 +1,7 @@
-name: "staging-14967 studio-playwright"
+name: "staging-14972 studio-playwright"
 on:
   push:
-    branches: ["pr-14967-xplat-ci"]
+    branches: ["pr-14972-xplat-ci"]
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -80,7 +80,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
-          name: studio-playwright-14967
+          name: studio-playwright-14972
           path: |
             **/*.png
             **/*.webm
