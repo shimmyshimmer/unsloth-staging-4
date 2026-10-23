@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Router matrix for the opt-in MLX image engine: defaults unchanged, refusals fall back, predict == select."""
+"""Router matrix for the Apple Silicon MLX image engine: auto by default on a capable Mac, 0 keeps today's engine,
+1 forces it, refusals fall back, predict == select."""
 
 from __future__ import annotations
 
@@ -162,14 +163,108 @@ def test_opt_in_on_the_mps_less_cpu_backend_still_picks_mlx(monkeypatch):
     assert _predict() == _select() == ENGINE_MLX
 
 
-# ── default unchanged: unset / 0 / auto never consult MLX ────────────────────
-
-
-@pytest.mark.parametrize("value", [None, "0", "off", "auto", "AUTO", "garbage"])
-def test_default_and_auto_keep_todays_engine(monkeypatch, value):
+@pytest.mark.parametrize("value", [None, "", "auto", "AUTO"])
+def test_default_and_auto_pick_mlx_on_apple_silicon(monkeypatch, value):
     _apple(monkeypatch)
     if value is not None:
         monkeypatch.setenv("UNSLOTH_DIFFUSION_MLX", value)
+    assert _predict() == ENGINE_MLX
+    assert _select() == ENGINE_MLX
+    status = r.annotate_status({"loaded": False})
+    assert status["engine"] == ENGINE_MLX
+    assert status["mlx_fallback_reason"] is None
+
+
+@pytest.mark.parametrize("value", [None, "auto"])
+@pytest.mark.parametrize(
+    "host",
+    [
+        {"system": "linux", "machine": "x86_64"},
+        {"system": "win32", "machine": "AMD64"},
+        {"system": "darwin", "machine": "x86_64"},
+        {"system": "darwin", "machine": "arm64", "macos": "13.6"},
+    ],
+)
+def test_auto_on_other_hosts_is_todays_engine_and_records_nothing(monkeypatch, value, host):
+    _host(monkeypatch, **host)
+    _device(monkeypatch, "cpu")
+
+    def _no_probe(*_a, **_k):
+        raise AssertionError("auto must not probe the MLX runtime off Apple Silicon")
+
+    monkeypatch.setattr(r, "_mlx_runtime_refusal", _no_probe)
+    if value is not None:
+        monkeypatch.setenv("UNSLOTH_DIFFUSION_MLX", value)
+    assert _predict() == _select() == ENGINE_DIFFUSERS
+    assert r.annotate_status({})["mlx_fallback_reason"] is None
+
+
+@pytest.mark.parametrize(
+    "blocker_kwargs, needle",
+    [
+        ({"loras": [("some/lora", 1.0)]}, "LoRA"),
+        ({"component_files": {"vae_file": "vae.safetensors"}}, "text-encoder / VAE"),
+        ({"transformer_quant": "int8"}, "transformer precision (int8)"),
+        ({"text_encoder_quant": "fp8"}, "text-encoder precision (fp8)"),
+    ],
+)
+def test_auto_keeps_a_load_mlx_cannot_honour_on_diffusers(monkeypatch, blocker_kwargs, needle):
+    _apple(monkeypatch)
+    blocker = r.mlx_load_blocker(**blocker_kwargs)
+    assert needle in blocker
+    fam = detect_family("z-image")
+    assert (
+        r.predict_engine(fam, model_kind = "gguf", gguf_filename = _Q4, mlx_blocker = blocker)
+        == ENGINE_DIFFUSERS
+    )
+    r.select_and_activate_engine(fam, model_kind = "gguf", gguf_filename = _Q4, mlx_blocker = blocker)
+    assert r.active_engine_name() == ENGINE_DIFFUSERS
+    assert needle in (r.annotate_status({})["mlx_fallback_reason"] or "")
+    # Forced MLX ignores it here: the load route refuses those options with a 400, as before.
+    monkeypatch.setenv("UNSLOTH_DIFFUSION_MLX", "1")
+    assert (
+        r.predict_engine(fam, model_kind = "gguf", gguf_filename = _Q4, mlx_blocker = blocker)
+        == ENGINE_MLX
+    )
+
+
+@pytest.mark.parametrize("value", [None, "auto", "1"])
+def test_native_lora_pick_on_a_mac_is_never_an_mlx_refusal(monkeypatch, value):
+    # A LoRA load that asks for the native engine stays native: the default MLX routing must not divert it into the
+    # route's MLX LoRA refusal.
+    _apple(monkeypatch)
+    if value is not None:
+        monkeypatch.setenv("UNSLOTH_DIFFUSION_MLX", value)
+    monkeypatch.setattr(r, "ensure_sd_cpp_binary", lambda **_: "/usr/bin/sd-cli")
+    monkeypatch.setattr(r, "SdCppEngine", lambda **_: SimpleNamespace(version = lambda: "v0"))
+    blocker = r.mlx_load_blocker(loras = [("some/lora", 1.0)])
+    fam = detect_family("z-image")
+    use_mlx, reason = r.mlx_selection(
+        fam, model_kind = "gguf", gguf_filename = _Q4, engine = ENGINE_SD_CPP, load_blocker = blocker
+    )
+    assert use_mlx is False
+    assert "sd_cpp" in reason
+    assert (
+        r.predict_engine(
+            fam,
+            model_kind = "gguf",
+            gguf_filename = _Q4,
+            engine = ENGINE_SD_CPP,
+            mlx_blocker = blocker,
+        )
+        == ENGINE_SD_CPP
+    )
+
+
+def test_delegating_precisions_do_not_block_mlx():
+    for quant in (None, "", "auto", "AUTO", "none"):
+        assert r.mlx_load_blocker(transformer_quant = quant, text_encoder_quant = quant) is None
+
+
+@pytest.mark.parametrize("value", ["0", "off", "false", "no", "garbage"])
+def test_kill_switch_keeps_todays_engine(monkeypatch, value):
+    _apple(monkeypatch)
+    monkeypatch.setenv("UNSLOTH_DIFFUSION_MLX", value)
 
     def _no_probe(*_a, **_k):
         raise AssertionError("MLX must not be probed when it was not asked for")
@@ -184,9 +279,13 @@ def test_default_and_auto_keep_todays_engine(monkeypatch, value):
     assert status["fallback_reason"] == "GPU backend 'mps' uses diffusers"
 
 
-def test_default_keeps_sd_cpp_where_sd_cpp_is_chosen_today(monkeypatch):
+@pytest.mark.parametrize("runtime", [False, True])
+def test_default_keeps_sd_cpp_where_sd_cpp_is_chosen_today(monkeypatch, runtime):
+    # UNSLOTH_DIFFUSION_SD_CPP_MPS=1 is an explicit ask for native on the Mac GPU: auto MLX does not override it.
     _host(monkeypatch)
     _device(monkeypatch, "mps")
+    if runtime:
+        _runtime(monkeypatch)
     monkeypatch.setenv("UNSLOTH_DIFFUSION_SD_CPP_MPS", "1")
     monkeypatch.setattr(r, "ensure_sd_cpp_binary", lambda **_: "/usr/bin/sd-cli")
     monkeypatch.setattr(r, "SdCppEngine", lambda **_: SimpleNamespace(version = lambda: "v0"))
@@ -351,19 +450,47 @@ def test_predict_matches_selection(monkeypatch, env, backend, gguf, fam):
     r._active_engine_name = ENGINE_DIFFUSERS
     assert _select(fam, gguf) == predicted
     convertible = gguf in (_Q4, "z-image-turbo-Q4_K_M.gguf")
-    expect_mlx = env == "1" and backend != "cuda" and convertible and fam == "z-image"
+    expect_mlx = (
+        env in (None, "auto", "1") and backend != "cuda" and convertible and fam == "z-image"
+    )
     assert (predicted == ENGINE_MLX) is expect_mlx
 
 
 # ── engine plumbing ──────────────────────────────────────────────────────────
 
 
-def test_engine_for_mlx_is_the_mlx_singleton():
+def test_engine_for_forced_mlx_is_the_mlx_singleton(monkeypatch):
     from core.inference import mlx_diffusion_backend as mb
 
+    monkeypatch.setenv("UNSLOTH_DIFFUSION_MLX", "1")
     engine = r.engine_for(ENGINE_MLX)
     assert isinstance(engine, mb.MlxDiffusionBackend)
     assert engine is mb.get_mlx_diffusion_backend()
+
+
+@pytest.mark.parametrize("value", [None, "auto"])
+def test_engine_for_auto_mlx_is_the_routed_singleton(monkeypatch, value):
+    from core.inference import mlx_diffusion_routing as routing
+
+    if value is not None:
+        monkeypatch.setenv("UNSLOTH_DIFFUSION_MLX", value)
+    engine = r.engine_for(ENGINE_MLX)
+    assert isinstance(engine, routing.RoutedMlxEngine)
+    assert engine is routing.get_routed_mlx_engine()
+
+
+def test_cancel_scans_the_routed_engine_while_it_loads_its_fallback(monkeypatch):
+    from core.inference import mlx_diffusion_routing as routing
+
+    calls = []
+    fake = SimpleNamespace(
+        _active_generate_account = "acct",
+        cancel_generate = lambda expected_account = None: calls.append(expected_account) or True,
+    )
+    monkeypatch.setattr(routing, "_routed_mlx_engine", fake)
+    assert r.cancel_generation_for_account("acct") is True
+    assert calls == ["acct"]
+    assert r.cancel_generation_for_account("someone-else") is False
 
 
 def test_cancel_and_retire_scan_the_mlx_singleton(monkeypatch):
@@ -393,6 +520,8 @@ def test_switching_away_from_mlx_unloads_it(monkeypatch):
     r._active_engine_name = ENGINE_MLX
     _host(monkeypatch)
     _device(monkeypatch, "mps")
+    # Off, so the result does not depend on whether this host has mlx installed (a real Mac would pick MLX).
+    monkeypatch.setenv("UNSLOTH_DIFFUSION_MLX", "0")
     assert _select() == ENGINE_DIFFUSERS
     assert unloaded == [True]
 
@@ -405,6 +534,8 @@ def test_family_buildable_here_counts_mlx_only_with_a_convertible_gguf(monkeypat
     assert r.family_buildable_here(fam, model_kind = "gguf", gguf_filename = _Q4) is True
     assert r.family_buildable_here(fam, model_kind = "gguf") is False
     monkeypatch.delenv("UNSLOTH_DIFFUSION_MLX")
+    assert r.family_buildable_here(fam, model_kind = "gguf", gguf_filename = _Q4) is True
+    monkeypatch.setenv("UNSLOTH_DIFFUSION_MLX", "0")
     assert r.family_buildable_here(fam, model_kind = "gguf", gguf_filename = _Q4) is False
 
 
@@ -438,3 +569,58 @@ def test_auto_switch_planner_judges_mlx_with_the_picks_gguf(monkeypatch):
     monkeypatch.setattr(r, "engine_for", lambda name: name)
     pick = MediaModelPick("unsloth/Z-Image-Turbo-GGUF", "unsloth/Z-Image-Turbo-GGUF", _Q4, "gguf")
     assert media_locality.planners_for(DIFFUSION, pick) == [ENGINE_MLX]
+
+
+@pytest.mark.parametrize("value", [None, "auto", "1"])
+@pytest.mark.parametrize("gguf", [_Q4, "z-image-turbo-Q4_K_M.gguf", "z-image-turbo-Q5_1.gguf"])
+def test_a_lora_load_declines_mlx_under_default_routing(monkeypatch, value, gguf):
+    _apple(monkeypatch)
+    if value is not None:
+        monkeypatch.setenv("UNSLOTH_DIFFUSION_MLX", value)
+    fam = detect_family("z-image")
+    # Without adapters this load is MLX's.
+    assert _predict(gguf = gguf) == _select(gguf = gguf) == ENGINE_MLX
+    kw = dict(model_kind = "gguf", gguf_filename = gguf, with_loras = True)
+    assert r.predict_engine(fam, **kw) == ENGINE_DIFFUSERS
+    r.select_and_activate_engine(fam, **kw)
+    assert r.active_engine_name() == ENGINE_DIFFUSERS
+    assert "LoRA" in (r.annotate_status({})["mlx_fallback_reason"] or "")
+
+
+def test_a_lora_load_keeps_sd_cpp_under_default_routing_with_the_native_mps_knob(monkeypatch):
+    _apple(monkeypatch)
+    monkeypatch.setenv("UNSLOTH_DIFFUSION_SD_CPP_MPS", "1")
+    monkeypatch.setattr(r, "ensure_sd_cpp_binary", lambda **_: "/usr/bin/sd-cli")
+    monkeypatch.setattr(r, "SdCppEngine", lambda **_: SimpleNamespace(version = lambda: "v0"))
+    fam = detect_family("z-image")
+    kw = dict(model_kind = "gguf", gguf_filename = _Q4, with_loras = True)
+    assert r.predict_engine(fam, **kw) == ENGINE_SD_CPP
+    r.select_and_activate_engine(fam, **kw)
+    assert r.active_engine_name() == ENGINE_SD_CPP
+
+
+def test_every_load_route_and_the_residency_estimate_pass_loras_to_engine_selection():
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for rel, minimum in (("routes/inference.py", 3), ("core/inference/gpu_residency.py", 1)):
+        source = (root / rel).read_text(encoding = "utf-8")
+        calls = [
+            c
+            for c in ast.walk(ast.parse(source))
+            if isinstance(c, ast.Call)
+            and (
+                getattr(c.func, "id", None) == "predict_engine"
+                or (
+                    getattr(c.func, "id", None) == "partial"
+                    or getattr(c.func, "attr", None) == "partial"
+                )
+                and c.args
+                and getattr(c.args[0], "id", None) == "select_and_activate_engine"
+            )
+        ]
+        assert len(calls) >= minimum, rel
+        for call in calls:
+            names = {k.arg for k in call.keywords}
+            assert {"with_loras", "mlx_blocker"} <= names, f"{rel}: {ast.unparse(call)[:120]}"
