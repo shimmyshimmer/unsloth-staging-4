@@ -1,0 +1,37 @@
+name: "staging-14938 macos-15"
+on:
+  push:
+    branches: ["pr-14938-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+      - name: Install frontend deps
+        working-directory: studio/frontend
+        run: npm ci --no-fund --no-audit
+      - name: Node tests
+        working-directory: studio/frontend
+        run: node --experimental-strip-types --test tests/cache-rows-model-folder.test.ts tests/export-hub-repo-required.test.ts tests/knowledge-base-composer-refresh.test.ts tests/knowledge-base-dialog-focus.test.ts tests/mcp-server-arguments.test.ts tests/memory-estimate-narrow-panel.test.ts tests/native-dropzone-coverage.test.ts tests/projects-page-rows.test.ts tests/reasoning-live-tail.test.ts tests/sidebar-custom-sections.test.ts tests/sidebar-row-drag.test.ts
