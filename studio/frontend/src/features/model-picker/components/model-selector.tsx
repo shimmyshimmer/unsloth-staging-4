@@ -646,8 +646,16 @@ function ModelSelectorContent({
             // the rounded box the scroller put the scrollbar inside it, running the full height
             // and straight through the top and bottom right corners, which squared them off on
             // any machine set to show scrollbars always. The padding moves in with the scroller so
-            // the bar sits beside the content instead of on the edge.
-            "max-h-[var(--radix-popover-content-available-height)] w-[min(468px,calc(100vw-1rem))] overflow-hidden p-0"
+            // the bar sits beside the content instead of on the edge. !px-0: the list view's padding,
+            // snapped to whole pixels as an inline style when the panel opened, would otherwise stay
+            // and hold the scrollbar 8px off the edge. Same width as the list, so the panel keeps its
+            // size going in and out of Run settings.
+            cn(
+              "max-h-[var(--radix-popover-content-available-height)] overflow-hidden p-0 !px-0",
+              hasExternal
+                ? "w-[min(var(--picker-panel-w-external),calc(100vw-1rem))]"
+                : "w-[min(var(--picker-panel-w),calc(100vw-1rem))]",
+            )
           : cn(
               "pt-4 pb-0 pl-4",
               // Sized so the left-packed row keeps uniform gaps and the last dropdown's right gap matches
@@ -669,7 +677,8 @@ function ModelSelectorContent({
         disableHoverableContent={true}
       >
         {visibleConfigTarget ? (
-          <div className="min-h-0 w-full overflow-y-auto px-4 pt-4 pb-4 [scrollbar-gutter:stable]">
+          // Half the left inset before the bar; an overlay bar takes its measured strip on top.
+          <div className="min-h-0 w-full overflow-y-auto pt-4 pr-[calc(var(--spacing)*4+var(--overlay-scrollbar-gutter,0px))] pb-4 pl-4 [scrollbar-gutter:stable]">
             <ModelConfigPage
               key={modelConfigInstanceKey(
                 visibleConfigTarget.configId ?? visibleConfigTarget.id,
