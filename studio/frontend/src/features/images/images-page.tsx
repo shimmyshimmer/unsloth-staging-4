@@ -5209,12 +5209,11 @@ export function ImagesPage({
           type="button"
           variant="secondary"
           size="sm"
-          className="w-full"
+          className="w-fit self-start"
           disabled={!initImage}
           onClick={() => setReferenceImages((prev) => [...prev, ""])}
         >
-          <HugeiconsIcon icon={PlusSignIcon} className="size-3.5" />
-          Add image {numberOf(referenceImages.length)}
+          Add image
         </Button>
       )}
     </>
@@ -7321,7 +7320,7 @@ export function ImagesPage({
 
           </div>
           {/* The scroll mask provides the fade; leave the footer unpainted to avoid dark-mode banding. */}
-          <div className="relative z-10 flex shrink-0 flex-wrap justify-center gap-2 px-4 pt-0.5 pb-4">
+          <div className="relative z-10 flex shrink-0 flex-wrap justify-end gap-2 px-4 pt-0.5 pb-3">
             {busy === "generating" ? (
               /* Replaces Generate while a run is in flight. Every workflow funnels through the same
                  handler, so one control stops all of them. */
