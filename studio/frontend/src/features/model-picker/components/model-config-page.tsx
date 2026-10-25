@@ -3,6 +3,7 @@
 
 import { HugeiconsIcon } from "@hugeicons/react";
 import { InferenceEnginePicker } from "./inference-engines";
+import { SavedRunSettingsRow } from "./saved-run-settings-row";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -3667,7 +3668,9 @@ export function ModelConfigPage({
       : "Saved settings will be forgotten"
     : !remember && atDefault
       ? "Using default settings"
-      : "";
+      : remember && !atDefault
+        ? "Unsaved changes"
+        : "";
   const persistenceOnly = isActiveModel && atBaseline && rememberChanged;
   const primaryActionLabel = persistenceOnly
     ? remember
@@ -4159,7 +4162,29 @@ export function ModelConfigPage({
       >
       {/* pt-3.25: Remember's cap top 18px under the rule, as under the buttons. */}
       <div className="flex flex-col gap-3.5 border-t border-border pt-3.25">
-        <div className="flex min-w-0 items-center gap-2">
+        <SavedRunSettingsRow
+          modelId={configId}
+          disabled={sharedVariantUnresolved}
+          currentConfig={() => commitDraft().effectiveRuntimeConfig}
+          onApply={(saved) => {
+            // As Reset does: a panel edit, with the raw arguments text dropped for the saved one.
+            handleSharedConfigEdit();
+            markModelConfigDraftEdited(draftKey);
+            clearExtraArgsEditForDraft(draftKey);
+            setConfig({
+              ...DEFAULT_PER_MODEL_CONFIG,
+              ...saved,
+              llamaExtraArgs: saved.llamaExtraArgs ?? null,
+            });
+          }}
+        />
+        {/* The sidebar is too narrow for both on one row: the status takes a line of its own. */}
+        <div
+          className={cn(
+            "flex min-w-0 items-center gap-x-2",
+            variant === "sidebar" && "flex-wrap",
+          )}
+        >
           <Checkbox
             id={rememberId}
             aria-describedby={saveStatusId}
@@ -4182,7 +4207,13 @@ export function ModelConfigPage({
             id={saveStatusId}
             aria-live="polite"
             data-state={saveStatus === "Unsaved changes" ? "dirty" : undefined}
-            className="ml-auto min-w-0 truncate text-ui-11 leading-snug text-muted-foreground data-[state=dirty]:text-amber-600 dark:data-[state=dirty]:text-amber-400"
+            className={cn(
+              "min-w-0 truncate text-ui-11 leading-snug text-muted-foreground data-[state=dirty]:text-amber-600 dark:data-[state=dirty]:text-amber-400",
+              // min-h: the line keeps its height while empty, so a status appearing never moves the buttons.
+              variant === "sidebar"
+                ? "min-h-[calc(1.375em+0.25rem)] basis-full pt-1 pl-6"
+                : "ml-auto",
+            )}
           >
             {saveStatus}
           </p>
@@ -4210,8 +4241,11 @@ export function ModelConfigPage({
           >
             {primaryActionLabel}
           </Button>
-          {/* Hidden with nothing to save or forget, else never-remembered models show a dead Forget. */}
-          {!persistenceOnly && (remember || savedRemember) && (
+          {/* Load already saves while Remember is ticked: this only shows with changes to save or a record to forget. */}
+          {!persistenceOnly &&
+            (remember
+              ? !matchesStored && !(atDefault && !savedRemember)
+              : savedRemember) && (
             <Button
               type="button"
               variant="outline"
@@ -4230,7 +4264,7 @@ export function ModelConfigPage({
               }
               onClick={handleSave}
             >
-              {remember ? "Save settings" : "Forget settings"}
+              {remember ? "Save without loading" : "Forget without loading"}
             </Button>
           )}
           <Button
