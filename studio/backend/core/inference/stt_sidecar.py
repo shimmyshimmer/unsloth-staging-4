@@ -1469,16 +1469,25 @@ class WhisperSttSidecar:
         request_cancel_event: Optional[threading.Event] = None,
         device: Optional[str] = None,
     ):
-        """An explicit device differing from the resident one reloads the model; None keeps what is
-        resident."""
-        from core.inference.audio_device import audio_device_default, normalize_audio_device
+        """Load (or switch to) a model, reusing it if already resident.
+
+        ``device`` is the user's device preference (``auto``/``cpu``/``gpu``, see
+        ``core.inference.audio_device``). An explicit one that differs from the
+        resident model's reloads it, or the setting would be silently ignored.
+        ``None`` means no opinion: it takes the server default for a fresh load
+        and reuses whatever is resident, so a caller that never sends one cannot
+        move a model another surface placed.
+
+        Returns a ``(model, processor)`` pair.
+        """
+        from core.inference.audio_device import normalize_audio_device, stt_device_default
 
         if request_cancel_event is not None and request_cancel_event.is_set():
             raise SttTranscriptionCancelledError("Transcription cancelled.")
         model_id = resolve_model_id(model)
         # None means no opinion, not auto: do not move a model another surface placed.
         requested = None if device is None else normalize_audio_device(device)
-        preference = audio_device_default() if requested is None else requested
+        preference = stt_device_default() if requested is None else requested
         with self._lock:
             if request_cancel_event is not None and request_cancel_event.is_set():
                 raise SttTranscriptionCancelledError("Transcription cancelled.")

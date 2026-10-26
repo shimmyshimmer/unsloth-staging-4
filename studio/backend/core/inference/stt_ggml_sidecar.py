@@ -921,9 +921,14 @@ class GgmlSttSidecar:
         request_cancel_event: Optional[threading.Event] = None,
         device: Optional[str] = None,
     ) -> None:
-        """A None device keeps the running server's placement, so a caller that sends none cannot
-        move it."""
-        from core.inference.audio_device import audio_device_forces_cpu
+        """Start (or switch) whisper-server for the requested curated model.
+
+        ``device`` is the user's audio device preference; ``cpu`` starts the server
+        with ``--no-gpu``, the same flag training and a CPU-only install already use.
+        ``None`` is no opinion: it keeps the running server's placement, so a
+        caller that never sends one cannot restart it onto the other device.
+        """
+        from core.inference.audio_device import stt_device_forces_cpu
 
         if request_cancel_event is not None and request_cancel_event.is_set():
             raise SttTranscriptionCancelledError("Transcription cancelled.")
@@ -937,7 +942,7 @@ class GgmlSttSidecar:
             force_cpu = (
                 self._forced_cpu
                 if device is None and self._process_alive()
-                else audio_device_forces_cpu(device)
+                else stt_device_forces_cpu(device)
             )
             if (
                 self._process_alive()
