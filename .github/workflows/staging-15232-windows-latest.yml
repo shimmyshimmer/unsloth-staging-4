@@ -1,0 +1,37 @@
+name: "staging-15232 windows-latest"
+on:
+  push:
+    branches: ["pr-15232-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+      - name: Install frontend deps
+        working-directory: studio/frontend
+        run: npm ci --no-fund --no-audit
+      - name: Node tests
+        working-directory: studio/frontend
+        run: node --experimental-strip-types --test tests/api-model-reload-target.test.ts tests/api-token-default-name.test.ts tests/audio-sidebar-workflows.test.ts tests/chat-continuation.test.ts tests/chat-model-load-replacement.test.ts tests/composer-icon-alignment.test.ts tests/context-usage-compact.test.ts tests/mcp-access-section.test.ts tests/model-memory-multi-model-mode.test.ts tests/overlay-scrollbar-gutter.test.ts tests/projects-page-rows.test.ts tests/resident-config-match.test.ts tests/tooltip-open-state.test.ts tests/ui-font-size-scales-spacing.test.ts

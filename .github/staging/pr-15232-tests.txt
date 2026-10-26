@@ -1,0 +1,10 @@
+studio/backend/tests/test_hub_snapshot_filter_frontend_parity.py
+studio/backend/tests/test_kernel_install.py
+studio/backend/tests/test_logging_middleware.py
+studio/backend/tests/test_mlx_precision_variants.py
+studio/backend/tests/test_pdf_ocr_regressions.py
+studio/backend/tests/test_sandbox_files_and_storage_roots.py
+studio/backend/tests/test_saved_image_metadata_precision_contract.py
+studio/backend/tests/test_torch_cpu_build_on_nvidia_host.py
+studio/backend/tests/test_train_precision_scheme_contract.py
+studio/backend/tests/test_video_resolution_preset_contract.py
