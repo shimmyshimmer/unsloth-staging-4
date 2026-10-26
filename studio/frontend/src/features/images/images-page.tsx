@@ -76,6 +76,7 @@ import { Slider } from "@/components/ui/slider";
 import { useSidebar } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
+import { DeferredTextarea } from "@/components/deferred-textarea";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Tooltip,
@@ -6900,7 +6901,7 @@ export function ImagesPage({
               label={workflow === "edit" ? "Instruction" : "Prompt"}
               hint={external ? undefined : status?.prompt_hint || undefined}
             >
-              <Textarea
+              <DeferredTextarea
                 data-type-to-activate="prompt"
                 rows={4}
                 className={cn(PROMPT_BOX_CLASS, "min-h-32")}
@@ -6913,7 +6914,7 @@ export function ImagesPage({
                   dismissExample(`images:${workflow}`);
                   setExamplesDismissed((prev) => ({ ...prev, [workflow]: true }));
                 }}
-                onChange={(e) => setPrompt(e.target.value)}
+                onValueChange={setPrompt}
                 onPaste={(e) => {
                   // A whole AUTOMATIC1111 / Forge / Civitai block fills the form instead of the prompt.
                   const text = e.clipboardData.getData("text/plain");
@@ -7445,7 +7446,7 @@ export function ImagesPage({
                 alt="Live preview of the image being generated"
                 data-testid="images-live-preview"
                 style={{ maxWidth: width, maxHeight: height }}
-                className="size-full object-contain shadow-sm"
+                className="media-stage-shadow size-full object-contain shadow-sm"
               />
             ) : selected && selectedSrc ? (
               <>
@@ -7463,7 +7464,7 @@ export function ImagesPage({
                       openViewer();
                     }
                   }}
-                  className="max-h-full max-w-full cursor-zoom-in object-contain shadow-sm"
+                  className="media-stage-shadow max-h-full max-w-full cursor-zoom-in object-contain shadow-sm"
                 />
                 {/* Actions grouped in one glass toolbar so they stay legible over any image. Size and seed
                     live in the Recipe popover. */}
