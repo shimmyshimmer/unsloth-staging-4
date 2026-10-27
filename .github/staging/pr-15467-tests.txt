@@ -1,0 +1,2 @@
+studio/backend/tests/test_sandbox_files_and_storage_roots.py
+studio/backend/tests/test_ui_stream_events_gate.py
