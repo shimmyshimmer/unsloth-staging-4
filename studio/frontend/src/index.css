@@ -682,7 +682,7 @@
    Flavor themes (Theme > More themes). Each sets --th-* seeds per mode; the
    block below maps them onto the --*-base tokens, so contrast and custom
    colors still apply. */
-:root:where([data-palette="blueberry"], [data-palette="butterfly-pea"], [data-palette="cherry"], [data-palette="cinnamon"], [data-palette="cotton-candy"], [data-palette="dragon-fruit"], [data-palette="earl-grey"], [data-palette="espresso"], [data-palette="honey"], [data-palette="licorice"], [data-palette="macaron"], [data-palette="matcha"], [data-palette="mint"], [data-palette="neon-cyberpunk"], [data-palette="oat-milk"], [data-palette="peach"], [data-palette="pina-paraiso"], [data-palette="plum"], [data-palette="tangerine"], [data-palette="taro"], [data-palette="wasabi"], [data-palette="yuzu"])[data-palette] {
+:root:where([data-palette="blueberry"], [data-palette="butterfly-pea"], [data-palette="cherry"], [data-palette="cinnamon"], [data-palette="cotton-candy"], [data-palette="dragon-fruit"], [data-palette="earl-grey"], [data-palette="espresso"], [data-palette="honey"], [data-palette="licorice"], [data-palette="macaron"], [data-palette="matcha"], [data-palette="mint"], [data-palette="neon-cyberpunk"], [data-palette="oat-milk"], [data-palette="peach"], [data-palette="pina-paraiso"], [data-palette="plum"], [data-palette="tangerine"], [data-palette="taro"], [data-palette="wasabi"], [data-palette="yuzu"], [data-palette="pumpkin"], [data-palette="bloody-valentine"], [data-palette="the-thing"], [data-palette="alien"], [data-palette="gothic"], [data-palette="black-cat"], [data-palette="trick-or-treat"], [data-palette="ghost-ship"], [data-palette="midnight-haunt"])[data-palette] {
 	--background: var(--th-bg);
 	--foreground-base: var(--th-fg);
 	--action-base: var(--foreground);
@@ -732,17 +732,17 @@
 }
 
 /* Attribute specificity only, so html[data-contrast-adjust] still wins. */
-[data-palette]:where([data-palette="blueberry"], [data-palette="butterfly-pea"], [data-palette="cherry"], [data-palette="cinnamon"], [data-palette="cotton-candy"], [data-palette="dragon-fruit"], [data-palette="earl-grey"], [data-palette="espresso"], [data-palette="honey"], [data-palette="licorice"], [data-palette="macaron"], [data-palette="matcha"], [data-palette="mint"], [data-palette="neon-cyberpunk"], [data-palette="oat-milk"], [data-palette="peach"], [data-palette="pina-paraiso"], [data-palette="plum"], [data-palette="tangerine"], [data-palette="taro"], [data-palette="wasabi"], [data-palette="yuzu"]) {
+[data-palette]:where([data-palette="blueberry"], [data-palette="butterfly-pea"], [data-palette="cherry"], [data-palette="cinnamon"], [data-palette="cotton-candy"], [data-palette="dragon-fruit"], [data-palette="earl-grey"], [data-palette="espresso"], [data-palette="honey"], [data-palette="licorice"], [data-palette="macaron"], [data-palette="matcha"], [data-palette="mint"], [data-palette="neon-cyberpunk"], [data-palette="oat-milk"], [data-palette="peach"], [data-palette="pina-paraiso"], [data-palette="plum"], [data-palette="tangerine"], [data-palette="taro"], [data-palette="wasabi"], [data-palette="yuzu"], [data-palette="pumpkin"], [data-palette="bloody-valentine"], [data-palette="the-thing"], [data-palette="alien"], [data-palette="gothic"], [data-palette="black-cat"], [data-palette="trick-or-treat"], [data-palette="ghost-ship"], [data-palette="midnight-haunt"]) {
 	--muted-foreground: var(--th-muted);
 }
 
-:root:where([data-palette="blueberry"], [data-palette="butterfly-pea"], [data-palette="cherry"], [data-palette="cinnamon"], [data-palette="cotton-candy"], [data-palette="dragon-fruit"], [data-palette="earl-grey"], [data-palette="espresso"], [data-palette="honey"], [data-palette="licorice"], [data-palette="macaron"], [data-palette="matcha"], [data-palette="mint"], [data-palette="neon-cyberpunk"], [data-palette="oat-milk"], [data-palette="peach"], [data-palette="pina-paraiso"], [data-palette="plum"], [data-palette="tangerine"], [data-palette="taro"], [data-palette="wasabi"], [data-palette="yuzu"])[data-palette].dark
+:root:where([data-palette="blueberry"], [data-palette="butterfly-pea"], [data-palette="cherry"], [data-palette="cinnamon"], [data-palette="cotton-candy"], [data-palette="dragon-fruit"], [data-palette="earl-grey"], [data-palette="espresso"], [data-palette="honey"], [data-palette="licorice"], [data-palette="macaron"], [data-palette="matcha"], [data-palette="mint"], [data-palette="neon-cyberpunk"], [data-palette="oat-milk"], [data-palette="peach"], [data-palette="pina-paraiso"], [data-palette="plum"], [data-palette="tangerine"], [data-palette="taro"], [data-palette="wasabi"], [data-palette="yuzu"], [data-palette="pumpkin"], [data-palette="bloody-valentine"], [data-palette="the-thing"], [data-palette="alien"], [data-palette="gothic"], [data-palette="black-cat"], [data-palette="trick-or-treat"], [data-palette="ghost-ship"], [data-palette="midnight-haunt"])[data-palette].dark
 	:is(.chat-composer-surface, .unsloth-composer-surface, .unsloth-files-panel) {
 	background-color: color-mix(in srgb, var(--card), var(--th-fg) 4%);
 }
 
 /* Collapsed rail takes the page color, as it does in dark mode. */
-:root:where([data-palette="blueberry"], [data-palette="butterfly-pea"], [data-palette="cherry"], [data-palette="cinnamon"], [data-palette="cotton-candy"], [data-palette="dragon-fruit"], [data-palette="earl-grey"], [data-palette="espresso"], [data-palette="honey"], [data-palette="licorice"], [data-palette="macaron"], [data-palette="matcha"], [data-palette="mint"], [data-palette="neon-cyberpunk"], [data-palette="oat-milk"], [data-palette="peach"], [data-palette="pina-paraiso"], [data-palette="plum"], [data-palette="tangerine"], [data-palette="taro"], [data-palette="wasabi"], [data-palette="yuzu"])[data-palette]:not(.dark)
+:root:where([data-palette="blueberry"], [data-palette="butterfly-pea"], [data-palette="cherry"], [data-palette="cinnamon"], [data-palette="cotton-candy"], [data-palette="dragon-fruit"], [data-palette="earl-grey"], [data-palette="espresso"], [data-palette="honey"], [data-palette="licorice"], [data-palette="macaron"], [data-palette="matcha"], [data-palette="mint"], [data-palette="neon-cyberpunk"], [data-palette="oat-milk"], [data-palette="peach"], [data-palette="pina-paraiso"], [data-palette="plum"], [data-palette="tangerine"], [data-palette="taro"], [data-palette="wasabi"], [data-palette="yuzu"], [data-palette="pumpkin"], [data-palette="bloody-valentine"], [data-palette="the-thing"], [data-palette="alien"], [data-palette="gothic"], [data-palette="black-cat"], [data-palette="trick-or-treat"], [data-palette="ghost-ship"], [data-palette="midnight-haunt"])[data-palette]:not(.dark)
 	[data-collapsible="icon"] [data-sidebar="sidebar"] {
 	--sidebar-surface: var(--background);
 }
@@ -1591,6 +1591,469 @@
 	--th-chart-5: #c79ae6;
 }
 
+/* Halloween themes (sidebar Trick or treat, and Theme > Halloween in October). */
+:root[data-palette="pumpkin"]:not(.dark) {
+	--th-bg: #fff3e3;
+	--th-surface: #ffe7c9;
+	--th-raised: #f7e0c1;
+	--th-hover: #efd9b9;
+	--th-border: #c1ac8b;
+	--th-fg: #3a1a00;
+	--th-muted: #6e5f3c;
+	--th-subtle: #a6917d;
+	--th-accent: #b84800;
+	--th-accent-fg: #ffffff;
+	--th-second: #3a7d00;
+	--th-chart-1: #b84800;
+	--th-chart-2: #3a7d00;
+	--th-chart-3: #c48a00;
+	--th-chart-4: #7a2fe0;
+	--th-chart-5: #d1202e;
+	--ring: #3a7d00;
+	--sidebar-ring: #3a7d00;
+	--control-accent: #3a7d00;
+	--control-accent-foreground: #ffffff;
+	--nav-icon-idle-base: #588f22;
+	--composer-shadow:
+		0 6px 28px -10px rgb(184 72 0 / 0.35),
+		0 2px 8px -2px rgb(0 0 0 / 0.1);
+}
+:root[data-palette="pumpkin"].dark {
+	--th-bg: #1f0f02;
+	--th-surface: #2b1606;
+	--th-raised: #33210d;
+	--th-hover: #3b2b14;
+	--th-border: #4b4022;
+	--th-fg: #ffeedd;
+	--th-muted: #bbbc91;
+	--th-subtle: #847365;
+	--th-accent: #ff7a00;
+	--th-accent-fg: #130901;
+	--th-second: #8fe03a;
+	--th-chart-1: #ff7a00;
+	--th-chart-2: #8fe03a;
+	--th-chart-3: #ffc21a;
+	--th-chart-4: #b06bff;
+	--th-chart-5: #ff4a3d;
+	--ring: #8fe03a;
+	--sidebar-ring: #8fe03a;
+	--control-accent: #8fe03a;
+	--control-accent-foreground: #130901;
+	--nav-icon-idle-base: #73ac2c;
+	--composer-shadow: 0 0 40px 6px rgb(255 122 0 / 0.16);
+}
+
+:root[data-palette="trick-or-treat"]:not(.dark) {
+	--th-bg: #fffae6;
+	--th-surface: #fff0c4;
+	--th-raised: #f8e8bf;
+	--th-hover: #f0e0bb;
+	--th-border: #c2b192;
+	--th-fg: #2e1f00;
+	--th-muted: #6f5b58;
+	--th-subtle: #a1977f;
+	--th-accent: #8f5c00;
+	--th-accent-fg: #ffffff;
+	--th-second: #7a2fe0;
+	--th-chart-1: #8f5c00;
+	--th-chart-2: #7a2fe0;
+	--th-chart-3: #c84a00;
+	--th-chart-4: #5f6f00;
+	--th-chart-5: #c20a7f;
+	--ring: #7a2fe0;
+	--sidebar-ring: #7a2fe0;
+	--control-accent: #7a2fe0;
+	--control-accent-foreground: #ffffff;
+	--nav-icon-idle-base: #8e4de1;
+}
+:root[data-palette="trick-or-treat"].dark {
+	--th-bg: #1a0b24;
+	--th-surface: #251135;
+	--th-raised: #2f1a3e;
+	--th-hover: #392247;
+	--th-border: #4c3459;
+	--th-fg: #fff4d6;
+	--th-muted: #c6adb8;
+	--th-subtle: #817474;
+	--th-accent: #ffc400;
+	--th-accent-fg: #100716;
+	--th-second: #d17dff;
+	--th-chart-1: #ffc400;
+	--th-chart-2: #d17dff;
+	--th-chart-3: #ff7a00;
+	--th-chart-4: #fff0b3;
+	--th-chart-5: #3dffa0;
+	--ring: #d17dff;
+	--sidebar-ring: #d17dff;
+	--control-accent: #d17dff;
+	--control-accent-foreground: #100716;
+	--nav-icon-idle-base: #a361c8;
+}
+
+:root[data-palette="bloody-valentine"]:not(.dark) {
+	--th-bg: #fff0f2;
+	--th-surface: #ffe0e6;
+	--th-raised: #f9d8df;
+	--th-hover: #f3cfd8;
+	--th-border: #cca3ae;
+	--th-fg: #3a0510;
+	--th-muted: #7c4759;
+	--th-subtle: #a6868c;
+	--th-accent: #c4001f;
+	--th-accent-fg: #ffffff;
+	--th-second: #b0247a;
+	--th-chart-1: #c4001f;
+	--th-chart-2: #b0247a;
+	--th-chart-3: #6e5a64;
+	--th-chart-4: #d1550e;
+	--th-chart-5: #8b2fd1;
+	--ring: #b0247a;
+	--sidebar-ring: #b0247a;
+	--control-accent: #b0247a;
+	--control-accent-foreground: #ffffff;
+	--nav-icon-idle-base: #bc438c;
+	--composer-shadow:
+		0 6px 28px -10px rgb(196 0 31 / 0.35),
+		0 2px 8px -2px rgb(0 0 0 / 0.1);
+}
+:root[data-palette="bloody-valentine"].dark {
+	--th-bg: #1f0307;
+	--th-surface: #2c070d;
+	--th-raised: #371017;
+	--th-hover: #411921;
+	--th-border: #562b36;
+	--th-fg: #ffe3e8;
+	--th-muted: #cfa3b2;
+	--th-subtle: #84686c;
+	--th-accent: #ff1f43;
+	--th-accent-fg: #130204;
+	--th-second: #ff8ac4;
+	--th-chart-1: #ff1f43;
+	--th-chart-2: #ff8ac4;
+	--th-chart-3: #c8b8c4;
+	--th-chart-4: #ff7a2e;
+	--th-chart-5: #c25cff;
+	--ring: #ff8ac4;
+	--sidebar-ring: #ff8ac4;
+	--control-accent: #ff8ac4;
+	--control-accent-foreground: #130204;
+	--nav-icon-idle-base: #c76895;
+	--composer-shadow: 0 0 40px 6px rgb(255 31 67 / 0.16);
+}
+
+:root[data-palette="alien"]:not(.dark) {
+	--th-bg: #eefff4;
+	--th-surface: #dafbe6;
+	--th-raised: #d4f2df;
+	--th-hover: #ceead8;
+	--th-border: #a0baab;
+	--th-fg: #032a12;
+	--th-muted: #565f5c;
+	--th-subtle: #849f8e;
+	--th-accent: #007a33;
+	--th-accent-fg: #ffffff;
+	--th-second: #b0128a;
+	--th-chart-1: #007a33;
+	--th-chart-2: #b0128a;
+	--th-chart-3: #0080b0;
+	--th-chart-4: #5f8f00;
+	--th-chart-5: #4f6f5c;
+	--ring: #b0128a;
+	--sidebar-ring: #b0128a;
+	--control-accent: #b0128a;
+	--control-accent-foreground: #ffffff;
+	--nav-icon-idle-base: #b9369a;
+	--composer-shadow:
+		0 6px 28px -10px rgb(0 122 51 / 0.35),
+		0 2px 8px -2px rgb(0 0 0 / 0.1);
+}
+:root[data-palette="alien"].dark {
+	--th-bg: #02130a;
+	--th-surface: #051e10;
+	--th-raised: #10251a;
+	--th-hover: #1c2c24;
+	--th-border: #323a38;
+	--th-fg: #d6ffe6;
+	--th-muted: #b0aab2;
+	--th-subtle: #617d6d;
+	--th-accent: #00ff6a;
+	--th-accent-fg: #010b06;
+	--th-second: #ff3dc8;
+	--th-chart-1: #00ff6a;
+	--th-chart-2: #ff3dc8;
+	--th-chart-3: #1ad6ff;
+	--th-chart-4: #c8ff1a;
+	--th-chart-5: #8fb8a0;
+	--ring: #ff3dc8;
+	--sidebar-ring: #ff3dc8;
+	--control-accent: #ff3dc8;
+	--control-accent-foreground: #010b06;
+	--nav-icon-idle-base: #c03399;
+	--composer-shadow: 0 0 40px 6px rgb(0 255 106 / 0.16);
+}
+
+:root[data-palette="ghost-ship"]:not(.dark) {
+	--th-bg: #ecfffb;
+	--th-surface: #d4f8f0;
+	--th-raised: #cef1e7;
+	--th-hover: #c7e9df;
+	--th-border: #98bbb0;
+	--th-fg: #03302a;
+	--th-muted: #516c5c;
+	--th-subtle: #83a29d;
+	--th-accent: #00756a;
+	--th-accent-fg: #ffffff;
+	--th-second: #8a6000;
+	--th-chart-1: #00756a;
+	--th-chart-2: #8a6000;
+	--th-chart-3: #1f5fc8;
+	--th-chart-4: #4f8a00;
+	--th-chart-5: #c8102e;
+	--ring: #8a6000;
+	--sidebar-ring: #8a6000;
+	--control-accent: #8a6000;
+	--control-accent-foreground: #ffffff;
+	--nav-icon-idle-base: #997826;
+	--composer-shadow:
+		0 6px 28px -10px rgb(0 117 106 / 0.35),
+		0 2px 8px -2px rgb(0 0 0 / 0.1);
+}
+:root[data-palette="ghost-ship"].dark {
+	--th-bg: #021716;
+	--th-surface: #042420;
+	--th-raised: #102e27;
+	--th-hover: #1b382d;
+	--th-border: #324c3a;
+	--th-fg: #d9fff8;
+	--th-muted: #b2c6a6;
+	--th-subtle: #637f7c;
+	--th-accent: #00e5c8;
+	--th-accent-fg: #010e0d;
+	--th-second: #ffd23d;
+	--th-chart-1: #00e5c8;
+	--th-chart-2: #ffd23d;
+	--th-chart-3: #5ca8ff;
+	--th-chart-4: #a8ff3d;
+	--th-chart-5: #ff5c7a;
+	--ring: #ffd23d;
+	--sidebar-ring: #ffd23d;
+	--control-accent: #ffd23d;
+	--control-accent-foreground: #010e0d;
+	--nav-icon-idle-base: #c0a333;
+	--composer-shadow: 0 0 40px 6px rgb(0 229 200 / 0.16);
+}
+
+:root[data-palette="the-thing"]:not(.dark) {
+	--th-bg: #eef8ff;
+	--th-surface: #dcefff;
+	--th-raised: #d6e7f6;
+	--th-hover: #d0dfee;
+	--th-border: #a2b2c0;
+	--th-fg: #04233a;
+	--th-muted: #585f67;
+	--th-subtle: #8598a6;
+	--th-accent: #0062a8;
+	--th-accent-fg: #ffffff;
+	--th-second: #c03f00;
+	--th-chart-1: #0062a8;
+	--th-chart-2: #c03f00;
+	--th-chart-3: #4f7590;
+	--th-chart-4: #0a9e86;
+	--th-chart-5: #c8102e;
+	--ring: #c03f00;
+	--sidebar-ring: #c03f00;
+	--control-accent: #c03f00;
+	--control-accent-foreground: #ffffff;
+	--nav-icon-idle-base: #c75b26;
+	--composer-shadow:
+		0 6px 28px -10px rgb(0 98 168 / 0.35),
+		0 2px 8px -2px rgb(0 0 0 / 0.1);
+}
+:root[data-palette="the-thing"].dark {
+	--th-bg: #04121f;
+	--th-surface: #081c2e;
+	--th-raised: #142433;
+	--th-hover: #1f2b39;
+	--th-border: #363b43;
+	--th-fg: #e0f3ff;
+	--th-muted: #b7aba6;
+	--th-subtle: #677784;
+	--th-accent: #3dbcff;
+	--th-accent-fg: #020b13;
+	--th-second: #ff6a1a;
+	--th-chart-1: #3dbcff;
+	--th-chart-2: #ff6a1a;
+	--th-chart-3: #cfeaff;
+	--th-chart-4: #2ee0c0;
+	--th-chart-5: #ff3d5a;
+	--ring: #ff6a1a;
+	--sidebar-ring: #ff6a1a;
+	--control-accent: #ff6a1a;
+	--control-accent-foreground: #020b13;
+	--nav-icon-idle-base: #c0541b;
+	--composer-shadow: 0 0 40px 6px rgb(61 188 255 / 0.16);
+}
+
+:root[data-palette="midnight-haunt"]:not(.dark) {
+	--th-bg: #f0f3ff;
+	--th-surface: #dfe5ff;
+	--th-raised: #d8def7;
+	--th-hover: #d1d7ee;
+	--th-border: #a8adc6;
+	--th-fg: #0c1442;
+	--th-muted: #56596c;
+	--th-subtle: #898faa;
+	--th-accent: #2f45d6;
+	--th-accent-fg: #ffffff;
+	--th-second: #856400;
+	--th-chart-1: #2f45d6;
+	--th-chart-2: #856400;
+	--th-chart-3: #007fa8;
+	--th-chart-4: #8b2fd1;
+	--th-chart-5: #c8102e;
+	--ring: #856400;
+	--sidebar-ring: #856400;
+	--control-accent: #856400;
+	--control-accent-foreground: #ffffff;
+	--nav-icon-idle-base: #957926;
+	--composer-shadow:
+		0 6px 28px -10px rgb(47 69 214 / 0.35),
+		0 2px 8px -2px rgb(0 0 0 / 0.1);
+}
+:root[data-palette="midnight-haunt"].dark {
+	--th-bg: #060a24;
+	--th-surface: #0b1236;
+	--th-raised: #161d3d;
+	--th-hover: #222743;
+	--th-border: #393c50;
+	--th-fg: #e3e8ff;
+	--th-muted: #b9b7b5;
+	--th-subtle: #696e87;
+	--th-accent: #6f86ff;
+	--th-accent-fg: #040616;
+	--th-second: #ffe066;
+	--th-chart-1: #6f86ff;
+	--th-chart-2: #ffe066;
+	--th-chart-3: #3ddcff;
+	--th-chart-4: #d67aff;
+	--th-chart-5: #ff6a8a;
+	--ring: #ffe066;
+	--sidebar-ring: #ffe066;
+	--control-accent: #ffe066;
+	--control-accent-foreground: #040616;
+	--nav-icon-idle-base: #c1ab56;
+	--composer-shadow: 0 0 40px 6px rgb(111 134 255 / 0.16);
+}
+
+:root[data-palette="gothic"]:not(.dark) {
+	--th-bg: #f8f1ff;
+	--th-surface: #eee0ff;
+	--th-raised: #e8d7f7;
+	--th-hover: #e2cff0;
+	--th-border: #bea6ca;
+	--th-fg: #22093d;
+	--th-muted: #6e4770;
+	--th-subtle: #9889a8;
+	--th-accent: #6a24c8;
+	--th-accent-fg: #ffffff;
+	--th-second: #c4103f;
+	--th-chart-1: #6a24c8;
+	--th-chart-2: #c4103f;
+	--th-chart-3: #5c5470;
+	--th-chart-4: #2f55d1;
+	--th-chart-5: #a8770e;
+	--ring: #c4103f;
+	--sidebar-ring: #c4103f;
+	--control-accent: #c4103f;
+	--control-accent-foreground: #ffffff;
+	--nav-icon-idle-base: #cc325c;
+}
+:root[data-palette="gothic"].dark {
+	--th-bg: #100619;
+	--th-surface: #190b28;
+	--th-raised: #24122f;
+	--th-hover: #2f1937;
+	--th-border: #452646;
+	--th-fg: #f0e4ff;
+	--th-muted: #c394b3;
+	--th-subtle: #756a81;
+	--th-accent: #b27aff;
+	--th-accent-fg: #0a040f;
+	--th-second: #ff2f6a;
+	--th-chart-1: #b27aff;
+	--th-chart-2: #ff2f6a;
+	--th-chart-3: #c4b8d6;
+	--th-chart-4: #6a8cff;
+	--th-chart-5: #ffc85c;
+	--ring: #ff2f6a;
+	--sidebar-ring: #ff2f6a;
+	--control-accent: #ff2f6a;
+	--control-accent-foreground: #0a040f;
+	--nav-icon-idle-base: #c32556;
+}
+
+:root[data-palette="black-cat"]:not(.dark) {
+	--th-bg: #f6f1ff;
+	--th-surface: #ebe0ff;
+	--th-raised: #e2d8f6;
+	--th-hover: #dacfed;
+	--th-border: #b4a9c5;
+	--th-fg: #120a1c;
+	--th-muted: #4f4759;
+	--th-subtle: #8f8999;
+	--th-accent: #6a1fd6;
+	--th-accent-fg: #ffffff;
+	--th-second: #1c1028;
+	--th-chart-1: #6a1fd6;
+	--th-chart-2: #1c1028;
+	--th-chart-3: #4a3fd1;
+	--th-chart-4: #b0128a;
+	--th-chart-5: #5c5470;
+	--ring: #1c1028;
+	--sidebar-ring: #1c1028;
+	--control-accent: #1c1028;
+	--control-accent-foreground: #ffffff;
+	--nav-icon-idle-base: #3d3248;
+	--composer-shadow:
+		0 6px 28px -10px rgb(106 31 214 / 0.35),
+		0 2px 8px -2px rgb(0 0 0 / 0.1);
+}
+:root[data-palette="black-cat"].dark {
+	--th-bg: #08060b;
+	--th-surface: #110d16;
+	--th-raised: #1c1722;
+	--th-hover: #27212d;
+	--th-border: #3c3545;
+	--th-fg: #f3eaff;
+	--th-muted: #bdb1cb;
+	--th-subtle: #726d79;
+	--th-accent: #a259ff;
+	--th-accent-fg: #050407;
+	--th-second: #dcb8ff;
+	--th-chart-1: #a259ff;
+	--th-chart-2: #dcb8ff;
+	--th-chart-3: #7a5cff;
+	--th-chart-4: #ff5cd6;
+	--th-chart-5: #b8b0c4;
+	--ring: #dcb8ff;
+	--sidebar-ring: #dcb8ff;
+	--control-accent: #dcb8ff;
+	--control-accent-foreground: #050407;
+	--nav-icon-idle-base: #a78cc2;
+	--composer-shadow: 0 0 40px 6px rgb(162 89 255 / 0.16);
+}
+
+:root:where([data-palette="pumpkin"], [data-palette="bloody-valentine"], [data-palette="alien"], [data-palette="ghost-ship"], [data-palette="the-thing"], [data-palette="midnight-haunt"], [data-palette="black-cat"]):not(.dark)
+	:is(.chat-composer-surface, .unsloth-composer-surface):focus-within {
+	box-shadow:
+		0 8px 34px -10px color-mix(in srgb, var(--th-accent) 45%, transparent),
+		0 2px 8px -2px rgb(0 0 0 / 0.1);
+}
+:root:where([data-palette="pumpkin"], [data-palette="bloody-valentine"], [data-palette="alien"], [data-palette="ghost-ship"], [data-palette="the-thing"], [data-palette="midnight-haunt"], [data-palette="black-cat"]).dark
+	:is(.chat-composer-surface, .unsloth-composer-surface):focus-within {
+	box-shadow: 0 0 48px 8px color-mix(in srgb, var(--th-accent) 22%, transparent);
+}
+
 /* --------------------------------------------------------------------------- */
 /* Appearance customization: every rule is gated on a class or attribute appearance-custom-store.ts
    sets on <html>, so with none active the stylesheet is stock. Custom colors/fonts are inline vars. */
@@ -2219,6 +2682,7 @@ html[data-chat-font] .aui-root {
 	.group\/project-item:hover:not(:has(.sidebar-row-action:hover)) .sidebar-nav-btn,
 	.group\/project-chat-item:hover:not(:has(.sidebar-row-action:hover)) .sidebar-nav-btn,
 	.group\/projects-item:hover:not(:has(.sidebar-row-action:hover)) .sidebar-nav-btn,
+	.group\/halloween-item:hover:not(:has(.sidebar-row-action:hover)) .sidebar-nav-btn,
 	.group\/recent-item:hover:not(:has(.sidebar-row-action:hover)) .sidebar-nav-btn,
 	/* The chevron discloses this row's own list, so the row stays lit while hovered. */
 	.group\/images-item:hover > .relative > .sidebar-nav-btn,
@@ -2234,6 +2698,7 @@ html[data-chat-font] .aui-root {
 	.dark .group\/project-item:hover:not(:has(.sidebar-row-action:hover)) .sidebar-nav-btn,
 	.dark .group\/project-chat-item:hover:not(:has(.sidebar-row-action:hover)) .sidebar-nav-btn,
 	.dark .group\/projects-item:hover:not(:has(.sidebar-row-action:hover)) .sidebar-nav-btn,
+	.dark .group\/halloween-item:hover:not(:has(.sidebar-row-action:hover)) .sidebar-nav-btn,
 	.dark .group\/recent-item:hover:not(:has(.sidebar-row-action:hover)) .sidebar-nav-btn,
 	.dark .group\/images-item:hover > .relative > .sidebar-nav-btn,
 	.dark .group\/audio-item:hover > .relative > .sidebar-nav-btn,
@@ -2425,15 +2890,16 @@ html[data-chat-font] .aui-root {
 
 	/* Images (Create + Train) and Video: a lighter control border than the palette
 	   default. Light mode only, since dark mode draws these controls borderless.
-	   Overrides the token, so every derived shade stays in step. */
-	html:not(.dark) .diffusion-surface {
+	   Overrides the token, so every derived shade stays in step. Halloween keeps its own
+	   border: a neutral gray vanishes on its tinted pages. */
+	html:not(.dark):not(:where([data-palette="pumpkin"], [data-palette="black-cat"], [data-palette="trick-or-treat"], [data-palette="bloody-valentine"], [data-palette="alien"], [data-palette="ghost-ship"], [data-palette="the-thing"], [data-palette="midnight-haunt"], [data-palette="gothic"])) .diffusion-surface {
 		--border-base: #e9e9e9;
 		--input-base: #e9e9e9;
 		--border: var(--border-base);
 		--input: var(--input-base);
 	}
 	/* The :root derivation is already substituted, so a scoped base must redo it for the slider. */
-	html[data-contrast-adjust]:not(.dark) .diffusion-surface {
+	html[data-contrast-adjust]:not(.dark):not(:where([data-palette="pumpkin"], [data-palette="black-cat"], [data-palette="trick-or-treat"], [data-palette="bloody-valentine"], [data-palette="alien"], [data-palette="ghost-ship"], [data-palette="the-thing"], [data-palette="midnight-haunt"], [data-palette="gothic"])) .diffusion-surface {
 		--border: color-mix(in oklab, var(--border-base), var(--contrast-target) var(--contrast-line-mix));
 		--input: color-mix(in oklab, var(--input-base), var(--contrast-target) var(--contrast-control-mix));
 	}

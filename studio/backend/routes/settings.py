@@ -4810,6 +4810,15 @@ class PersonalizationAppearance(BaseModel):
         "taro",
         "wasabi",
         "yuzu",
+        "pumpkin",
+        "bloody-valentine",
+        "the-thing",
+        "alien",
+        "gothic",
+        "black-cat",
+        "trick-or-treat",
+        "ghost-ship",
+        "midnight-haunt",
     ] = "standard"
     language: Optional[str] = Field(None, max_length = 20)
     customization: PersonalizationCustomization = Field(
