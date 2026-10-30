@@ -1,7 +1,7 @@
-name: "staging-16077 windows-latest"
+name: "staging-16069 ubuntu-latest"
 on:
   push:
-    branches: ["pr-16077-xplat-ci"]
+    branches: ["pr-16069-xplat-ci"]
     paths-ignore:
       - '**/*.md'
   workflow_dispatch:
@@ -15,7 +15,7 @@ defaults:
     shell: bash
 jobs:
   test:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       UNSLOTH_COMPILE_DISABLE: '1'
@@ -34,4 +34,4 @@ jobs:
         run: npm ci --no-fund --no-audit
       - name: Node tests
         working-directory: studio/frontend
-        run: node --experimental-strip-types --test tests/dismiss-click-streak.test.ts
+        run: node --experimental-strip-types --test tests/artifact-frame-network-access.test.ts tests/backend-download-progress.test.ts tests/desktop-closing-overlay.test.ts tests/lazy-locale-loading.test.ts tests/locale-detection.test.ts tests/login-account-modes.test.ts tests/startup-messages.test.ts tests/tauri-details-toggle.test.ts tests/update-banner-flex-priority.test.ts tests/update-screen-drag-region.test.ts
