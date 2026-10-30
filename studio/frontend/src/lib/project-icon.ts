@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+
+import { Folder01Icon } from "./folder-icons";
+
+// A project while it is not open; Folder02Icon (open folder) stays for an expanded or opened project.
+export const ProjectIcon = Folder01Icon;
