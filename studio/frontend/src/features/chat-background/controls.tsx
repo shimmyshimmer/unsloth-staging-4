@@ -25,7 +25,10 @@ import {
 	IMAGE_SIZING,
 	type ImageSizing,
 	POSITIONS,
+	SCOPES,
+	type BackgroundScope,
 	normalizedSize,
+	parsePosition,
 	validUpload,
 	type BackgroundEffect,
 } from "./model";
@@ -46,12 +49,31 @@ const labels: Record<BackgroundEffect, TranslationKey> = {
 	Halftone: "chatBackground.halftone",
 	Scanlines: "chatBackground.scanlines",
 };
+const scopeLabels: Record<BackgroundScope, TranslationKey> = {
+	newChat: "chatBackground.scopeNewChat",
+	chats: "chatBackground.scopeChats",
+	all: "chatBackground.scopeAll",
+};
 const sizingLabels: Record<ImageSizing, TranslationKey> = {
 	cover: "chatBackground.fill",
 	contain: "chatBackground.fit",
+	width: "chatBackground.fitWidth",
+	height: "chatBackground.fitHeight",
 	stretch: "chatBackground.stretch",
 	original: "chatBackground.original",
 };
+const SLIDERS: {
+	key: "visibility" | "blur" | "zoom" | "outline";
+	label: TranslationKey;
+	min: number;
+	max: number;
+	unit: string;
+}[] = [
+	{ key: "visibility", label: "chatBackground.visibility", min: 0, max: 100, unit: "%" },
+	{ key: "blur", label: "chatBackground.blur", min: 0, max: 20, unit: "px" },
+	{ key: "zoom", label: "chatBackground.zoom", min: 100, max: 300, unit: "%" },
+	{ key: "outline", label: "chatBackground.outline", min: 0, max: 100, unit: "%" },
+];
 const errors = {
 	storage: "chatBackground.storageError",
 	file: "chatBackground.fileError",
@@ -179,7 +201,9 @@ export function ChatBackgroundControls() {
 							className="wallpaper-preview relative h-48 overflow-hidden rounded-xl border border-border bg-background"
 							data-wallpaper-conversation={conversation || undefined}
 						>
-							<ChatBackground />
+							<ChatBackground
+								active={!(conversation && adjustments.scope === "newChat")}
+							/>
 							{!value && (
 								<p className="absolute inset-x-4 top-4 text-center text-xs text-muted-foreground">
 									{t("chatBackground.noBackground")}
@@ -201,7 +225,30 @@ export function ChatBackgroundControls() {
 			</div>
 			{value && (
 				<>
-					<SettingsRow label={t("chatBackground.effect")} className="mt-3 items-start">
+					<SettingsRow label={t("chatBackground.scope")} className="mt-3 items-start">
+						<Select
+							disabled={busy}
+							value={adjustments.scope}
+							onValueChange={(scope) =>
+								patchBackground({ scope: scope as BackgroundScope })
+							}
+						>
+							<SelectTrigger
+								aria-label={t("chatBackground.scope")}
+								className="w-52"
+							>
+								<SelectValue />
+							</SelectTrigger>
+							<SelectContent>
+								{SCOPES.map((scope) => (
+									<SelectItem key={scope} value={scope}>
+										{t(scopeLabels[scope])}
+									</SelectItem>
+								))}
+							</SelectContent>
+						</Select>
+					</SettingsRow>
+					<SettingsRow label={t("chatBackground.effect")} className="items-start">
 						<Select
 							disabled={!value || busy}
 							value={adjustments.effect}
@@ -247,49 +294,25 @@ export function ChatBackgroundControls() {
 							</SelectContent>
 						</Select>
 					</SettingsRow>
-					{(["visibility", "blur", "zoom"] as const).map((key) => (
-						<SettingsRow
-							key={key}
-							className="items-start"
-							label={t(
-								key === "zoom"
-									? "chatBackground.zoom"
-									: key === "blur"
-										? "chatBackground.blur"
-										: "chatBackground.visibility",
-							)}
-						>
+					{SLIDERS.map(({ key, label, min, max, unit }) => (
+						<SettingsRow key={key} className="items-start" label={t(label)}>
 							<div className="flex w-52 items-center gap-3">
 								<Slider
 									disabled={!value || busy}
-									aria-label={t(
-										key === "zoom"
-											? "chatBackground.zoom"
-											: key === "blur"
-												? "chatBackground.blur"
-												: "chatBackground.visibility",
-									)}
-									min={key === "zoom" ? 100 : 0}
-									max={key === "zoom" ? 300 : key === "blur" ? 20 : 100}
+									aria-label={t(label)}
+									min={min}
+									max={max}
 									step={1}
 									value={[adjustments[key]]}
 									onValueChange={([v]) => patchBackground({ [key]: v })}
 								/>
 								<span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
 									{adjustments[key]}
-									{key === "blur" ? "px" : "%"}
+									{unit}
 								</span>
 							</div>
 						</SettingsRow>
 					))}
-					<SettingsRow label={t("chatBackground.outline")} className="items-start">
-						<Switch
-							aria-label={t("chatBackground.outline")}
-							checked={adjustments.outline}
-							disabled={!value || busy}
-							onCheckedChange={(outline) => patchBackground({ outline })}
-						/>
-					</SettingsRow>
 					<SettingsRow label={t("chatBackground.fade")} className="items-start">
 						<Switch
 							aria-label={t("chatBackground.fade")}
@@ -309,9 +332,7 @@ export function ChatBackgroundControls() {
 								aria-label={t("chatBackground.position")}
 							>
 								{POSITIONS.map((position) => {
-									const [x, y] = position
-										.split(" ")
-										.map((v) => Number.parseInt(v));
+									const [x, y] = parsePosition(position)!;
 									return (
 										<button
 											key={position}
@@ -330,6 +351,32 @@ export function ChatBackgroundControls() {
 							</div>
 						</div>
 					</SettingsRow>
+					{(["horizontal", "vertical"] as const).map((axis, index) => {
+						const label = t(`chatBackground.${axis}`);
+						const current = parsePosition(adjustments.position) ?? [50, 50];
+						return (
+							<SettingsRow key={axis} className="items-start" label={label}>
+								<div className="flex w-52 items-center gap-3">
+									<Slider
+										disabled={!value || busy}
+										aria-label={label}
+										min={0}
+										max={100}
+										step={1}
+										value={[current[index]]}
+										onValueChange={([v]) => {
+											const next = [...current];
+											next[index] = v;
+											patchBackground({ position: `${next[0]}% ${next[1]}%` });
+										}}
+									/>
+									<span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+										{current[index]}%
+									</span>
+								</div>
+							</SettingsRow>
+						);
+					})}
 				</>
 			)}
 		</SettingsSection>

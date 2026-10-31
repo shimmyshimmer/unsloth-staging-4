@@ -27,9 +27,20 @@ test("background preferences repair malformed persisted data", () => {
 	);
 	assert.equal(sanitizeAdjustments({ visibility: NaN }).visibility, 70);
 	assert.equal(sanitizeAdjustments({ fade: false }).fade, false);
-    assert.equal(sanitizeAdjustments({ outline: false }).outline, false);
-    assert.equal(sanitizeAdjustments({ outline: "false" as never }).outline, true);
+    // Stored booleans from the old switch map onto the strength slider.
+    assert.equal(sanitizeAdjustments({ outline: false as never }).outline, 0);
+    assert.equal(sanitizeAdjustments({ outline: true as never }).outline, DEFAULT_ADJUSTMENTS.outline);
+    assert.equal(sanitizeAdjustments({ outline: "false" as never }).outline, DEFAULT_ADJUSTMENTS.outline);
+    assert.equal(sanitizeAdjustments({ outline: 150 }).outline, 100);
+    assert.equal(sanitizeAdjustments({ position: "25% 80%" }).position, "25% 80%");
+    assert.equal(sanitizeAdjustments({ position: "101% 0%" }).position, "50% 50%");
+    assert.equal(sanitizeAdjustments({ sizing: "width" }).sizing, "width");
     assert.equal(sanitizeAdjustments({ sizing: "contain" }).sizing, "contain");
+    // Saved before scopes existed: keep showing on chats, as it always did.
+    assert.equal(sanitizeAdjustments({}).scope, "chats");
+    assert.equal(sanitizeAdjustments({ scope: "all" }).scope, "all");
+    assert.equal(sanitizeAdjustments({ scope: "newChat" }).scope, "newChat");
+    assert.equal(sanitizeAdjustments({ scope: "everywhere" as never }).scope, "chats");
     assert.equal(sanitizeAdjustments({ sizing: "invalid" as never }).sizing, "cover");
     assert.equal(sanitizeAdjustments({ zoom: 500 }).zoom, 300);
     assert.equal(sanitizeAdjustments({ zoom: 0 }).zoom, 100);
