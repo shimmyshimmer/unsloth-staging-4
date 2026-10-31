@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-import { BACKGROUND_ON_ALL_PAGES, ChatBackground } from "@/features/chat-background";
+import {
+  BACKGROUND_ON_ALL_PAGES,
+  ChatBackground,
+  LiquidGlassMount,
+  WindowMaterialMount,
+} from "@/features/chat-background";
 import { ImageViewer } from "@/components/image-viewer";
 import { useAppShellReadySignal } from "@/components/app-readiness";
 import { LazyImportFailure } from "@/components/lazy-import-boundary";
@@ -696,6 +701,8 @@ function RootLayout() {
     <>
       <PersonalizationSyncMount />
       <InterfaceZoom />
+      <WindowMaterialMount />
+      <LiquidGlassMount />
       <ReloadSnapshotPrivacy />
       {!isAuthFlowRoute && <ChatSettingsHydrationMount />}
       {!isAuthFlowRoute && <LowDiskNoticeMount />}
