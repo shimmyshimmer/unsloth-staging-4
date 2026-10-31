@@ -22,6 +22,10 @@ import { ChatBackground } from "./index";
 import {
 	DEFAULT_ADJUSTMENTS,
 	EFFECTS,
+	LENS_MODES,
+	type LensMode,
+	MATERIALS,
+	type WindowMaterial,
 	IMAGE_SIZING,
 	type ImageSizing,
 	POSITIONS,
@@ -38,6 +42,7 @@ import {
 	useChatBackground,
 } from "./storage";
 import { canvasBlob, decodeImage } from "./image";
+import { nativeMaterialAvailable, useMaterialStore } from "./material";
 
 const labels: Record<BackgroundEffect, TranslationKey> = {
 	None: "chatBackground.none",
@@ -52,6 +57,131 @@ const sizingLabels: Record<ImageSizing, TranslationKey> = {
 	stretch: "chatBackground.stretch",
 	original: "chatBackground.original",
 };
+const materialLabels: Record<WindowMaterial, TranslationKey> = {
+	solid: "chatBackground.materialSolid",
+	transparent: "chatBackground.materialTransparent",
+	frosted: "chatBackground.materialFrosted",
+	blurred: "chatBackground.materialBlurred",
+	liquid: "chatBackground.materialLiquid",
+	"liquid-3d": "chatBackground.materialLiquid3d",
+	macos: "chatBackground.materialMacos",
+};
+function MaterialRow({ hasImage }: { hasImage: boolean }) {
+	const t = useT();
+	const { material, nativeFailed, setMaterial } = useMaterialStore();
+	const native = nativeMaterialAvailable();
+	const options = MATERIALS.filter((m) => m !== "macos" || native);
+	const shown = options.includes(material) ? material : "solid";
+	const note = nativeFailed
+		? "chatBackground.materialNativeFailed"
+		: shown === "macos"
+			? "chatBackground.materialMacosNote"
+			: shown !== "solid" && !hasImage
+				? "chatBackground.materialNeedsImage"
+				: null;
+	return (
+		<SettingsRow
+			label={t("chatBackground.material")}
+			description={note ? t(note) : t("chatBackground.materialDescription")}
+		>
+			<Select
+				value={shown}
+				onValueChange={(next) => setMaterial(next as WindowMaterial)}
+			>
+				<SelectTrigger
+					aria-label={t("chatBackground.material")}
+					className="w-52"
+				>
+					<SelectValue />
+				</SelectTrigger>
+				<SelectContent>
+					{options.map((m) => (
+						<SelectItem key={m} value={m}>
+							{t(materialLabels[m])}
+						</SelectItem>
+					))}
+				</SelectContent>
+			</Select>
+		</SettingsRow>
+	);
+}
+function MaterialMenusRow() {
+	const t = useT();
+	const { material, menus, setMenus } = useMaterialStore();
+	const off =
+		material === "solid" || (material === "macos" && !nativeMaterialAvailable());
+	return (
+		<SettingsRow
+			label={t("chatBackground.materialMenus")}
+			description={t("chatBackground.materialMenusDescription")}
+		>
+			<Switch
+				aria-label={t("chatBackground.materialMenus")}
+				checked={menus && !off}
+				disabled={off}
+				onCheckedChange={setMenus}
+			/>
+		</SettingsRow>
+	);
+}
+function MaterialStrengthRow() {
+	const t = useT();
+	const { material, strength, setStrength } = useMaterialStore();
+	const off =
+		material === "solid" || (material === "macos" && !nativeMaterialAvailable());
+	return (
+		<SettingsRow label={t("chatBackground.materialStrength")}>
+			<div className="flex w-52 items-center gap-3">
+				<Slider
+					disabled={off}
+					aria-label={t("chatBackground.materialStrength")}
+					min={0}
+					max={100}
+					step={1}
+					value={[strength]}
+					onValueChange={([v]) => setStrength(v)}
+				/>
+				<span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+					{strength}%
+				</span>
+			</div>
+		</SettingsRow>
+	);
+}
+const lensLabels: Record<LensMode, TranslationKey> = {
+	off: "chatBackground.lensOff",
+	magnify: "chatBackground.lensMagnify",
+	shrink: "chatBackground.lensShrink",
+};
+function LensRow() {
+	const t = useT();
+	const { material, lens, setLens } = useMaterialStore();
+	const off =
+		material === "solid" || (material === "macos" && !nativeMaterialAvailable());
+	return (
+		<SettingsRow
+			label={t("chatBackground.lens")}
+			description={t("chatBackground.lensDescription")}
+		>
+			<Select
+				disabled={off}
+				value={lens}
+				onValueChange={(next) => setLens(next as LensMode)}
+			>
+				<SelectTrigger aria-label={t("chatBackground.lens")} className="w-52">
+					<SelectValue />
+				</SelectTrigger>
+				<SelectContent>
+					{LENS_MODES.map((mode) => (
+						<SelectItem key={mode} value={mode}>
+							{t(lensLabels[mode])}
+						</SelectItem>
+					))}
+				</SelectContent>
+			</Select>
+		</SettingsRow>
+	);
+}
 const errors = {
 	storage: "chatBackground.storageError",
 	file: "chatBackground.fileError",
@@ -157,6 +287,10 @@ export function ChatBackgroundControls() {
 					}
 				}}
 			/>
+			<MaterialRow hasImage={Boolean(value)} />
+			<MaterialStrengthRow />
+			<LensRow />
+			<MaterialMenusRow />
 			{error && (
 				<p role="alert" className="mt-3 mb-3 text-sm text-destructive">
 					{t(errors[error])}
