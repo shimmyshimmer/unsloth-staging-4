@@ -4809,8 +4809,6 @@ class PersonalizationAppearance(BaseModel):
     theme: Literal["light", "dark", "system"] = "system"
     palette: Literal[
         "standard",
-        "classic",
-        "minimal",
         "blueberry",
         "butterfly-pea",
         "cherry",
