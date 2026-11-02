@@ -195,6 +195,7 @@ const TABS: TabDef[] = [
     id: "appearance",
     labelKey: "settings.tabs.appearance",
     icon: BrushCleaningIcon,
+    badgeKey: "shell.navigation.newBadge",
   },
   {
     id: "resources",
@@ -591,9 +592,10 @@ export function SettingsDialog() {
                 onScroll={onRailScroll}
                 className={cn(
                   // A short window leaves the list taller than the clipped sidebar, so scroll it.
-                  "hover-scrollbar settings-rail-fade flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto p-1",
+                  // -mr-1/pr-2: scroll bar nearer the edge, items unmoved.
+                  "hover-scrollbar settings-rail-fade -mr-1 flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto p-1 pr-2",
                   railFadeClass,
-                  "group-data-stacked/settings:flex-none group-data-stacked/settings:flex-row group-data-stacked/settings:overflow-x-auto group-data-stacked/settings:py-0",
+                  "group-data-stacked/settings:mr-0 group-data-stacked/settings:flex-none group-data-stacked/settings:flex-row group-data-stacked/settings:overflow-x-auto group-data-stacked/settings:py-0 group-data-stacked/settings:pr-1",
                   results !== null && "group-data-stacked/settings:flex hidden",
                 )}
               >
@@ -648,7 +650,8 @@ export function SettingsDialog() {
                         {t(tab.labelKey)}
                       </span>
                       {tab.badgeKey ? (
-                        <span className="relative z-10 ml-auto rounded-full bg-control-accent/10 px-2 py-1 text-ui-10 leading-none font-semibold text-control-accent">
+                        // Visual only, so the tab's accessible name stays its label.
+                        <span aria-hidden="true" className="relative z-10 ml-auto rounded-full bg-control-accent/10 px-2 py-1 text-ui-10 leading-none font-semibold text-control-accent">
                           {t(tab.badgeKey)}
                         </span>
                       ) : null}
