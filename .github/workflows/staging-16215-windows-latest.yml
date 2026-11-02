@@ -1,0 +1,100 @@
+name: "staging-16215 windows-latest"
+on:
+  push:
+    branches: ["pr-16215-paired-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart psutil
+      - name: Compare merge-base and head source on this runner
+        shell: bash
+        run: |
+          python - <<'PAIRPY'
+          import json
+          import os
+          import shutil
+          import subprocess
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          
+          workspace = Path.cwd()
+          source = "https://github.com/unslothai/unsloth.git"
+          base_sha = "f863657aebd19f5cd382173c0095854184398a2c"
+          head_sha = "c91e4803cfb97e33423673e77dc2910c7afac042"
+          test_file = Path("studio/backend/tests/test_cache_inventory.py")
+          root = workspace / ".cache-pair"
+          root.mkdir()
+          subprocess.run(["git", "fetch", "--no-tags", "--depth=1", source, base_sha, head_sha], check=True)
+          for arm, sha in [("base", base_sha), ("head", head_sha)]:
+              subprocess.run(["git", "worktree", "add", "--detach", str(root / arm), sha], check=True)
+          shutil.copy2(root / "head" / test_file, root / "base" / test_file)
+          observed = {}
+          for arm in ["base", "head"]:
+              tree = root / arm
+              environment = os.environ.copy()
+              environment["PYTHONPATH"] = str(tree / "studio/backend")
+              environment["CUDA_VISIBLE_DEVICES"] = ""
+              output = root / (arm + ".xml")
+              code = (
+                  "from pathlib import Path; import sys; from utils import cache_inventory; "
+                  "print('ARM_IMPORT', cache_inventory.__file__, flush=True); "
+                  "assert Path(cache_inventory.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve()); "
+                  "import pytest; raise SystemExit(pytest.main(sys.argv[2:]))"
+              )
+              result = subprocess.run(
+                  [sys.executable, "-c", code, str(tree), str(test_file), "-q", "-o", "addopts=",
+                   "--tb=short", "--junitxml=" + str(output)],
+                  cwd=tree, env=environment, check=False,
+              )
+              assert result.returncode in (0, 1), (arm, result.returncode)
+              document = ET.parse(output)
+              tests = document.findall(".//testcase")
+              assert tests, arm
+              assert not document.findall(".//error"), arm
+              assert not document.findall(".//skipped"), arm
+              ids = {case.attrib["classname"] + "::" + case.attrib["name"] for case in tests}
+              failures = {case.attrib["classname"] + "::" + case.attrib["name"]
+                          for case in tests if case.find("failure") is not None}
+              observed[arm] = {"ids": ids, "failures": failures}
+          base, head = observed["base"], observed["head"]
+          assert base["ids"] == head["ids"], "test IDs differ"
+          new_failures = head["failures"] - base["failures"]
+          fixed = base["failures"] - head["failures"]
+          required = ("test_an_active_hub_nested", "test_a_nested_hub_breakdown", "test_a_growing_nested_hub")
+          targeted = {case for case in head["ids"] if any(prefix in case for prefix in required)}
+          assert len(targeted) == 5, targeted
+          assert not (targeted & head["failures"]), "new nested-cache cases fail"
+          assert not new_failures, sorted(new_failures)
+          assert fixed, "base did not expose the defect"
+          report = {
+              "verdict": "FIX_CONFIRMED", "base_sha": base_sha, "head_sha": head_sha,
+              "python": sys.version, "platform": sys.platform, "tests": len(head["ids"]),
+              "fixed": sorted(fixed), "shared_failures": sorted(head["failures"]),
+              "head_only_failures": sorted(new_failures), "new_nested_cases_passed": len(targeted),
+          }
+          (root / "result.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+          print("PAIRED_RESULT " + json.dumps(report), flush=True)
+          PAIRPY
