@@ -1,0 +1,2 @@
+studio/backend/tests/test_chat_history_routes.py
+studio/backend/tests/test_training_finalizing_phase.py
