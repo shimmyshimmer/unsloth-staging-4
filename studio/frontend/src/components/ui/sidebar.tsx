@@ -72,6 +72,11 @@ function useSidebar() {
   return context
 }
 
+/** The sidebar state, or null outside a SidebarProvider (an embedded or standalone page). */
+function useOptionalSidebar() {
+  return React.useContext(SidebarContext)
+}
+
 const OPEN_DIALOG_SELECTOR =
   '[data-slot="dialog-content"][data-state="open"], [data-slot="alert-dialog-content"][data-state="open"]'
 
@@ -932,6 +937,7 @@ export {
   SidebarResizeHandle,
   SidebarSeparator,
   SidebarTrigger,
+  useOptionalSidebar,
   useSidebar,
   SIDEBAR_WIDTH,
   SIDEBAR_WIDTH_ICON,

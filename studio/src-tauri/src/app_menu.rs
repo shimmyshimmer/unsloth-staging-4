@@ -53,6 +53,7 @@ const GO_ROWS: &[Row] = &[
     Row::Action("go-hub", "Model Hub", "Ctrl+3"),
     Row::Action("go-train", "Train", "Ctrl+4"),
     Row::Action("go-recipes", "Recipes", "Ctrl+5"),
+    Row::Action("go-flows", "Flows", ""),
     Row::Action("go-images", "Images", "Ctrl+6"),
     Row::Action("go-video", "Video", "Ctrl+7"),
     Row::Action("go-audio", "Audio", "Ctrl+8"),
@@ -161,7 +162,46 @@ pub fn setup_app_menus(
             }
         }
     }
+    route_edit_history(app, find("Edit")?)?;
     app.manage(AppMenuActions(std::sync::Mutex::new(actions)));
+    Ok(())
+}
+
+/// (native item label, action, accelerator) for the Edit items the renderer runs itself.
+#[cfg(target_os = "macos")]
+const EDIT_HISTORY: &[(&str, &str, &str)] = &[
+    ("Undo", "edit-undo", "CmdOrCtrl+Z"),
+    ("Redo", "edit-redo", "CmdOrCtrl+Shift+Z"),
+];
+
+/// The main webview is a child webview (the `unstable` feature), and wry returns NO from its
+/// performKeyEquivalent for those (tauri#9426): the page never sees Cmd+Z, the native Undo sends
+/// `undo:` instead, and that does nothing outside a text field. These items send the action to
+/// the renderer, which undoes text natively or replays the key for the page's own history.
+#[cfg(target_os = "macos")]
+fn route_edit_history(
+    app: &tauri::App,
+    edit: Option<(usize, tauri::menu::Submenu<tauri::Wry>)>,
+) -> tauri::Result<()> {
+    use tauri::menu::MenuItemBuilder;
+
+    let Some((_, edit)) = edit else {
+        return Ok(());
+    };
+    for (index, item) in edit.items()?.into_iter().enumerate() {
+        let Some(native) = item.as_predefined_menuitem() else {
+            continue;
+        };
+        let label = native.text()?;
+        let Some((_, action, accelerator)) = EDIT_HISTORY.iter().find(|row| row.0 == label) else {
+            continue;
+        };
+        let routed = MenuItemBuilder::with_id(format!("{ID_PREFIX}{action}"), &label)
+            .accelerator(*accelerator)
+            .build(app)?;
+        edit.remove(&item)?;
+        edit.insert(&routed, index)?;
+    }
     Ok(())
 }
 
@@ -204,18 +244,87 @@ fn append_rows(
 
 #[cfg(target_os = "macos")]
 pub fn handle_menu_event(app: &tauri::AppHandle, id: &str) {
-    use tauri::Emitter;
-
     let Some(action) = id.strip_prefix(ID_PREFIX) else {
         return;
     };
     crate::show_main_window(app);
+    if EDIT_HISTORY.iter().any(|row| row.1 == action) {
+        route_history(app, action);
+        return;
+    }
+    emit_action(app, action);
+}
+
+#[cfg(target_os = "macos")]
+fn emit_action(app: &tauri::AppHandle, action: &str) {
+    use tauri::Emitter;
+
     if let Err(error) = app.emit_to("main", APP_MENU_ACTION_EVENT, action) {
         log::warn!("Could not send menu action {action}: {error}");
     }
 }
 
-/// Enable exactly the listed actions and show each one's current chord. No-op without app menus.
+/// Undo / Redo go where the key focus is: the Studio page gets the renderer action, and an
+/// embedded browser page (its own native webview) gets AppKit's `undo:` / `redo:`, as the stock
+/// Edit items sent it.
+#[cfg(target_os = "macos")]
+fn route_history(app: &tauri::AppHandle, action: &str) {
+    let Some(main) = app.get_webview("main") else {
+        emit_action(app, action);
+        return;
+    };
+    let window = main.window();
+    let handle = app.clone();
+    let owned = action.to_string();
+    let sent = main.with_webview(move |platform| {
+        if !undo_in_other_view(&window, platform.inner(), owned == "edit-redo") {
+            emit_action(&handle, &owned);
+        }
+    });
+    if sent.is_err() {
+        emit_action(app, action);
+    }
+}
+
+/// On the main thread: when the key focus is outside the main webview, send it `undo:` or `redo:`
+/// up its responder chain and return true; false leaves it to the renderer.
+#[cfg(target_os = "macos")]
+fn undo_in_other_view(
+    window: &tauri::Window,
+    main_view: *mut std::ffi::c_void,
+    redo: bool,
+) -> bool {
+    use objc2::sel;
+    use objc2_app_kit::{NSView, NSWindow};
+
+    let Ok(ns_window) = window.ns_window() else {
+        return false;
+    };
+    if ns_window.is_null() || main_view.is_null() {
+        return false;
+    }
+    // SAFETY: both are live AppKit objects owned by this window, read on the main thread.
+    let (ns_window, main_view) = unsafe {
+        (
+            &*(ns_window as *const NSWindow),
+            &*(main_view as *const NSView),
+        )
+    };
+    let Some(responder) = ns_window.firstResponder() else {
+        return false;
+    };
+    if let Some(view) = responder.downcast_ref::<NSView>() {
+        if view.isDescendantOf(main_view) {
+            return false;
+        }
+    }
+    let action = if redo { sel!(redo:) } else { sel!(undo:) };
+    // SAFETY: a standard responder action with no sender, as a menu item would send it.
+    unsafe { responder.tryToPerform_with(action, None) }
+}
+
+/// Enable exactly the listed actions, and show the chord each is bound to now (None for none).
+/// A no-op where there are no app menus.
 #[tauri::command]
 pub fn set_app_menu_actions(
     app: tauri::AppHandle,

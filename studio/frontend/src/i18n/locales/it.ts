@@ -792,6 +792,7 @@ export const it = {
       library: "Libreria",
       train: "Addestra",
       recipes: "Ricette",
+      flows: "Flussi",
       images: "Immagini",
       video: "Video",
       audio: "Audio",
