@@ -1,0 +1,39 @@
+name: "staging-16470 strict native watchdog"
+on:
+  push:
+    branches: ["pr-16470-convergence-rust-strict-ci"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: unslothai/unsloth
+          ref: 242f14b1d2eb10b3be7749d29bb4eda758b4e7e4
+          path: before
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Compile production decision on this native target
+        run: python .github/scripts/watchdog_native_matrix.py --base before/studio/src-tauri/src/commands.rs --head studio/src-tauri/src/commands.rs --out results/watchdog.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: watchdog-${{ matrix.os }}
+          path: results/watchdog.json
+          if-no-files-found: error
