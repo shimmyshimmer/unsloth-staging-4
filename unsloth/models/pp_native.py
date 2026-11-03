@@ -103,8 +103,7 @@ class PPConfig:
 
 
 class _StageOutput(BaseException):
-    """Raised by the pass-through after a non-last stage's last layer: the stage output. A BaseException,
-    so no `except Exception` inside a model forward swallows it."""
+    """BaseException prevents model-level except Exception handlers from swallowing stage exits."""
 
     def __init__(self, hidden):
         super().__init__()
@@ -141,7 +140,6 @@ def _decoder_of(inner):
 
 
 def _owner(root, target):
-    """(parent module, attribute name) holding `target` inside `root`."""
     for name, module in root.named_modules():
         for attr, child in module._modules.items():
             if child is target:
@@ -150,7 +148,6 @@ def _owner(root, target):
 
 
 def _model_chain(model):
-    """`model` and every wrapper level below it (PeftModel -> LoraModel -> CausalLM -> decoder)."""
     chain, m = [], model
     while isinstance(m, nn.Module) and all(m is not c for c in chain) and len(chain) < 8:
         chain.append(m)
@@ -164,7 +161,6 @@ def _model_chain(model):
 
 
 def is_pipeline_parallel(model) -> bool:
-    """True when apply_pipeline_parallel split `model` or a wrapper level below it."""
     if not isinstance(model, nn.Module):
         return False
     try:
@@ -175,7 +171,6 @@ def is_pipeline_parallel(model) -> bool:
 
 
 def pipeline_stage_of(model):
-    """The PipelineParallel of `model` (any wrapper level below it), else None."""
     if not isinstance(model, nn.Module):
         return None
     for level in _model_chain(model):
@@ -203,9 +198,7 @@ def _root_mesh(mesh):
 
 
 def check_mesh_composition(meshes, what = "pipeline parallel composition"):
-    """`meshes` ({name: 1-D DeviceMesh}) must be dimensions of one init_device_mesh covering every rank:
-    1-D, meeting only at this rank (orthogonal) and with sizes multiplying to the world size. Returns the
-    world size covered; ValueError otherwise (nothing is changed)."""
+    """Validate orthogonal 1-D meshes that jointly cover the world before changing the model."""
     import torch.distributed as dist
 
     world = dist.get_world_size() if dist.is_initialized() else 1
@@ -287,14 +280,14 @@ def check_pp_dp_composition(model, dp_mesh):
 
 @dataclasses.dataclass
 class _Parts:
-    inner: nn.Module  # the CausalLM
-    decoder: nn.Module  # the base model holding embed / layers / norm
+    inner: nn.Module
+    decoder: nn.Module
     layers: nn.ModuleList
-    layers_name: str  # attribute of `decoder`
+    layers_name: str
     embed: nn.Module
     lm_head: nn.Module
-    norms: list  # [(name, module)]: other parameter-holding decoder children (final norm)
-    source: str  # "transformers" (base_model_pp_plan) / "structural"
+    norms: list
+    source: str
     tied: bool
 
 
@@ -312,7 +305,7 @@ def _find_parts(model) -> _Parts:
         )
     text = _text_config(model)
     n = getattr(text, "num_hidden_layers", None)
-    # A decoder-only use of an encoder-decoder config (BartForCausalLM): num_hidden_layers is the encoder's.
+    # Decoder-only encoder-decoder configs report encoder depth here.
     counts = {n, getattr(text, "decoder_layers", None)} - {None}
     pp_plan = getattr(text, "base_model_pp_plan", None) or getattr(
         getattr(inner, "config", None), "base_model_pp_plan", None
@@ -365,13 +358,11 @@ def _find_parts(model) -> _Parts:
     order = list(decoder._modules)
     others = []
     for name, child in norms:
-        base = getattr(child, "original_module", child)  # PEFT modules_to_save wraps it
+        base = getattr(child, "original_module", child)
         norm_like = "norm" in name.lower() or "Norm" in type(base).__name__
         too_big = bool(hidden) and sum(p.numel() for p in base.parameters()) > 4 * hidden
-        # A learned position / token-type table before the layers (GPT-2 wpe, OPT / BART / Whisper
-        # embed_positions): indexed by positions, not tokens, so later stages (whose pre-layer result is
-        # replaced by the received hidden states anyway) need nothing from it. A token-indexed table could
-        # feed the layers a side input and stays refused.
+        # Later stages replace positional-table output; token-indexed side inputs remain unsupported.
+
         positional = (
             isinstance(base, nn.Embedding)
             and isinstance(vocab, int)
@@ -393,8 +384,6 @@ def _find_parts(model) -> _Parts:
         if _owner(child, lm_head)[0] is not None:
             continue
         if _owner(child, decoder)[0] is not None:
-            # A wrapper around the decoder (OPTModel.decoder, BartDecoderWrapper.decoder): fine when it holds
-            # nothing else.
             inside = {id(p) for p in decoder.parameters()}
             if all(id(p) in inside for p in child.parameters()):
                 continue
@@ -409,8 +398,7 @@ def _find_parts(model) -> _Parts:
 
 
 def _refuse_shared_across_stages(parts, bounds):
-    """A trainable parameter used by layers of two stages (a block shared by several layers, Zamba2 /
-    ALBERT style) would be trained as two independent copies."""
+    """Refuse cross-stage trainable sharing, which would create independently trained copies."""
     stage_of = {i: k for k, (start, end) in enumerate(bounds) for i in range(start, end)}
     owners = {}
     for i, layer in enumerate(parts.layers):
@@ -746,8 +734,7 @@ def _forward_function(module):
 
 
 def _layer_call_format(decoder, layers_name):
-    """'tuple' when the decoder forward reads `out = layer(...); hidden = out[0]` (Unsloth fast forwards,
-    transformers 4.x), 'tensor' when it reads `hidden = layer(...)` (transformers 5.x)."""
+    """Match the decoder's layer output convention: tuple on legacy forwards, tensor on newer ones."""
     try:
         source = textwrap.dedent(inspect.getsource(_forward_function(decoder)))
         tree = ast.parse(source)
@@ -781,7 +768,7 @@ def _layer_call_format(decoder, layers_name):
                 formats.add("tensor")
             elif f"{out}[0]" in text:
                 formats.add("tuple")
-        # A layer handed to a checkpoint function would run the pass-through inside the checkpoint.
+        # Pass-through stages must not be checkpointed.
         for node in ast.walk(body):
             if (
                 isinstance(node, ast.Call)
@@ -826,7 +813,6 @@ def split_layers(
     last_extra = 0.0,
     first_extra = 0.0,
 ):
-    """Contiguous [start, end) ranges (>= 1 layer each) minimizing the largest stage cost."""
     n = len(costs)
     if num_stages < 1 or num_stages > n:
         raise ValueError(
@@ -846,7 +832,7 @@ def split_layers(
         return c
 
     inf = float("inf")
-    # best[k][j]: smallest max cost of stages 0..k covering layers [0, j)
+    # best[k][j] is the minimum peak cost for stages 0..k covering layers [0, j).
     best = [[inf] * (n + 1) for _ in range(num_stages)]
     cut = [[0] * (n + 1) for _ in range(num_stages)]
     for j in range(1, n + 1):
@@ -871,7 +857,6 @@ def derive_pp_split(
     num_stages,
     config: Optional[PPConfig] = None,
 ):
-    """[(start, end)] decoder layer ranges per stage (dry run: no change to the model)."""
     config = config or PPConfig()
     parts = _find_parts(model)
     n = len(parts.layers)
@@ -916,8 +901,7 @@ except (
 
 
 class _PPPassThrough(_CheckpointLayer):
-    """A decoder layer another stage owns. Never checkpointed (GradientCheckpointingLayer with the flag
-    pinned off), so the hidden states it hands out stay in this stage's autograd graph."""
+    """Keep the pass-through in autograd without checkpointing another stage's layer."""
 
     gradient_checkpointing = property(lambda self: False, lambda self, value: None)
 
@@ -941,7 +925,6 @@ class _PPPassThrough(_CheckpointLayer):
 
 
 def _placeholder(weight):
-    """Same shape / dtype / device as `weight`, no storage (zero stride)."""
     return torch.zeros((), dtype = weight.dtype, device = weight.device).expand(weight.shape)
 
 
@@ -981,8 +964,6 @@ def _embedding_output_dtype(embedding):
 
 
 class _PPHeadStub(nn.Module):
-    """lm_head on stages before the last (never called: those stages stop after their last layer)."""
-
     def __init__(self, source):
         super().__init__()
         for key, value in _simple_attrs(source).items():
@@ -1187,18 +1168,15 @@ def _gradient_checkpointing_on(model):
 
 
 def _zoo_slot_lease_present():
-    """unsloth_zoo smart gradient checkpointing leases host offload slots per checkpoint (zoo PR #2071):
-    without it, interleaved forwards / backwards (1F1B) overwrite offloaded activations."""
+    """Interleaved 1F1B needs per-checkpoint offload-slot leases (zoo #2071)."""
     module = sys.modules.get("unsloth_zoo.gradient_checkpointing")
     if module is None:
-        return None  # smart gradient checkpointing not loaded
+        return None
     return hasattr(module, "_CpuSlotLease")
 
 
 def _check_torch_pipelining():
-    """The schedule calls pass scale_grads (torch >= 2.7) and step(return_outputs = ...) (torch >= 2.10).
-    Probe the signatures, not the version string: on older torch the first step fails (2.6) or passes
-    return_outputs into the model as a keyword (2.7 - 2.9) after this rank's stage was already cut out."""
+    """Probe pipelining signatures before splitting: older APIs fail or leak kwargs into forward."""
     try:
         from torch.distributed.pipelining import Schedule1F1B, ScheduleGPipe
     except ImportError as e:
@@ -1390,7 +1368,6 @@ class PipelineParallel:
 
     @property
     def composed(self):
-        """True when the stage spans more ranks than its pp group (dp and / or tp)."""
         import torch.distributed as dist
         return dist.is_initialized() and dist.get_world_size() != self.num_stages
 
@@ -1447,6 +1424,9 @@ class PipelineParallel:
             cast_forward_inputs = False,  # the received hidden states keep PPConfig.activation_dtype
         )
         fully_shard(self.module, mesh = dp_mesh, mp_policy = policy, reshard_after_forward = False)
+        from .fsdp2_save import _install_replicated_grad_reset
+
+        _install_replicated_grad_reset(self.module)
         self.dp_mesh = dp_mesh
         self._shapes.clear()  # stages built before hold the unwrapped module
 
@@ -1468,7 +1448,6 @@ class PipelineParallel:
         return torch.device("cpu")
 
     def parameters(self):
-        """This stage's trainable parameters (disjoint across stages)."""
         return [p for p in self.module.parameters() if p.requires_grad]
 
     def __repr__(self):
@@ -1489,8 +1468,8 @@ class PipelineParallel:
     def _loss_fn(self, output, target):
         self._mb_losses.append(output.detach())
         if self._loss_multiplier != 1:
-            # FSDP2 averages gradients over dp: dp x (sum of this replica's token losses / global tokens)
-            # averages to the global batch gradient.
+            # FSDP averages dp gradients, so scale each replica's global-token loss by dp size.
+
             output = output * self._loss_multiplier
         return output if self._scaler is None else self._scaler.scale(output)
 
@@ -1774,13 +1753,15 @@ class PipelineParallel:
 
         state = self.model.__dict__.setdefault("_unsloth_replicated_grad_state", {"queued": False})
         _sync_replicated_grads(
-            params, dist, model_mesh(self.model) or self.dp_mesh, state.setdefault("buffers", {})
+            params,
+            dist,
+            model_mesh(self.model) or self.dp_mesh,
+            state.setdefault("buffers", {}),
+            state.pop("pending", None),
         )
 
     def _grad_copies(self, grad):
-        """(local tensor, number of ranks holding the same values) for this rank's gradient. Stages hold
-        disjoint parameters; inside a stage plain gradients are replicated over its world // pp ranks and
-        a DTensor's local shard repeats over that count divided by its shard dimensions."""
+        """Count each stage gradient once, accounting for replicated and TP-sharded copies."""
         stage_ranks = torch.distributed.get_world_size() // self.num_stages if self.composed else 1
         try:
             from torch.distributed.tensor import DTensor, Replicate
@@ -1812,9 +1793,7 @@ class PipelineParallel:
         parameters = None,
         eps = 1e-6,
     ):
-        """Clip by the global 2-norm over every stage (squares summed over pp). Returns the norm.
-        Composed with dp / tp: every gradient element counted once over the world (a local square sum
-        divided by the ranks holding a copy of it, summed over every rank)."""
+        """Clip the global norm across pp/dp/tp without double-counting replicas."""
         import torch.distributed as dist
 
         self._check_unscaled()
@@ -1831,7 +1810,7 @@ class PipelineParallel:
             part = local.detach().double().square().sum().to(device)
             sq = sq + (part / copies if copies != 1 else part)
         if self.composed:
-            dist.all_reduce(sq)  # the meshes cover the world (checked by step)
+            dist.all_reduce(sq)
         elif self.num_stages > 1:
             dist.all_reduce(sq, group = self.group)
         total = sq.sqrt()
@@ -1841,8 +1820,7 @@ class PipelineParallel:
         return total.float()
 
     def unscale_(self, scaler, optimizer):
-        """scaler.unscale_(optimizer), then found_inf is the MAX over every stage, so all stages skip the
-        same steps (scaler.step / scaler.update after this)."""
+        """Reduce found_inf over every stage so all optimizers skip the same step."""
         scaler.unscale_(optimizer)
         if not scaler.is_enabled():
             return
@@ -1896,7 +1874,7 @@ class PipelineParallel:
         scaler._unsloth_pp_agree = pipeline
 
     def _check_unscaled(self):
-        """clip_grad_norm_ on gradients still multiplied by the loss scale clips the wrong norm."""
+        """Refuse clipping scaled gradients, which would use the wrong norm."""
         scaler = self._step_scaler
         if scaler is None or not scaler.is_enabled():
             return
@@ -1908,7 +1886,7 @@ class PipelineParallel:
         if any(
             state.get("stage") in (OptState.UNSCALED, OptState.STEPPED) for state in states.values()
         ):
-            return  # scaler.step unscales first: STEPPED gradients are unscaled too
+            return
         raise ValueError(
             "Unsloth: PipelineParallel.clip_grad_norm_ got gradients still multiplied by the float16 "
             "loss scale. Call scaler.unscale_(optimizer) (or pp.unscale_(scaler, optimizer)) first, as "
@@ -1925,7 +1903,7 @@ class PipelineParallel:
         for t in found.values():
             total = torch.maximum(total, t.reshape(1).float().to(device))
         if self.composed:
-            dist.all_reduce(total, op = dist.ReduceOp.MAX)  # every stage of every dp / tp replica
+            dist.all_reduce(total, op = dist.ReduceOp.MAX)
         elif self.num_stages > 1:
             dist.all_reduce(total, op = dist.ReduceOp.MAX, group = self.group)
         if not found:
@@ -1988,7 +1966,6 @@ class PipelineParallel:
         return merged
 
     def save_adapter(self, save_directory, **kwargs):
-        """Write the standard 1-GPU PEFT adapter from pp rank 0 (collective over the pp ranks)."""
         import torch.distributed as dist
 
         merged = self.adapter_state_dict(**kwargs)
@@ -2007,7 +1984,7 @@ class PipelineParallel:
 
             kwargs.pop("state_dict", None)
             kwargs.setdefault("is_main_process", True)
-            # PEFT's own writer (files, config, card), fed the merged selection of every stage.
+
             peft_model.get_peft_model_state_dict = gathered
             try:
                 peft_model.PeftModel.save_pretrained(self.model, save_directory, **kwargs)
