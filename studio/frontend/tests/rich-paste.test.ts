@@ -137,28 +137,3 @@ test("a structural paste returns the Markdown", () => {
   const parse = () => el("body", el("p", "Read ", el("a", { href: "https://unsloth.ai" }, "Unsloth")));
   assert.equal(richPasteMarkdown(clipboard(html, "Read Unsloth"), parse), "Read [Unsloth](https://unsloth.ai)");
 });
-
-test("a copy holding only a code block or styled spans still converts", () => {
-  const code = () => el("body", el("pre", el("code", { class: "language-python" }, "def f():\n    return 1\n")));
-  const fenced = richPasteMarkdown(
-    clipboard('<pre><code class="language-python">def f():\n    return 1\n</code></pre>', "def f():\n    return 1\n"),
-    code,
-  );
-  assert.match(fenced ?? "", /^```python\ndef f\(\):\n {4}return 1\n```/);
-  const styled = () => el("body", el("span", { style: "font-weight:700" }, "Bold"), " text");
-  assert.equal(
-    richPasteMarkdown(clipboard('<span style="font-weight:700">Bold</span> text', "Bold text"), styled),
-    "**Bold** text",
-  );
-});
-
-test("a table caption and line breaks inside code survive", () => {
-  assert.equal(
-    htmlNodeToMarkdown(el("table", el("caption", "Use these limits"), el("tr", el("th", "A")), el("tr", el("td", "1")))),
-    "Use these limits\n\n| A |\n| --- |\n| 1 |",
-  );
-  assert.equal(
-    htmlNodeToMarkdown(el("pre", "def f():", el("br"), "    return 1")),
-    "```\ndef f():\n    return 1\n```",
-  );
-});

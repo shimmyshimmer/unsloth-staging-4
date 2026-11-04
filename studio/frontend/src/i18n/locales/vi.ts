@@ -737,8 +737,11 @@ export const vi = {
     plainText: "Khung soạn thảo văn bản thuần",
     plainTextDescription:
       "Giữ mã, Markdown và liên kết dưới dạng văn bản nguyên bản. Tắt để hiển thị bản xem trước có định dạng.",
-    richPaste: "Dán văn bản có định dạng",
-    richPasteDescription: "Dán liên kết, bảng và định dạng dưới dạng Markdown. {shortcut} dán văn bản thuần. Trình soạn văn bản định dạng đầy đủ sắp ra mắt.",
+    richText: "Văn bản có định dạng",
+    richTextDescription: "Đầy đủ: Markdown như chữ đậm, nghiêng và mã được định dạng ngay khi bạn gõ. Chỉ khi dán: liên kết, bảng, danh sách và định dạng dán từ trang web và tài liệu sẽ thành Markdown. {shortcut} luôn dán văn bản thuần.",
+    richTextFull: "Đầy đủ",
+    richTextPasteOnly: "Chỉ khi dán",
+    richTextOff: "Tắt",
     showContext: "Mức sử dụng cửa sổ ngữ cảnh",
     sendShortcut: "Phím tắt gửi",
     sendMultiline: "{mod} + Enter cho lời nhắc nhiều dòng",

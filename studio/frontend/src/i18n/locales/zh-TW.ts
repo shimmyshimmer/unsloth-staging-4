@@ -696,8 +696,11 @@ export const zhTW = {
     plainText: "純文字輸入框",
     plainTextDescription:
       "將程式碼、Markdown 和連結保留為原始文字。關閉後會顯示格式化預覽。",
-    richPaste: "貼上豐富文字",
-    richPasteDescription: "將連結、表格和格式貼上為 Markdown。{shortcut} 貼上純文字。完整的富文字輸入框即將推出。",
+    richText: "豐富文字",
+    richTextDescription: "完整：輸入時即顯示粗體、斜體和程式碼等 Markdown 格式。僅限貼上：從網頁和文件貼上的連結、表格、清單和格式會轉換為 Markdown。{shortcut} 一律貼上純文字。",
+    richTextFull: "完整",
+    richTextPasteOnly: "僅限貼上",
+    richTextOff: "關閉",
     showContext: "上下文視窗用量",
     sendShortcut: "傳送快速鍵",
     sendMultiline: "多行提示詞使用 {mod} + Enter",
