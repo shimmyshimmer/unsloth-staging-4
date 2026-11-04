@@ -77,7 +77,7 @@ function userTexts(
     .filter((message) => message?.role === "user")
     .map((message) => messageText(message.content));
 }
-import { endBrowserAgentRun } from "@/features/browser/agent/agent-store";
+import { agentChat, endBrowserAgentRun } from "@/features/browser/agent/agent-store";
 import { browserAgentToolsForTurn } from "@/features/browser/agent/tools";
 import { shownBrowserChat } from "@/features/browser/panel-availability";
 import { projectHasSources } from "@/features/rag/api/rag-api";
@@ -2267,6 +2267,7 @@ export async function buildLocalTokenCountExtras(
   threadId: string | undefined,
   messages: readonly { role?: string; content?: unknown }[] = [],
 ): Promise<Record<string, unknown>> {
+  const browserChat = threadId ? `single:${threadId}` : shownBrowserChat();
   const state = useChatRuntimeStore.getState();
   const {
     supportsTools,
@@ -2328,7 +2329,7 @@ export async function buildLocalTokenCountExtras(
     codeToolsEnabled,
     userTexts(messages),
   );
-  const browserTools = browserAgentToolsForTurn();
+  const browserTools = browserAgentToolsForTurn(browserChat);
   const localMediaTools = localMediaToolsForTurn(state);
   if (
     !toolsEnabled &&
@@ -4443,6 +4444,8 @@ export function createOpenAIStreamAdapter(
       unstable_assistantMessageId,
     }) {
       // Read before the first await: later awaits make the store unreliable for the project.
+      const browserChatAtSend = shownBrowserChat();
+      const runThreadId = unstable_threadId ?? useChatRuntimeStore.getState().activeThreadId;
       const creationClaim = unstable_threadId
         ? readThreadCreationClaim(unstable_threadId)
         : undefined;
@@ -4456,8 +4459,6 @@ export function createOpenAIStreamAdapter(
       await awaitPendingQwenDefaultsMigration();
       // Every run path reaches here, so wait for this chat's own settings (else a chat stored as "ask"
       // could run tools on installation defaults). Bound to this run's chat.
-      const runThreadId =
-        unstable_threadId ?? useChatRuntimeStore.getState().activeThreadId;
       // Refuse rather than send with another chat's tools, which is unrecoverable.
       if (!(await awaitThreadScopedPairing(runThreadId))) {
         throw new Error(
@@ -4854,7 +4855,9 @@ export function createOpenAIStreamAdapter(
         runtime.deepResearchEnabled &&
         !options.pairId &&
         (options.modelType === undefined || options.modelType === "base");
-      const browserTools = browserAgentToolsForTurn();
+      const runBrowserChat = options.pairId ? `compare:${options.pairId}` : runThreadId ? `single:${runThreadId}` : browserChatAtSend;
+      const browserTools = browserAgentToolsForTurn(runBrowserChat);
+      const browserTargetVersion = agentChat(runBrowserChat).targetVersion;
       const toolConfirmationIdsByBackendId = new Map<string, string>();
       // Local tool ids ("call_0") repeat across turns and panes, so scope by pane and thread
       // (unstable_threadId only, matching the reader's remoteId).
@@ -5501,11 +5504,7 @@ export function createOpenAIStreamAdapter(
 
       const threadKey = resolvedThreadId || "__default";
       // A new chat's browser is the one on screen as it sends; a switch mid-run must not move it.
-      const browserChat = options.pairId
-        ? `compare:${options.pairId}`
-        : threadKey === "__default"
-          ? shownBrowserChat()
-          : undefined;
+      const browserChat = runBrowserChat;
       // A first turn files its handles under "__default" and autosave re-keys them mid-run, so resolve per use.
       const liveThreadKey = (owner: () => void) => {
         const key = threadKey === "__default" ? useChatRuntimeStore.getState().runKeyForOwner(threadKey, owner) : threadKey;
@@ -7459,6 +7458,7 @@ export function createOpenAIStreamAdapter(
                       if (action) {
                         void runBrowserAction(action, {
                           runKey: cancelId,
+                          targetVersion: browserTargetVersion,
                           chat: browserChat,
                           // Resolved per action: a first turn is re-keyed from "__default" to its id.
                           scope: liveThreadKey(serverCancel),
