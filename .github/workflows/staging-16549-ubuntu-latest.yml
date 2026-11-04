@@ -1,0 +1,37 @@
+name: "staging-16549 ubuntu-latest"
+on:
+  push:
+    branches: ["pr-16549-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+      - name: Install frontend deps
+        working-directory: studio/frontend
+        run: npm ci --no-fund --no-audit
+      - name: Node tests
+        working-directory: studio/frontend
+        run: node --experimental-strip-types --test tests/artifact-panel-reopen.test.ts tests/browser-agent-chats.test.ts tests/browser-agent-executor.test.ts tests/browser-agent-gate.test.ts tests/browser-agent-preparation.test.ts tests/browser-agent-share-adoption.test.ts tests/browser-agent-share.test.ts tests/browser-capture-parallel.test.ts tests/browser-native-share-lifetime.test.ts tests/browser-native-view-layered.test.ts tests/browser-new-tab-browser-use.test.ts tests/browser-store-chats.test.ts tests/browser-typed-tab-stays-live.test.ts tests/browser-url.test.ts tests/browser/browser-scope.test.ts tests/browser/observer.test.ts tests/context-usage-runtime.test.ts tests/popup-backdrop-no-blur.test.ts
