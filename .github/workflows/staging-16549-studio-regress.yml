@@ -1,0 +1,597 @@
+name: staging-16549 native parallel browser
+'on':
+  push:
+    branches:
+    - pr-16549-native-ci
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: native-parallel-16549-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ubuntu-22-04:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/native-target
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/sr-home
+      UNSLOTH_SKIP_AUTOSTART: '1'
+      UNSLOTH_DISABLE_UPDATE_CHECK: '1'
+      UNSLOTH_NO_LOCAL_GPU: '1'
+      CUDA_VISIBLE_DEVICES: ''
+      PYTHONUTF8: '1'
+      TAURI_SIGNING_PRIVATE_KEY: ''
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        path: harness
+        persist-credentials: false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: unslothai/unsloth
+        ref: 94f7304fa4c97cd7a5e3974e7cd9e0ec616e8670
+        path: src
+        persist-credentials: false
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+      with:
+        node-version: 24
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      with:
+        toolchain: stable
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: 'native-target
+
+          ~/.cargo/registry
+
+          ~/.cargo/git'
+        key: native-parallel-v1-ubuntu-22.04-${{ hashFiles('src/studio/src-tauri/Cargo.lock')
+          }}
+    - name: Native WebKit dependencies
+      run: 'sudo apt-get update -qq
+
+        sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
+        libxdo-dev libssl-dev patchelf xvfb'
+    - name: Real Studio backend
+      working-directory: src
+      shell: bash
+      run: ./install.sh --local --no-torch
+    - name: Prepare base worktree
+      shell: bash
+      run: 'git -C src fetch --depth 1 origin 28f3e5da91288145522d71f1484f24732746c631
+
+        git -C src worktree add ../base FETCH_HEAD'
+    - name: Build native base
+      shell: bash
+      run: 'set -euo pipefail
+
+        cd base/studio/frontend
+
+        npm ci --no-fund --no-audit
+
+
+        cd ../../..
+
+        python harness/.github/scripts/studio_regress/native_parallel/runner.py --prepare
+        base
+
+        cd base/studio
+
+        npm install --save-dev @tauri-apps/cli@2.10.1 --no-fund --no-audit
+
+        npx tauri build --debug --no-bundle
+
+        '
+    - name: Run real native base
+      shell: bash
+      run: 'set +e
+
+        python - <<''PY''
+
+        import hashlib, json, platform
+
+        from pathlib import Path
+
+        out = Path(''out/base'')
+
+        out.mkdir(parents=True, exist_ok=True)
+
+        fixture = Path(''harness/.github/scripts/studio_regress/native_parallel/main.tsx'')
+
+        (out / ''provenance.json'').write_text(json.dumps({''source_ref'': ''28f3e5da91288145522d71f1484f24732746c631'',
+        ''host'': platform.platform(), ''machine'': platform.machine(), ''fixture_sha256'':
+        hashlib.sha256(fixture.read_bytes()).hexdigest()}), encoding=''utf-8'')
+
+        PY
+
+        xvfb-run -a -s "-screen 0 1440x900x24" python harness/.github/scripts/studio_regress/native_parallel/runner.py
+        --bin native-target/debug/unsloth-studio --out out/base
+
+        rc=$?
+
+        echo "$rc" > out/base.rc
+
+        exit 0
+
+        '
+    - name: Build native head
+      shell: bash
+      run: 'set -euo pipefail
+
+        cd src/studio/frontend
+
+        npm ci --no-fund --no-audit
+
+        node --experimental-strip-types --test --test-concurrency=2 "tests/**/*.test.ts"
+
+        cd ../../..
+
+        python harness/.github/scripts/studio_regress/native_parallel/runner.py --prepare
+        src
+
+        cd src/studio
+
+        npm install --save-dev @tauri-apps/cli@2.10.1 --no-fund --no-audit
+
+        npx tauri build --debug --no-bundle
+
+        '
+    - name: Run real native head
+      shell: bash
+      run: 'set +e
+
+        python - <<''PY''
+
+        import hashlib, json, platform
+
+        from pathlib import Path
+
+        out = Path(''out/head'')
+
+        out.mkdir(parents=True, exist_ok=True)
+
+        fixture = Path(''harness/.github/scripts/studio_regress/native_parallel/main.tsx'')
+
+        (out / ''provenance.json'').write_text(json.dumps({''source_ref'': ''94f7304fa4c97cd7a5e3974e7cd9e0ec616e8670'',
+        ''host'': platform.platform(), ''machine'': platform.machine(), ''fixture_sha256'':
+        hashlib.sha256(fixture.read_bytes()).hexdigest()}), encoding=''utf-8'')
+
+        PY
+
+        xvfb-run -a -s "-screen 0 1440x900x24" python harness/.github/scripts/studio_regress/native_parallel/runner.py
+        --bin native-target/debug/unsloth-studio --out out/head
+
+        rc=$?
+
+        echo "$rc" > out/head.rc
+
+        exit 0
+
+        '
+    - name: Gate complete native evidence
+      shell: bash
+      run: 'python - <<''PY''
+
+        import json
+
+        from pathlib import Path
+
+        base = json.loads(Path(''out/base/result.json'').read_text(encoding=''utf-8''))
+
+        head = json.loads(Path(''out/head/result.json'').read_text(encoding=''utf-8''))
+
+        print(''BASE'', json.dumps(base))
+
+        print(''HEAD'', json.dumps(head))
+
+        assert head[''passed''], head
+
+        assert all(head.get(key) for key in [''native_supported'', ''background_actions_isolated'',
+        ''parallel_capture_preserves_b'', ''stop_b_preserves_a'', ''foreign_target_rejected'',
+        ''close_tab_releases_view'']), head
+
+        assert head[''retained_after_reply_and_panel_close''] == {''a'': True, ''b'':
+        True}, head
+
+        PY'
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: always()
+      with:
+        name: native-parallel-ubuntu-22.04
+        path: 'out/
+
+          sr-home/logs/'
+        if-no-files-found: error
+  macos-15:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/native-target
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/sr-home
+      UNSLOTH_SKIP_AUTOSTART: '1'
+      UNSLOTH_DISABLE_UPDATE_CHECK: '1'
+      UNSLOTH_NO_LOCAL_GPU: '1'
+      CUDA_VISIBLE_DEVICES: ''
+      PYTHONUTF8: '1'
+      TAURI_SIGNING_PRIVATE_KEY: ''
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        path: harness
+        persist-credentials: false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: unslothai/unsloth
+        ref: 94f7304fa4c97cd7a5e3974e7cd9e0ec616e8670
+        path: src
+        persist-credentials: false
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+      with:
+        node-version: 24
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      with:
+        toolchain: stable
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: 'native-target
+
+          ~/.cargo/registry
+
+          ~/.cargo/git'
+        key: native-parallel-v1-macos-15-${{ hashFiles('src/studio/src-tauri/Cargo.lock')
+          }}
+    - name: Real Studio backend
+      working-directory: src
+      shell: bash
+      run: ./install.sh --local --no-torch
+    - name: Prepare base worktree
+      shell: bash
+      run: 'git -C src fetch --depth 1 origin 28f3e5da91288145522d71f1484f24732746c631
+
+        git -C src worktree add ../base FETCH_HEAD'
+    - name: Build native base
+      shell: bash
+      run: 'set -euo pipefail
+
+        cd base/studio/frontend
+
+        npm ci --no-fund --no-audit
+
+
+        cd ../../..
+
+        python harness/.github/scripts/studio_regress/native_parallel/runner.py --prepare
+        base
+
+        cd base/studio
+
+        npm install --save-dev @tauri-apps/cli@2.10.1 --no-fund --no-audit
+
+        npx tauri build --debug --no-bundle
+
+        '
+    - name: Run real native base
+      shell: bash
+      run: 'set +e
+
+        python - <<''PY''
+
+        import hashlib, json, platform
+
+        from pathlib import Path
+
+        out = Path(''out/base'')
+
+        out.mkdir(parents=True, exist_ok=True)
+
+        fixture = Path(''harness/.github/scripts/studio_regress/native_parallel/main.tsx'')
+
+        (out / ''provenance.json'').write_text(json.dumps({''source_ref'': ''28f3e5da91288145522d71f1484f24732746c631'',
+        ''host'': platform.platform(), ''machine'': platform.machine(), ''fixture_sha256'':
+        hashlib.sha256(fixture.read_bytes()).hexdigest()}), encoding=''utf-8'')
+
+        PY
+
+        python harness/.github/scripts/studio_regress/native_parallel/runner.py --bin
+        native-target/debug/unsloth-studio --out out/base
+
+        rc=$?
+
+        echo "$rc" > out/base.rc
+
+        exit 0
+
+        '
+    - name: Build native head
+      shell: bash
+      run: 'set -euo pipefail
+
+        cd src/studio/frontend
+
+        npm ci --no-fund --no-audit
+
+        node --test --test-concurrency=2 tests/browser-native-view-layered.test.ts
+        tests/browser-native-view-snapshot.test.ts tests/browser-native-share-lifetime.test.ts
+        tests/browser-capture-parallel.test.ts
+
+        cd ../../..
+
+        python harness/.github/scripts/studio_regress/native_parallel/runner.py --prepare
+        src
+
+        cd src/studio
+
+        npm install --save-dev @tauri-apps/cli@2.10.1 --no-fund --no-audit
+
+        npx tauri build --debug --no-bundle
+
+        '
+    - name: Run real native head
+      shell: bash
+      run: 'set +e
+
+        python - <<''PY''
+
+        import hashlib, json, platform
+
+        from pathlib import Path
+
+        out = Path(''out/head'')
+
+        out.mkdir(parents=True, exist_ok=True)
+
+        fixture = Path(''harness/.github/scripts/studio_regress/native_parallel/main.tsx'')
+
+        (out / ''provenance.json'').write_text(json.dumps({''source_ref'': ''94f7304fa4c97cd7a5e3974e7cd9e0ec616e8670'',
+        ''host'': platform.platform(), ''machine'': platform.machine(), ''fixture_sha256'':
+        hashlib.sha256(fixture.read_bytes()).hexdigest()}), encoding=''utf-8'')
+
+        PY
+
+        python harness/.github/scripts/studio_regress/native_parallel/runner.py --bin
+        native-target/debug/unsloth-studio --out out/head
+
+        rc=$?
+
+        echo "$rc" > out/head.rc
+
+        exit 0
+
+        '
+    - name: Gate complete native evidence
+      shell: bash
+      run: 'python - <<''PY''
+
+        import json
+
+        from pathlib import Path
+
+        base = json.loads(Path(''out/base/result.json'').read_text(encoding=''utf-8''))
+
+        head = json.loads(Path(''out/head/result.json'').read_text(encoding=''utf-8''))
+
+        print(''BASE'', json.dumps(base))
+
+        print(''HEAD'', json.dumps(head))
+
+        assert head[''passed''], head
+
+        assert all(head.get(key) for key in [''native_supported'', ''background_actions_isolated'',
+        ''parallel_capture_preserves_b'', ''stop_b_preserves_a'', ''foreign_target_rejected'',
+        ''close_tab_releases_view'']), head
+
+        assert head[''retained_after_reply_and_panel_close''] == {''a'': True, ''b'':
+        True}, head
+
+        PY'
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: always()
+      with:
+        name: native-parallel-macos-15
+        path: 'out/
+
+          sr-home/logs/'
+        if-no-files-found: error
+  windows-latest:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/native-target
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/sr-home
+      UNSLOTH_SKIP_AUTOSTART: '1'
+      UNSLOTH_DISABLE_UPDATE_CHECK: '1'
+      UNSLOTH_NO_LOCAL_GPU: '1'
+      CUDA_VISIBLE_DEVICES: ''
+      PYTHONUTF8: '1'
+      TAURI_SIGNING_PRIVATE_KEY: ''
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        path: harness
+        persist-credentials: false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: unslothai/unsloth
+        ref: 94f7304fa4c97cd7a5e3974e7cd9e0ec616e8670
+        path: src
+        persist-credentials: false
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+      with:
+        node-version: 24
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      with:
+        toolchain: stable
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: 'native-target
+
+          ~/.cargo/registry
+
+          ~/.cargo/git'
+        key: native-parallel-v1-windows-latest-${{ hashFiles('src/studio/src-tauri/Cargo.lock')
+          }}
+    - name: Real Studio backend
+      working-directory: src
+      shell: pwsh
+      run: '& ./install.ps1 --local --no-torch; exit $LASTEXITCODE'
+    - name: Prepare base worktree
+      shell: bash
+      run: 'git -C src fetch --depth 1 origin 28f3e5da91288145522d71f1484f24732746c631
+
+        git -C src worktree add ../base FETCH_HEAD'
+    - name: Build native base
+      shell: bash
+      run: 'set -euo pipefail
+
+        cd base/studio/frontend
+
+        npm ci --no-fund --no-audit
+
+
+        cd ../../..
+
+        python harness/.github/scripts/studio_regress/native_parallel/runner.py --prepare
+        base
+
+        cd base/studio
+
+        npm install --save-dev @tauri-apps/cli@2.10.1 --no-fund --no-audit
+
+        npx tauri build --debug --no-bundle
+
+        '
+    - name: Run real native base
+      shell: bash
+      run: 'set +e
+
+        python - <<''PY''
+
+        import hashlib, json, platform
+
+        from pathlib import Path
+
+        out = Path(''out/base'')
+
+        out.mkdir(parents=True, exist_ok=True)
+
+        fixture = Path(''harness/.github/scripts/studio_regress/native_parallel/main.tsx'')
+
+        (out / ''provenance.json'').write_text(json.dumps({''source_ref'': ''28f3e5da91288145522d71f1484f24732746c631'',
+        ''host'': platform.platform(), ''machine'': platform.machine(), ''fixture_sha256'':
+        hashlib.sha256(fixture.read_bytes()).hexdigest()}), encoding=''utf-8'')
+
+        PY
+
+        python harness/.github/scripts/studio_regress/native_parallel/runner.py --bin
+        native-target/debug/unsloth-studio.exe --out out/base
+
+        rc=$?
+
+        echo "$rc" > out/base.rc
+
+        exit 0
+
+        '
+    - name: Build native head
+      shell: bash
+      run: 'set -euo pipefail
+
+        cd src/studio/frontend
+
+        npm ci --no-fund --no-audit
+
+        node --test --test-concurrency=2 tests/browser-native-view-layered.test.ts
+        tests/browser-native-view-snapshot.test.ts tests/browser-native-share-lifetime.test.ts
+        tests/browser-capture-parallel.test.ts
+
+        cd ../../..
+
+        python harness/.github/scripts/studio_regress/native_parallel/runner.py --prepare
+        src
+
+        cd src/studio
+
+        npm install --save-dev @tauri-apps/cli@2.10.1 --no-fund --no-audit
+
+        npx tauri build --debug --no-bundle
+
+        '
+    - name: Run real native head
+      shell: bash
+      run: 'set +e
+
+        python - <<''PY''
+
+        import hashlib, json, platform
+
+        from pathlib import Path
+
+        out = Path(''out/head'')
+
+        out.mkdir(parents=True, exist_ok=True)
+
+        fixture = Path(''harness/.github/scripts/studio_regress/native_parallel/main.tsx'')
+
+        (out / ''provenance.json'').write_text(json.dumps({''source_ref'': ''94f7304fa4c97cd7a5e3974e7cd9e0ec616e8670'',
+        ''host'': platform.platform(), ''machine'': platform.machine(), ''fixture_sha256'':
+        hashlib.sha256(fixture.read_bytes()).hexdigest()}), encoding=''utf-8'')
+
+        PY
+
+        python harness/.github/scripts/studio_regress/native_parallel/runner.py --bin
+        native-target/debug/unsloth-studio.exe --out out/head
+
+        rc=$?
+
+        echo "$rc" > out/head.rc
+
+        exit 0
+
+        '
+    - name: Gate complete native evidence
+      shell: bash
+      run: 'python - <<''PY''
+
+        import json
+
+        from pathlib import Path
+
+        base = json.loads(Path(''out/base/result.json'').read_text(encoding=''utf-8''))
+
+        head = json.loads(Path(''out/head/result.json'').read_text(encoding=''utf-8''))
+
+        print(''BASE'', json.dumps(base))
+
+        print(''HEAD'', json.dumps(head))
+
+        assert head[''passed''], head
+
+        assert all(head.get(key) for key in [''native_supported'', ''background_actions_isolated'',
+        ''parallel_capture_preserves_b'', ''stop_b_preserves_a'', ''foreign_target_rejected'',
+        ''close_tab_releases_view'']), head
+
+        assert head[''retained_after_reply_and_panel_close''] == {''a'': True, ''b'':
+        True}, head
+
+        PY'
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: always()
+      with:
+        name: native-parallel-windows-latest
+        path: 'out/
+
+          sr-home/logs/'
+        if-no-files-found: error
