@@ -1,0 +1,101 @@
+name: sdrc
+on:
+  push:
+    branches: ['sdrc-*']
+permissions:
+  contents: read
+jobs:
+  leg:
+    name: ${{ matrix.leg }}-${{ matrix.group }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"leg": "lx64", "group": "stack", "runner": "ubuntu-22.04"}, {"leg": "la64", "group": "stack", "runner": "ubuntu-24.04-arm"}, {"leg": "lvk", "group": "stack", "runner": "ubuntu-22.04", "vulkan": "linux"}, {"leg": "marm", "group": "stack", "runner": "macos-15"}, {"leg": "mx64", "group": "stack", "runner": "macos-15-intel"}, {"leg": "wx64", "group": "stack", "runner": "windows-2022"}, {"leg": "wvk", "group": "stack", "runner": "windows-2022", "vulkan": "windows"}, {"leg": "warm", "group": "stack", "runner": "windows-11-arm", "msvc_arch": "arm64"}, {"leg": "lx64", "group": "master", "runner": "ubuntu-22.04"}, {"leg": "la64", "group": "master", "runner": "ubuntu-24.04-arm"}, {"leg": "marm", "group": "master", "runner": "macos-15"}, {"leg": "mx64", "group": "master", "runner": "macos-15-intel"}, {"leg": "wx64", "group": "master", "runner": "windows-2022"}]
+    env:
+      VULKAN_VERSION: 1.4.328.1
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_MAXSIZE: 4G
+      GGML_VK_VISIBLE_DEVICES: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with: {path: h}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: git line endings (Windows)
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - name: MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch || 'x64' }}
+      - name: Ninja + ccache
+        shell: bash
+        run: |
+          set -x
+          python -m pip install -q ninja
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get update -qq && sudo apt-get install -y -qq ccache patchelf ;;
+            macOS) brew install -q ccache || true ;;
+            Windows) choco install -y --no-progress ccache || true ;;
+          esac
+          ninja --version; cmake --version | head -1; ccache --version | head -1 || true
+      - name: Vulkan SDK + lavapipe (Linux)
+        if: matrix.vulkan == 'linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq libvulkan-dev xz-utils mesa-vulkan-drivers vulkan-tools
+          archive="$RUNNER_TEMP/vulkansdk.tar.xz"; sdk_root="$RUNNER_TEMP/vulkansdk"
+          curl --fail --location --retry 3 --output "$archive" "https://sdk.lunarg.com/sdk/download/${VULKAN_VERSION}/linux/vulkansdk-linux-x86_64-${VULKAN_VERSION}.tar.xz"
+          echo "241e75b56c91c0d210ed07a7c638ec05a3e5b0e4c66ba9f0ba0f102d823ad6bf  $archive" | sha256sum --check --strict
+          mkdir -p "$sdk_root"; tar -xJf "$archive" -C "$sdk_root" --strip-components=1
+          echo "VULKAN_SDK=$sdk_root/x86_64" >> "$GITHUB_ENV"; echo "$sdk_root/x86_64/bin" >> "$GITHUB_PATH"
+          vulkaninfo --summary 2>&1 | head -30 || true
+      - name: Vulkan SDK (Windows)
+        if: matrix.vulkan == 'windows'
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'VulkanSDK-Installer.exe'
+          $sdkRoot = Join-Path $env:RUNNER_TEMP 'VulkanSDK'
+          curl.exe --fail --location --retry 3 --output $installer "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash -ne 'a8675df6d538079c2a719a9373994948091db785b48f142e024254e76348d16c') { throw 'sha mismatch' }
+          $p = Start-Process -FilePath $installer -ArgumentList @('--root', "`"$sdkRoot`"", '--accept-licenses', '--default-answer', '--confirm-command', 'install') -Wait -PassThru
+          if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdkRoot"; Add-Content $env:GITHUB_PATH "$sdkRoot\Bin"
+      - name: lavapipe (Windows, best effort)
+        if: matrix.vulkan == 'windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest
+          $a = $rel.assets | Where-Object { $_.name -match 'release-msvc\.7z$' } | Select-Object -First 1
+          Write-Host "mesa-dist-win $($rel.tag_name) $($a.name)"
+          $f = Join-Path $env:RUNNER_TEMP $a.name
+          curl.exe -fsSL --retry 3 -o $f $a.browser_download_url
+          $d = Join-Path $env:RUNNER_TEMP 'mesa'
+          & 7z x $f "-o$d" -y | Out-Null
+          $icd = Get-ChildItem $d -Recurse -Filter 'lvp_icd.x86_64.json' | Select-Object -First 1
+          Write-Host "icd $($icd.FullName)"
+          Add-Content $env:GITHUB_ENV "VK_DRIVER_FILES=$($icd.FullName)"
+          Add-Content $env:GITHUB_ENV "VK_ICD_FILENAMES=$($icd.FullName)"
+      - name: Build + smoke
+        shell: bash
+        run: |
+          set -o pipefail
+          python -u h/sdrc/run.py --leg ${{ matrix.leg }} --group ${{ matrix.group }} 2>&1 | tee run.log
+      - name: ccache stats
+        if: always()
+        shell: bash
+        run: ccache -s || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: res-${{ matrix.leg }}-${{ matrix.group }}
+          path: |
+            art
+            run.log
+            w/out/*.png
+          retention-days: 7
