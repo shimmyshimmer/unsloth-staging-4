@@ -6,9 +6,13 @@ build. Pure numpy + usearch: no SQLite here; ``vec_cache`` decides when an index
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import platform
+import sys
+import time
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -21,8 +25,48 @@ EXPANSION_SEARCH = 256
 FORMAT = 1
 
 
+# Must match studio/install_hnsw_prebuilt.py, which writes the marker this reads.
+PAIR = "usearch==2.26.6 numkong==7.8.6"
+MARKER = ".unsloth-hnsw.json"
+LOCK = ".unsloth-hnsw.lock"
+LOCK_STALE_S = 1800.0
+
+
+def hnsw_fingerprint() -> str:
+    return hashlib.sha1(f"{sys.prefix}|{sys.version}|{platform.machine()}".encode()).hexdigest()[
+        :16
+    ]
+
+
+def _probe_failed() -> bool:
+    """The installer's subprocess probe failed or hung here: never import this pair in-process."""
+    try:
+        with open(os.path.join(sys.prefix, MARKER), encoding = "utf-8") as fh:
+            marker = json.load(fh)
+        return (
+            marker.get("result") in ("failed", "unverified")
+            and marker.get("pair") == PAIR
+            and marker.get("fingerprint") == hnsw_fingerprint()
+        )
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _install_in_progress() -> bool:
+    """An installer holds the lock: its wheels may be on disk before its probe has passed."""
+    try:
+        return time.time() - os.stat(os.path.join(sys.prefix, LOCK)).st_mtime < LOCK_STALE_S
+    except OSError:
+        return False
+
+
 def usearch():
     """The usearch.index module, or None when the wheel is missing or does not load on this machine."""
+    loaded = sys.modules.get("usearch.index")
+    if loaded is not None:
+        return loaded
+    if _probe_failed() or _install_in_progress():
+        return None
     try:
         from usearch import index
     except Exception:  # noqa: BLE001 - any load failure leaves the exact / vec0 paths
