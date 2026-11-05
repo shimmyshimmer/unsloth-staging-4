@@ -1,0 +1,752 @@
+{
+ "legs": {
+  "lx64": {
+   "label": "Linux-Ubuntu-22.04-x86_64",
+   "runner": "ubuntu-22.04",
+   "defines": [],
+   "cpu_floor": "x64"
+  },
+  "la64": {
+   "label": "Linux-Ubuntu-24.04-aarch64",
+   "runner": "ubuntu-24.04-arm",
+   "defines": [
+    "-DCMAKE_C_COMPILER=gcc-14",
+    "-DCMAKE_CXX_COMPILER=g++-14"
+   ],
+   "cpu_floor": "armv8.0_1"
+  },
+  "lvk": {
+   "label": "Linux-Ubuntu-22.04-x86_64-vulkan",
+   "runner": "ubuntu-22.04",
+   "defines": [
+    "-DSD_VULKAN=ON"
+   ],
+   "gpu": [
+    "vk"
+   ],
+   "tbo": true,
+   "timeout": 5400
+  },
+  "marm": {
+   "label": "Darwin-macOS-arm64",
+   "runner": "macos-15",
+   "defines": [
+    "-DSD_METAL=ON",
+    "-DGGML_METAL_EMBED_LIBRARY=ON",
+    "-DGGML_BLAS=ON",
+    "-DGGML_BLAS_VENDOR=Apple",
+    "-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
+   ],
+   "gpu": [
+    "mtl"
+   ],
+   "tbo": true
+  },
+  "mx64": {
+   "label": "Darwin-macOS-x86_64",
+   "runner": "macos-15-intel",
+   "defines": [
+    "-DSD_METAL=OFF",
+    "-DGGML_BLAS=OFF",
+    "-DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
+   ],
+   "cpu_floor": "x64"
+  },
+  "wx64": {
+   "label": "win-cpu-x64",
+   "runner": "windows-2022",
+   "defines": [],
+   "cpu_floor": "x64",
+   "jobs": 3
+  },
+  "wvk": {
+   "label": "win-vulkan-x64",
+   "runner": "windows-2022",
+   "defines": [
+    "-DSD_VULKAN=ON"
+   ],
+   "gpu": [
+    "vk"
+   ],
+   "jobs": 3,
+   "timeout": 5400
+  },
+  "warm": {
+   "label": "win-cpu-arm64",
+   "runner": "windows-11-arm",
+   "defines": [],
+   "jobs": 4
+  }
+ },
+ "groups": {
+  "stack": {
+   "refs": {
+    "S": {
+     "pr": 35
+    },
+    "T": {
+     "pr": 48
+    },
+    "U": {
+     "merge": [
+      48,
+      37,
+      38,
+      39,
+      43,
+      44,
+      45,
+      46,
+      41
+     ],
+     "flags41": true,
+     "package": true
+    }
+   },
+   "arms": [
+    {
+     "id": "S.fp16",
+     "ref": "S",
+     "model": "fp16",
+     "reps": 2
+    },
+    {
+     "id": "T.fp16",
+     "ref": "T",
+     "model": "fp16",
+     "reps": 2
+    },
+    {
+     "id": "U.fp16",
+     "ref": "U",
+     "model": "fp16",
+     "reps": 1
+    },
+    {
+     "id": "S.q8",
+     "ref": "S",
+     "model": "q8",
+     "reps": 2
+    },
+    {
+     "id": "T.q8",
+     "ref": "T",
+     "model": "q8",
+     "reps": 2
+    },
+    {
+     "id": "U.q8",
+     "ref": "U",
+     "model": "q8",
+     "reps": 1
+    },
+    {
+     "id": "S.q3k",
+     "ref": "S",
+     "model": "q3k",
+     "reps": 2
+    },
+    {
+     "id": "T.q3k",
+     "ref": "T",
+     "model": "q3k",
+     "reps": 2
+    },
+    {
+     "id": "U.q3k",
+     "ref": "U",
+     "model": "q3k",
+     "reps": 1
+    },
+    {
+     "id": "S.q4kg.mmap",
+     "ref": "S",
+     "model": "q4kg",
+     "reps": 1,
+     "args": [
+      "--mmap"
+     ]
+    },
+    {
+     "id": "T.q4kg.mmap",
+     "ref": "T",
+     "model": "q4kg",
+     "reps": 1,
+     "args": [
+      "--mmap"
+     ]
+    },
+    {
+     "id": "U.q4kg.mmap",
+     "ref": "U",
+     "model": "q4kg",
+     "reps": 1,
+     "args": [
+      "--mmap"
+     ]
+    },
+    {
+     "id": "U.q4kg",
+     "ref": "U",
+     "model": "q4kg",
+     "reps": 1
+    },
+    {
+     "id": "T.fp16.ks",
+     "ref": "T",
+     "model": "fp16",
+     "reps": 1,
+     "env": {
+      "GGML_CPU_SGEMM_TYPES": "none",
+      "GGML_CPU_IQK": "0"
+     },
+     "args": [
+      "--conv-direct",
+      "off"
+     ],
+     "pin": "S.fp16"
+    },
+    {
+     "id": "T.q8.ks",
+     "ref": "T",
+     "model": "q8",
+     "reps": 1,
+     "env": {
+      "GGML_CPU_SGEMM_TYPES": "none",
+      "GGML_CPU_IQK": "0"
+     },
+     "args": [
+      "--conv-direct",
+      "off"
+     ],
+     "pin": "S.q8"
+    },
+    {
+     "id": "T.q3k.ks",
+     "ref": "T",
+     "model": "q3k",
+     "reps": 1,
+     "env": {
+      "GGML_CPU_SGEMM_TYPES": "none",
+      "GGML_CPU_IQK": "0"
+     },
+     "args": [
+      "--conv-direct",
+      "off"
+     ],
+     "pin": "S.q3k"
+    },
+    {
+     "id": "T.fp16.conv",
+     "ref": "T",
+     "model": "fp16",
+     "reps": 1,
+     "env": {
+      "GGML_CPU_SGEMM_TYPES": "none",
+      "GGML_CPU_IQK": "0"
+     },
+     "pin": "S.fp16"
+    },
+    {
+     "id": "T.q8.sgemm",
+     "ref": "T",
+     "model": "q8",
+     "reps": 1,
+     "env": {
+      "GGML_CPU_SGEMM_TYPES": "q8_0",
+      "GGML_CPU_IQK": "0"
+     },
+     "args": [
+      "--conv-direct",
+      "off"
+     ],
+     "pin": "S.q8"
+    },
+    {
+     "id": "T.fp16.sgemm16",
+     "ref": "T",
+     "model": "fp16",
+     "reps": 1,
+     "env": {
+      "GGML_CPU_SGEMM_TYPES": "f16,bf16",
+      "GGML_CPU_IQK": "0"
+     },
+     "args": [
+      "--conv-direct",
+      "off"
+     ],
+     "pin": "S.fp16"
+    },
+    {
+     "id": "T.q3k.iqk",
+     "ref": "T",
+     "model": "q3k",
+     "reps": 1,
+     "env": {
+      "GGML_CPU_SGEMM_TYPES": "none"
+     },
+     "args": [
+      "--conv-direct",
+      "off"
+     ],
+     "pin": "S.q3k"
+    },
+    {
+     "id": "T.fp16.thr",
+     "ref": "T",
+     "model": "fp16",
+     "reps": 2,
+     "threads": "default"
+    },
+    {
+     "id": "S.q3k.noblas",
+     "ref": "S",
+     "model": "q3k",
+     "reps": 1,
+     "env": {
+      "SD_CPU_BLAS": "0"
+     },
+     "legs": [
+      "marm"
+     ]
+    },
+    {
+     "id": "T.q3k.noblas",
+     "ref": "T",
+     "model": "q3k",
+     "reps": 1,
+     "env": {
+      "SD_CPU_BLAS": "0"
+     },
+     "legs": [
+      "marm"
+     ]
+    },
+    {
+     "id": "S.gpu",
+     "ref": "S",
+     "model": "fp16",
+     "reps": 2,
+     "gpu": "vk"
+    },
+    {
+     "id": "T.gpu",
+     "ref": "T",
+     "model": "fp16",
+     "reps": 1,
+     "gpu": "vk"
+    },
+    {
+     "id": "U.gpu",
+     "ref": "U",
+     "model": "fp16",
+     "reps": 2,
+     "gpu": "vk"
+    },
+    {
+     "id": "U.gpu.convon",
+     "ref": "U",
+     "model": "fp16",
+     "reps": 1,
+     "args": [
+      "--conv-direct",
+      "on"
+     ],
+     "gpu": "vk"
+    },
+    {
+     "id": "U.gpu.convoff",
+     "ref": "U",
+     "model": "fp16",
+     "reps": 1,
+     "args": [
+      "--conv-direct",
+      "off"
+     ],
+     "gpu": "vk"
+    },
+    {
+     "id": "S.gpu.convoff",
+     "ref": "S",
+     "model": "fp16",
+     "reps": 1,
+     "args": [
+      "--conv-direct",
+      "off"
+     ],
+     "gpu": "vk"
+    },
+    {
+     "id": "S.mgpu",
+     "ref": "S",
+     "model": "fp16",
+     "reps": 2,
+     "gpu": "mtl",
+     "size": 512
+    },
+    {
+     "id": "U.mgpu",
+     "ref": "U",
+     "model": "fp16",
+     "reps": 2,
+     "gpu": "mtl",
+     "size": 512
+    }
+   ],
+   "compare": [
+    [
+     "T.fp16.ks",
+     "S.fp16",
+     "identical"
+    ],
+    [
+     "T.q8.ks",
+     "S.q8",
+     "identical"
+    ],
+    [
+     "T.q3k.ks",
+     "S.q3k",
+     "identical"
+    ],
+    [
+     "T.fp16.conv",
+     "S.fp16",
+     "identical"
+    ],
+    [
+     "T.q8.sgemm",
+     "S.q8",
+     "identical"
+    ],
+    [
+     "T.fp16.sgemm16",
+     "S.fp16",
+     "close"
+    ],
+    [
+     "T.q3k.iqk",
+     "S.q3k",
+     "close"
+    ],
+    [
+     "T.fp16",
+     "S.fp16",
+     "close"
+    ],
+    [
+     "T.q8",
+     "S.q8",
+     "close"
+    ],
+    [
+     "T.q3k",
+     "S.q3k",
+     "close"
+    ],
+    [
+     "T.fp16.thr",
+     "T.fp16",
+     "identical"
+    ],
+    [
+     "U.fp16",
+     "T.fp16",
+     "identical"
+    ],
+    [
+     "U.q8",
+     "T.q8",
+     "identical"
+    ],
+    [
+     "U.q3k",
+     "T.q3k",
+     "identical"
+    ],
+    [
+     "U.q4kg.mmap",
+     "T.q4kg.mmap",
+     "identical"
+    ],
+    [
+     "U.q4kg",
+     "U.q4kg.mmap",
+     "identical"
+    ],
+    [
+     "T.q4kg.mmap",
+     "S.q4kg.mmap",
+     "close"
+    ],
+    [
+     "T.q3k.noblas",
+     "S.q3k.noblas",
+     "close"
+    ],
+    [
+     "T.gpu",
+     "S.gpu",
+     "identical"
+    ],
+    [
+     "U.gpu",
+     "U.gpu.convon",
+     "identical"
+    ],
+    [
+     "U.gpu.convoff",
+     "S.gpu.convoff",
+     "identical"
+    ],
+    [
+     "U.gpu",
+     "U.gpu.convoff",
+     "close"
+    ],
+    [
+     "U.mgpu",
+     "S.mgpu",
+     "close"
+    ]
+   ],
+   "convert_with": "S",
+   "close_psnr": 30,
+   "tbo": {
+    "lvk": {
+     "refs": [
+      "S",
+      "U"
+     ],
+     "runs": [
+      "test:Vulkan0:RMS_NORM",
+      "test:Vulkan0:RMS_NORM_MUL_ADD",
+      "perf:Vulkan0:RMS_NORM"
+     ]
+    }
+   }
+  },
+  "master": {
+   "refs": {
+    "M": {
+     "ref": "origin/master"
+    },
+    "MP": {
+     "merge": [
+      43,
+      44,
+      45,
+      46
+     ]
+    }
+   },
+   "arms": [
+    {
+     "id": "M.q4kg",
+     "ref": "M",
+     "model": "q4kg",
+     "reps": 2
+    },
+    {
+     "id": "MP.q4kg",
+     "ref": "MP",
+     "model": "q4kg",
+     "reps": 2
+    },
+    {
+     "id": "M.q4kg.mmap",
+     "ref": "M",
+     "model": "q4kg",
+     "reps": 2,
+     "args": [
+      "--mmap"
+     ]
+    },
+    {
+     "id": "MP.q4kg.mmap",
+     "ref": "MP",
+     "model": "q4kg",
+     "reps": 2,
+     "args": [
+      "--mmap"
+     ]
+    },
+    {
+     "id": "M.fp16",
+     "ref": "M",
+     "model": "fp16",
+     "reps": 1
+    },
+    {
+     "id": "M.fp16.mmap",
+     "ref": "M",
+     "model": "fp16",
+     "reps": 1,
+     "args": [
+      "--mmap"
+     ]
+    },
+    {
+     "id": "MP.fp16.mmap",
+     "ref": "MP",
+     "model": "fp16",
+     "reps": 1,
+     "args": [
+      "--mmap"
+     ]
+    },
+    {
+     "id": "M.mgpu",
+     "ref": "M",
+     "model": "fp16",
+     "reps": 3,
+     "gpu": "mtl",
+     "size": 512
+    },
+    {
+     "id": "MP.mgpu",
+     "ref": "MP",
+     "model": "fp16",
+     "reps": 3,
+     "gpu": "mtl",
+     "size": 512
+    },
+    {
+     "id": "MP.mgpu.legacy",
+     "ref": "MP",
+     "model": "fp16",
+     "reps": 1,
+     "env": {
+      "GGML_METAL_IM2COL_LEGACY": "1"
+     },
+     "gpu": "mtl",
+     "size": 512
+    },
+    {
+     "id": "MP.mgpu.cb0",
+     "ref": "MP",
+     "model": "fp16",
+     "reps": 1,
+     "env": {
+      "GGML_METAL_NODES_PER_CB": "0"
+     },
+     "gpu": "mtl",
+     "size": 512
+    },
+    {
+     "id": "M.mgpu.faon",
+     "ref": "M",
+     "model": "fp16",
+     "reps": 2,
+     "args": [
+      "--flash-attn",
+      "on"
+     ],
+     "gpu": "mtl",
+     "size": 512
+    },
+    {
+     "id": "M.mgpu.faoff",
+     "ref": "M",
+     "model": "fp16",
+     "reps": 2,
+     "args": [
+      "--flash-attn",
+      "off"
+     ],
+     "gpu": "mtl",
+     "size": 512
+    },
+    {
+     "id": "MP.mgpu.faoff",
+     "ref": "MP",
+     "model": "fp16",
+     "reps": 1,
+     "args": [
+      "--flash-attn",
+      "off"
+     ],
+     "gpu": "mtl",
+     "size": 512
+    }
+   ],
+   "compare": [
+    [
+     "MP.q4kg",
+     "M.q4kg",
+     "identical"
+    ],
+    [
+     "MP.q4kg.mmap",
+     "M.q4kg.mmap",
+     "identical"
+    ],
+    [
+     "MP.q4kg.mmap",
+     "MP.q4kg",
+     "identical"
+    ],
+    [
+     "M.q4kg.mmap",
+     "M.q4kg",
+     "identical"
+    ],
+    [
+     "MP.fp16.mmap",
+     "M.fp16.mmap",
+     "identical"
+    ],
+    [
+     "M.fp16.mmap",
+     "M.fp16",
+     "identical"
+    ],
+    [
+     "MP.mgpu.legacy",
+     "MP.mgpu",
+     "identical"
+    ],
+    [
+     "MP.mgpu.cb0",
+     "MP.mgpu",
+     "identical"
+    ],
+    [
+     "MP.mgpu",
+     "M.mgpu.faon",
+     "identical"
+    ],
+    [
+     "MP.mgpu.faoff",
+     "M.mgpu.faoff",
+     "identical"
+    ],
+    [
+     "MP.mgpu",
+     "M.mgpu",
+     "any"
+    ],
+    [
+     "M.mgpu.faon",
+     "M.mgpu.faoff",
+     "close"
+    ]
+   ],
+   "convert_with": "M",
+   "tbo": {
+    "marm": {
+     "refs": [
+      "M",
+      "MP"
+     ],
+     "runs": [
+      "test:MTL0:IM2COL",
+      "test:MTL0:IM2COL_3D",
+      "test:MTL0:CONV_2D",
+      "perf:MTL0:IM2COL"
+     ]
+    }
+   }
+  }
+ }
+}
