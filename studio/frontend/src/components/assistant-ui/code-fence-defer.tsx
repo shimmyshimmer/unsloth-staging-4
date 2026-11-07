@@ -102,7 +102,7 @@ const subscribeCodeWrap = (listener: () => void): (() => void) => {
     });
     // data-wrap: a block's own word wrap button (CodeBlockActions) overrides the setting for that block.
     wrapObserver.observe(document.documentElement, {
-      attributes: true, subtree: true, attributeFilter: ["data-code-wrap", "data-wrap"],
+      attributes: true, attributeFilter: ["data-code-wrap"],
     });
   }
   return () => {
@@ -118,7 +118,7 @@ const codeWrapOn = (node: Element | null): boolean => {
   return own ? own === "on" : document.documentElement.hasAttribute("data-code-wrap");
 };
 const useCodeWrap = (node: RefObject<Element | null>): boolean =>
-  useSyncExternalStore(subscribeCodeWrap, () => codeWrapOn(node.current), () => false);
+  useSyncExternalStore(subscribeCodeWrap, () => (void node, document.documentElement.hasAttribute("data-code-wrap")), () => false);
 
 /* One viewport of lookahead. The percentage resolves against the root's HEIGHT in all engines
  * (spec says width, w3c/IntersectionObserver#391); pf9462_parity.py guards it. */
