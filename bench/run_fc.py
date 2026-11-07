@@ -55,10 +55,24 @@ def main():
            env = dict(os.environ, FENCE_COLOUR_OUT = str(dist)))
         dists.append(f"{name}={dist}")
     (OUT / "arms.json").write_text(json.dumps(shas, indent = 1))
+    dist_of = {d.split("=", 1)[0]: d.split("=", 1)[1] for d in dists}
+    # Variants: name=arm@file, the arm's build with a stylesheet or a page script applied.
+    for spec in filter(None, os.environ.get("FC_VARIANTS", "").split(",")):
+        name, rest = spec.split("=", 1)
+        arm, path = rest.split("@", 1)
+        dists.append(f"{name}={dist_of[arm]}@{HERE / path}")
+    order = [a for a in os.environ.get("FC_ORDER", "").split(",") if a]
+    if order:
+        by = {d.split("=", 1)[0]: d for d in dists}
+        dists = [by[a] for a in order]
     env = dict(os.environ, FC_SHAS = json.dumps(shas))
     sh(f"{sys.executable} -u {HERE / 'bench.py'} --arms {','.join(dists)} --engines {os.environ['FC_ENGINE']} "
        f"--throttle {os.environ['FC_THROTTLE']} --reps 1 --out {OUT / 'result.json'} --record-builds {OUT / 'builds.json'}",
        env = env, timeout = 7200)
+    for name in filter(None, os.environ.get("FC_LONGTASKS", "").split(",")):
+        with open(OUT / f"longtasks_{name}.txt", "w") as f:
+            subprocess.run([sys.executable, "-u", str(HERE / "fc_longtasks.py"), dist_of[name], os.environ["FC_ENGINE"].split(",")[0]],
+                           cwd = HERE, stdout = f, stderr = subprocess.STDOUT, timeout = 1800)
 
 
 if __name__ == "__main__":

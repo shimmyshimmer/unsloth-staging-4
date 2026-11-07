@@ -10,18 +10,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        leg:
-          - { os: ubuntu-latest, engines: chromium, throttle: "1,4" }
-          - { os: macos-15, engines: "webkit,chromium", throttle: "1" }
         rep: [1, 2, 3]
         include:
           - rep: 1
-            arms: "pre=bench/fc-pre,main=bench/fc-main,main2=bench/fc-main2,head=bench/fc-head"
+            order: "pre,main,uncap,noscroll,noblock,gutter,head"
           - rep: 2
-            arms: "head=bench/fc-head,pre=bench/fc-pre,main=bench/fc-main,main2=bench/fc-main2"
+            order: "head,gutter,noblock,noscroll,uncap,main,pre"
           - rep: 3
-            arms: "main2=bench/fc-main2,head=bench/fc-head,pre=bench/fc-pre,main=bench/fc-main"
-    runs-on: ${{ matrix.leg.os }}
+            order: "noscroll,pre,head,main,gutter,uncap,noblock"
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -34,19 +31,22 @@ jobs:
       - name: Install Playwright
         run: |
           python -m pip install -q playwright pyyaml
-          for i in 1 2 3; do python -m playwright install --with-deps ${{ matrix.leg.os == 'macos-15' && 'webkit chromium' || 'chromium' }} && break; sleep 20; done
+          for i in 1 2 3; do python -m playwright install --with-deps webkit && break; sleep 20; done
       - name: Fence colour bench
         env:
           BENCH_WORK: ${{ runner.temp }}/fcbench
-          FC_ARMS: ${{ matrix.arms }}
+          FC_ARMS: "pre=bench/fc-pre,main=bench/fc-main,head=bench/fc-head"
+          FC_VARIANTS: "uncap=main@v_uncap.css,noscroll=main@v_noscrollbar.js,noblock=main@v_noblock.js,gutter=main@v_gutter.css"
+          FC_ORDER: ${{ matrix.order }}
+          FC_LONGTASKS: "pre,main,head"
           FC_REPO: ${{ github.repository }}
-          FC_ENGINE: ${{ matrix.leg.engines }}
-          FC_THROTTLE: ${{ matrix.leg.throttle }}
+          FC_ENGINE: webkit
+          FC_THROTTLE: "1"
         run: |
           mkdir -p job && cd job
           python -u ../bench/run_fc.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: fc-${{ matrix.leg.os }}-r${{ matrix.rep }}
+          name: fcabl-macos-r${{ matrix.rep }}
           path: job/out

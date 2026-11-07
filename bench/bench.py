@@ -93,7 +93,9 @@ def run_one(pw, engine, url, throttle, turns, ticks, css = None):
     page.on("pageerror", lambda e: errors.append(str(e)))
     page.goto(f"{url}/smoke-fence-colour.html")
     page.wait_for_function("() => window.__fc && document.querySelector('.aui-thread-viewport')", timeout = 60000)
-    if css:
+    if css and css.lstrip().startswith("//js"):
+        page.evaluate(css)
+    elif css:
         page.add_style_tag(content = css)
     cdp = None
     if engine == "chromium":
@@ -126,7 +128,8 @@ def run_one(pw, engine, url, throttle, turns, ticks, css = None):
     page.evaluate("() => window.__fc.toBottom()")
     page.wait_for_timeout(1200)
     box = page.evaluate("() => window.__fc.viewportBox()")
-    page.mouse.move(box["x"] + box["w"] * 0.5, box["y"] + box["h"] * 0.5)
+    import os
+    page.mouse.move(box["x"] + box["w"] * float(os.environ.get("FC_MOUSE_X", "0.5")), box["y"] + box["h"] * 0.5)
     page.evaluate("() => window.__fc.startSampling()")
     s0 = page.evaluate("() => performance.now()")
     for _ in range(ticks):
