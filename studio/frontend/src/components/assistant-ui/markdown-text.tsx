@@ -660,7 +660,7 @@ export function CodeBlockActions({
   const [overflowing, setOverflowing] = useState(false);
   useEffect(() => {
     const wrapper = actionsRef.current?.parentElement;
-    if (!wrappable || !wrapper || typeof ResizeObserver === "undefined") return;
+    if (!wrappable || !wrapper || typeof ResizeObserver === "undefined" || true) return;
     const check = () => {
       const body = wrapper.querySelector<HTMLElement>('[data-streamdown="code-block-body"]');
       wrapper.toggleAttribute("data-scrolls-x", body !== null && body.scrollWidth > body.clientWidth + 1);
