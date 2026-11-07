@@ -41,6 +41,7 @@ jobs:
         env:
           BENCH_WORK: ${{ runner.temp }}/fcbench
           FC_ARMS: ${{ matrix.arms }}
+          FC_REPO: ${{ github.repository }}
           FC_ENGINE: ${{ matrix.leg.engine }}
           FC_THROTTLE: ${{ matrix.leg.throttle }}
         run: |

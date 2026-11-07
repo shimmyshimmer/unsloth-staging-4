@@ -38,7 +38,7 @@ def node_modules(fe):
 
 
 def main():
-    sh(f"git clone -q --filter=blob:none --no-checkout https://github.com/danielhanchen/unsloth-staging-2 {REPO}")
+    sh(f"git clone -q --filter=blob:none --no-checkout https://github.com/{os.environ['FC_REPO']} {REPO}")
     refs = " ".join(f"+refs/heads/{branch}:refs/remotes/arm/{name}" for name, branch in ARMS)
     sh(f"git fetch -q origin {refs}", cwd = REPO)
     shas, dists = {}, []
