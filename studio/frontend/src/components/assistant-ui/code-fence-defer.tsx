@@ -1279,7 +1279,7 @@ function useFenceHighlightLimit(
     if (progress === null || tokens === null || parked) return;
     const body = surface.current;
     // A capped block colours what is in view and stops; scrolling inside it asks for the rest.
-    const capped = innerLineWindow(code.current, body);
+    const capped: { first: number; last: number } | null = null;
     if (capped !== null && body !== null && lineWindowColoured(tokens, progress, capped)) {
       let frameId = 0;
       // Expand code lifts the cap without a scroll: a resize rechecks too.
