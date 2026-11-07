@@ -204,7 +204,7 @@ function FenceShell({
         data-language={language ?? undefined}
         data-streamdown="code-block-header"
       >
-        <CodeBlockLanguage language={language} />
+        <span className="ml-1 font-mono lowercase">{language}</span>
       </div>
       <div
         className="overflow-x-auto rounded-md border border-border bg-background p-4 text-sm"
@@ -1908,7 +1908,7 @@ export const FenceBody = memo(function FenceBody({
         data-language={language ?? undefined}
         data-streamdown="code-block-header"
       >
-        <CodeBlockLanguage language={language} />
+        <span className="ml-1 font-mono lowercase">{language}</span>
       </div>
       <div
         data-unsloth-fence-paint={
