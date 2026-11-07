@@ -1876,7 +1876,6 @@ export const FenceBody = memo(function FenceBody({
   const highlight = useFenceHighlightLimit(
     tokens, isIncomplete, windowing, language, source, code, frame, surface, offscreenPlain,
   );
-  usePinnedWhileStreaming(surface, isIncomplete, tokens, language, source);
   const languageClass = language === null ? null : `language-${language}`;
 
   const rootStyle = useMemo(() => {
