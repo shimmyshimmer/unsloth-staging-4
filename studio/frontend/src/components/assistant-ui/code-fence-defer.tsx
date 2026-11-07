@@ -469,7 +469,7 @@ const flagScrolledBody = (event: Event): void => {
 };
 
 if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
-  document.addEventListener("scroll", flagScrolledBody, { capture: true, passive: true });
+  void flagScrolledBody;
 }
 
 if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
