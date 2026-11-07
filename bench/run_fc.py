@@ -69,6 +69,10 @@ def main():
     sh(f"{sys.executable} -u {HERE / 'bench.py'} --arms {','.join(dists)} --engines {os.environ['FC_ENGINE']} "
        f"--throttle {os.environ['FC_THROTTLE']} --reps 1 --out {OUT / 'result.json'} --record-builds {OUT / 'builds.json'}",
        env = env, timeout = 7200)
+    for name in filter(None, os.environ.get("FC_MUTLOG", "").split(",")):
+        with open(OUT / f"mutlog_{name}.json", "w") as f:
+            subprocess.run([sys.executable, "-u", str(HERE / "fc_mutlog.py"), dist_of[name], os.environ["FC_ENGINE"].split(",")[0], name],
+                           cwd = HERE, stdout = f, stderr = subprocess.STDOUT, timeout = 1800)
     for name in filter(None, os.environ.get("FC_LONGTASKS", "").split(",")):
         with open(OUT / f"longtasks_{name}.txt", "w") as f:
             subprocess.run([sys.executable, "-u", str(HERE / "fc_longtasks.py"), dist_of[name], os.environ["FC_ENGINE"].split(",")[0]],

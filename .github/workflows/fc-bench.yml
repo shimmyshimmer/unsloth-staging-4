@@ -13,11 +13,11 @@ jobs:
         rep: [1, 2, 3]
         include:
           - rep: 1
-            order: "pre,main,uncap,noscroll,noblock,gutter,head"
+            order: "pre,main,main2,a,b,c,d,e,f,g"
           - rep: 2
-            order: "head,gutter,noblock,noscroll,uncap,main,pre"
+            order: "g,f,e,d,c,b,a,main2,main,pre"
           - rep: 3
-            order: "noscroll,pre,head,main,gutter,uncap,noblock"
+            order: "c,main2,a,pre,g,b,main,f,d,e"
     runs-on: macos-15
     timeout-minutes: 120
     steps:
@@ -35,10 +35,11 @@ jobs:
       - name: Fence colour bench
         env:
           BENCH_WORK: ${{ runner.temp }}/fcbench
-          FC_ARMS: "pre=bench/fc-pre,main=bench/fc-main,head=bench/fc-head"
-          FC_VARIANTS: "uncap=main@v_uncap.css,noscroll=main@v_noscrollbar.js,noblock=main@v_noblock.js,gutter=main@v_gutter.css"
+          FC_ARMS: "pre=bench/fc-pre,main=bench/fc-main,main2=bench/fc-main2,a=bench/fcv-a,b=bench/fcv-b,c=bench/fcv-c,d=bench/fcv-d,e=bench/fcv-e,f=bench/fcv-f,g=bench/fcv-g"
+          FC_VARIANTS: ""
           FC_ORDER: ${{ matrix.order }}
-          FC_LONGTASKS: "pre,main,head"
+          FC_LONGTASKS: ""
+          FC_MUTLOG: "pre,main,a,c"
           FC_REPO: ${{ github.repository }}
           FC_ENGINE: webkit
           FC_THROTTLE: "1"
@@ -48,5 +49,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: fcabl-macos-r${{ matrix.rep }}
+          name: fcbis-macos-r${{ matrix.rep }}
           path: job/out
