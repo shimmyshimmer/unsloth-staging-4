@@ -1166,7 +1166,7 @@ export function queueFenceWork(work: () => void): () => void {
   const remove = highlightQueue.add(() => {
     finish();
     return true;
-  }, finish, true);
+  }, finish);
   cancel = () => {
     remove();
     unwatchHighlighting();
@@ -1315,7 +1315,7 @@ function useFenceHighlightLimit(
         );
       setPrevious({ tokens, parked, progress: next });
       return true;
-    }, () => setPrevious({ tokens, parked, progress: null }), capped !== null);
+    }, () => setPrevious({ tokens, parked, progress: null }), false);
     return () => {
       cancel();
       unwatchHighlighting();
