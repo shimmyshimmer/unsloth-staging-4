@@ -1010,6 +1010,8 @@ _SANDBOX_ATTACHMENT_NOTE_RE = re.compile(
 )
 # The frontend's wrapper tag (attachment, pasted_text, document_annotations); the cut goes inside it.
 _ATTACHMENT_OPEN_RE = re.compile(r"<(?P<tag>[A-Za-z_][\w-]*)(?:\s[^\n]*)?>\n")
+# The browser parsers' header ("[PDF: name]", runtime-provider.tsx): their text has no closing tag.
+_LABELLED_TEXT_RE = re.compile(r"\[[A-Z]+: [^\n]*\]\n")
 # Room left for the fit's own additions (carried block, recall), so a cut turn is not refused one step later.
 _ATTACHMENT_FIT_MARGIN = 0.125
 # No tokenizer packs more characters than this into one token, so a longer body cannot fit and is never counted.
@@ -1018,32 +1020,53 @@ _MAX_CHARS_PER_TOKEN = 16
 
 def _attachment_spans(text: str):
     """(note, open tag, inner text, close tag, trailing text) per sandbox-backed attachment."""
-    notes = list(_SANDBOX_ATTACHMENT_NOTE_RE.finditer(text))
-    for index, note in enumerate(notes):
-        end = notes[index + 1].start() if index + 1 < len(notes) else len(text)
-        body = text[note.end() : end]
-        opened = _ATTACHMENT_OPEN_RE.match(body)
-        closing = f"\n</{opened.group('tag')}>" if opened else ""
-        close = body.rfind(closing) if opened else -1
-        if opened and close >= opened.end():
-            yield (
-                note,
-                opened.group(0),
-                body[opened.end() : close],
-                closing,
-                body[close + len(closing) :],
-            )
-        else:
+    # A note starts an attachment only when its content follows; a file quoting the note is text (#16913).
+    notes, openers = [], []
+    for note in _SANDBOX_ATTACHMENT_NOTE_RE.finditer(text):
+        opened = _ATTACHMENT_OPEN_RE.match(text, note.end())
+        if opened or _LABELLED_TEXT_RE.match(text, note.end()):
+            notes.append(note)
+            openers.append(opened)
+    # Wrappers pair with closing tags like brackets, so a quoted attachment nests; an unclosed one runs to the next note.
+    events = [(opened.end(), 0, i) for i, opened in enumerate(openers) if opened]
+    tags = {opened.group("tag") for opened in openers if opened}
+    if tags:
+        closings = re.compile("\n</(?P<tag>" + "|".join(map(re.escape, sorted(tags))) + ")>")
+        events += [(closed.start(), 1, closed) for closed in closings.finditer(text)]
+    ends, open_by_tag = {}, {}
+    for _, kind, item in sorted(events, key = lambda event: event[:2]):
+        if kind == 0:
+            open_by_tag.setdefault(openers[item].group("tag"), []).append(item)
+        elif open_by_tag.get(item.group("tag")):
+            ends[open_by_tag[item.group("tag")].pop()] = item.end()
+    index = 0
+    while index < len(notes):
+        note, opened, extent = notes[index], openers[index], ends.get(index, -1)
+        index += 1
+        while index < len(notes) and notes[index].start() < extent:
+            index += 1
+        body = text[note.end() : notes[index].start() if index < len(notes) else len(text)]
+        if extent < 0:
             yield note, "", body, "", ""
+            continue
+        closing = f"\n</{opened.group('tag')}>"
+        close = body.rfind(closing)
+        yield (
+            note,
+            opened.group(0),
+            body[opened.end() - note.end() : close],
+            closing,
+            body[close + len(closing) :],
+        )
 
 
 def _cut_attachment_bodies(text: str, keep_chars: int, *, excerpt: bool) -> str:
     """Attachments longer than ``keep_chars`` keep their first whole lines (``excerpt``) or only their path."""
-    first = _SANDBOX_ATTACHMENT_NOTE_RE.search(text)
-    if not first:
+    spans = list(_attachment_spans(text))
+    if not spans:
         return text
-    out = [text[: first.start()]]
-    for note, opened, inner, close, tail in _attachment_spans(text):
+    out = [text[: spans[0][0].start()]]
+    for note, opened, inner, close, tail in spans:
         name, path = note.group("name"), note.group("path")
         if len(inner) <= keep_chars:
             out.append(note.group(0) + opened + inner + close + tail)
