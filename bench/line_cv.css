@@ -1,0 +1,8 @@
+/* Experiment: skip layout of code lines far outside a capped block (no line numbers, no wrap). */
+html:not([data-code-line-numbers]):not([data-code-wrap]) .aui-thread-root [data-streamdown="code-block"]:not([data-incomplete]) [data-streamdown="code-block-body"] > pre > code > span {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 1lh;
+}
+.aui-thread-root [data-wrap="on"] [data-streamdown="code-block-body"] > pre > code > span {
+  content-visibility: visible;
+}

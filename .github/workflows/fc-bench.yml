@@ -1,0 +1,53 @@
+name: fc-bench
+on:
+  push:
+    branches: ["bench/fc-ci"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fc:
+    strategy:
+      fail-fast: false
+      matrix:
+        leg:
+          - { os: ubuntu-latest, engine: chromium, throttle: "1" }
+          - { os: ubuntu-latest, engine: chromium, throttle: "4" }
+          - { os: macos-15, engine: webkit, throttle: "1" }
+          - { os: macos-15, engine: chromium, throttle: "1" }
+        rep: [1, 2, 3]
+        include:
+          - rep: 1
+            arms: "pre=bench/fc-pre,main=bench/fc-main,main2=bench/fc-main2,head=bench/fc-head"
+          - rep: 2
+            arms: "head=bench/fc-head,pre=bench/fc-pre,main=bench/fc-main,main2=bench/fc-main2"
+          - rep: 3
+            arms: "main2=bench/fc-main2,head=bench/fc-head,pre=bench/fc-pre,main=bench/fc-main"
+    runs-on: ${{ matrix.leg.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Playwright
+        run: |
+          python -m pip install -q playwright pyyaml
+          for i in 1 2 3; do python -m playwright install --with-deps ${{ matrix.leg.engine }} && break; sleep 20; done
+      - name: Fence colour bench
+        env:
+          BENCH_WORK: ${{ runner.temp }}/fcbench
+          FC_ARMS: ${{ matrix.arms }}
+          FC_ENGINE: ${{ matrix.leg.engine }}
+          FC_THROTTLE: ${{ matrix.leg.throttle }}
+        run: |
+          mkdir -p job && cd job
+          python -u ../bench/run_fc.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fc-${{ matrix.leg.os }}-${{ matrix.leg.engine }}-x${{ matrix.leg.throttle }}-r${{ matrix.rep }}
+          path: job/out
