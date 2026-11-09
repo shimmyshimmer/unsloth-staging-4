@@ -1,24 +1,18 @@
-name: menus-bench
+name: bpane-bench
 on:
   push:
-    branches: ["bench/menus-ci"]
-  workflow_dispatch:
+    branches: ["bench/bpane-ci"]
 permissions:
   contents: read
 jobs:
-  menus:
+  pane:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-latest]
+        os: [macos-15]
         rep: [1, 2]
-        include:
-          - rep: 1
-            arms: "now=bench/r11-main,base=bench/main-now2,now2=bench/r11-main2"
-          - rep: 2
-            arms: "base=bench/main-now2,now2=bench/r11-main2,now=bench/r11-main"
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 330
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -30,20 +24,20 @@ jobs:
       - name: Record arm refs
         run: |
           mkdir -p job/out
-          git ls-remote https://github.com/danielhanchen/unsloth-staging-2 "refs/heads/bench/main-now2" "refs/heads/bench/r11-main" "refs/heads/bench/r11-main2" | tee job/out/arm_ref.txt
-      - name: Menu bench round 11 (main-now2 9af15b95f7 vs main 763347f4d4 twice as A/A, WebKit + Chromium, solid + glass, 1 vs 150 turns)
+          git ls-remote https://github.com/danielhanchen/unsloth-staging-2 "refs/heads/bench/bp-*" | tee job/out/arm_ref.txt
+      - name: Browser pane attribution (1 vs 150 turns, runtime variants, WebKit + Chromium)
         env:
           BENCH_WORK: ${{ runner.temp }}/lagbench
-          MENU_ARM_REFS: ${{ matrix.arms }}
-          MENU_GLASS: "1"
-          MENU_TURNS: "1 150"
-          MENU_ENGINES: webkit,chromium
+          PANE_ARM_REFS: ${{ vars.PANE_ARM_REFS || 'base=bench/bp-base' }}
+          PANE_REPS: "2"
+          PANE_ENGINES: webkit,chromium
+          PANE_VARIANTS: stock,noanim,nocontain,floor
         run: |
           cp bench/pack_menus.tgz job/
           cd job
-          python -u ../bench/run_all.py menus
+          python -u ../bench/run_all.py pane
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: menus-${{ matrix.os }}-r11-r${{ matrix.rep }}
+          name: pane-${{ matrix.os }}-r${{ matrix.rep }}
           path: job/out

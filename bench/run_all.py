@@ -390,6 +390,49 @@ def stage_menus() -> None:
                 stop()
 
 
+def stage_pane() -> None:
+    """Browser-pane attribution: PANE_ARM_REFS label=ref,...; runtime variants per arm (pane_probe.py)."""
+    arms = [tuple(x.split("=", 1)) for x in os.environ["PANE_ARM_REFS"].split(",")]
+    sh("git fetch -q https://github.com/danielhanchen/unsloth-staging-2 "
+       + " ".join(f"{r}:{r}" for _, r in arms) + " --force", "fetch_bench", cwd=REPO)
+    dists = {}
+    for label, ref in arms:
+        d = build_app(ref, "p_" + label)
+        if d is None:
+            result("pane", {"arm": label, "error": "build failed"})
+        else:
+            dists[label] = d
+    if not dists:
+        return
+    threads = W / "threads_pane.json"
+    url = launch(next(iter(dists.values())), W / "hf_empty")
+    try:
+        if not threads.exists():
+            sh(f"{sys.executable} -u {PACK}/menu_bench.py seed --base-url {url} --home {HOME} "
+               f"--turns 1 150 --out {threads}", "seed_pane", timeout=3600)
+    finally:
+        stop()
+    result("pane_threads", json.loads(threads.read_text()))
+    labels = list(dists)
+    for rep in range(int(os.environ.get("PANE_REPS", "2"))):
+        order = labels if rep % 2 == 0 else list(reversed(labels))
+        for arm in order:
+            try:
+                url = launch(dists[arm], W / "hf_empty")
+                if rep == 0:
+                    record_build(arm, dict(arms)[arm], dists[arm], url)
+                out = OUT / f"pane_{arm}_{rep}.json"
+                sh(f"{sys.executable} -u {PACK}/pane_probe.py --base-url {url} --home {HOME} --threads {threads} "
+                   f"--arm {arm} --engines {os.environ.get('PANE_ENGINES', 'webkit,chromium')} "
+                   f"--variants {os.environ.get('PANE_VARIANTS', 'stock,noanim,nocontain,floor')} "
+                   f"--reps 1 --out {out}", f"pane_{arm}_{rep}", timeout=3600, echo="PANE")
+                result("pane", {"arm": arm, "rep": rep, "file": out.name})
+            except Exception as exc:  # noqa: BLE001
+                result("pane", {"arm": arm, "rep": rep, "error": str(exc)[:300]})
+            finally:
+                stop()
+
+
 def measure_typing(ref: str, tid: str, reps: int = 1) -> float | None:
     name = "b_" + ref.replace("/", "_")[:20]
     dist = build_app(ref, name)
