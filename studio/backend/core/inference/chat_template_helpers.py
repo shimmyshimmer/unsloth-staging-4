@@ -1534,14 +1534,10 @@ def renderable_tool_catalog(
         return safe if active_renders_tools else _unadvertised()
     if not active_renders_tools and not _template_reads_tools(native_tpl, tools):
         return _unadvertised()
-    # Include special tokens too: native render resolves bos_token; else a dropped tool stays
-    # listed.
-    native = model_markup(
-        native_tpl,
-        _vocabulary_of(tokenizer),
-        tools,
-        specials = _special_token_strings(getattr(tokenizer, "tokenizer", tokenizer)),
-    )
+    # With the special tokens too: the native render profiles through markup_for_tokenizer and so resolves "{{
+    # bos_token }}", and a catalog built without them kept a tool whose schema carries that value while the render
+    # dropped it (#7066).
+    native = _native_markup_for_tokenizer(tokenizer, native_tpl, tools)
     if native is None:
         return safe
     kept = catalog_tool_names(neutralize_tool_descriptions(tools, cache, native))
@@ -2335,6 +2331,53 @@ def _special_token_strings(tokenizer) -> dict:
         if isinstance(value, str) and value:
             specials[name] = value
     return specials
+
+
+_NATIVE_MARKUP_BY_TOKENIZER: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _native_markup_for_tokenizer(tokenizer, native_tpl, tools) -> Optional[ModelMarkup]:
+    """model_markup for the native fallback template, cached per tokenizer: rebuilding it walks the whole
+    vocabulary (150k-262k strings) on every tools request. model_markup reads tools only for truthiness, so the
+    key is the template, tools presence, vocabulary size (added tokens) and the special-token spellings."""
+    inner = getattr(tokenizer, "tokenizer", tokenizer)
+    specials = _special_token_strings(inner)
+    if isinstance(native_tpl, str):
+        template_key = native_tpl
+    else:
+        try:
+            template_key = json.dumps(native_tpl, sort_keys = True, default = str)
+        except (TypeError, ValueError):
+            template_key = repr(native_tpl)
+    try:
+        vocab_size = len(inner)
+    except Exception:
+        vocab_size = None
+    key = (template_key, bool(tools), vocab_size, tuple(sorted(specials.items())))
+    try:
+        entry = _NATIVE_MARKUP_BY_TOKENIZER.get(tokenizer)
+    except TypeError:  # not weak-referenceable
+        entry = None
+    if isinstance(entry, dict):
+        hit = entry.get(key, _UNPARSED)
+        if hit is not _UNPARSED:
+            return hit
+    profile = model_markup(
+        native_tpl,
+        _vocabulary_of(tokenizer),
+        tools,
+        specials = specials,
+    )
+    try:
+        entry = entry if isinstance(entry, dict) else {}
+        # Two selectors per template; trim if a tokenizer somehow cycles templates or vocabularies.
+        if len(entry) >= 4:
+            entry.clear()
+        entry[key] = profile
+        _NATIVE_MARKUP_BY_TOKENIZER[tokenizer] = entry
+    except TypeError:
+        pass
+    return profile
 
 
 def markup_for_tokenizer(
