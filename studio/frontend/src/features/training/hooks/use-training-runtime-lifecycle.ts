@@ -346,13 +346,31 @@ export function useTrainingRuntimeLifecycle(): void {
       void pollStatus();
     }, STATUS_POLL_INTERVAL_MS);
 
-    const metricsTimer = setInterval(() => {
+    let lastMetricsPollAt = 0;
+    const pollMetricsIfActive = () => {
       if (isIdle()) return;
       const s = runtimeStore.getState();
       if (shouldUseLiveSync(s) || s.currentStep > 0) {
+        lastMetricsPollAt = Date.now();
         void pollMetrics();
       }
+    };
+
+    // Keeps polling while hidden: drives the "training finished" notification.
+    const metricsTimer = setInterval(() => {
+      if (document.hidden) return;
+      pollMetricsIfActive();
     }, METRICS_POLL_INTERVAL_MS);
+    // Refetch on return only if a tick was skipped.
+    const onVisibilityChange = () => {
+      if (
+        !document.hidden &&
+        Date.now() - lastMetricsPollAt >= METRICS_POLL_INTERVAL_MS
+      ) {
+        pollMetricsIfActive();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
 
     // Recovers failed hydration and catches out-of-band state changes.
     const idleTimer = setInterval(() => {
@@ -371,6 +389,7 @@ export function useTrainingRuntimeLifecycle(): void {
       clearInterval(statusTimer);
       clearInterval(metricsTimer);
       clearInterval(idleTimer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       unsubscribeRuntime();
       stopStream();
     };
