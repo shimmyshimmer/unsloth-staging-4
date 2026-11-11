@@ -75,7 +75,7 @@ def _json_object_refused_for_schema(
 
 
 # launch-time windows are absent from catalogues; custom covers unregistered self-hosted servers.
-_SERVED_WINDOW_PROVIDERS = frozenset({"vllm", "llama_cpp", "custom"})
+_SERVED_WINDOW_PROVIDERS = frozenset({"vllm", "llama_cpp", "custom", "ollama"})
 # refresh within one or two turns to detect server restarts.
 _SERVED_WINDOW_TTL_S = 60.0
 _SERVED_WINDOW_TIMEOUT_S = 5.0
@@ -84,6 +84,8 @@ _GEMINI_RESTRICTED_GENERATION = re.compile(r"^gemini-(?:3\.[78]-flash|4-argon)(?
 _served_windows: dict[tuple[str, str, str], tuple[float, Optional[int]]] = {}
 _served_templates: dict[tuple[str, str, str], tuple[float, Optional[str]]] = {}
 _served_versions: dict[tuple[str, str], tuple[float, bool]] = {}
+# outlives the TTL: Ollama unloads an idle model after keep_alive and reloads it at the same window.
+_ollama_last_windows: dict[tuple[str, str, str], int] = {}
 
 
 def _positive_int(value: Any) -> Optional[int]:
@@ -7547,7 +7549,27 @@ class ExternalProviderClient:
             token = page.get("nextPageToken")
         return {**data, "models": models}
 
+    async def _read_ollama_loaded_window(self, model: str) -> Optional[int]:
+        response = await _client().get(
+            f"{self.base_url.removesuffix('/v1').rstrip('/')}/api/ps",
+            headers = self._auth_headers(),
+            timeout = _SERVED_WINDOW_TIMEOUT_S,
+        )
+        response.raise_for_status()
+        body = response.json()
+        loaded = body.get("models") if isinstance(body, dict) else None
+        # /api/ps always names the tag; a bare name means :latest.
+        wanted = (model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest").casefold()
+        for entry in loaded if isinstance(loaded, list) else []:
+            if isinstance(entry, dict) and wanted in {
+                str(entry.get(k) or "").casefold() for k in ("name", "model")
+            }:
+                return _positive_int(entry.get("context_length"))
+        return None
+
     async def _read_served_window(self, model: str) -> Optional[int]:
+        if self.provider_type == "ollama":
+            return await self._read_ollama_loaded_window(model)
         _, entries = await self._models_payload(_SERVED_WINDOW_TIMEOUT_S)
         by_id = {e["id"]: e for e in entries if isinstance(e.get("id"), str)}
         entry = by_id.get(model) or next(
@@ -7621,6 +7643,11 @@ class ExternalProviderClient:
             window = await asyncio.wait_for(
                 self._read_served_window(model), timeout = _SERVED_WINDOW_TIMEOUT_S
             )
+            if self.provider_type == "ollama":
+                # /api/ps lists a model only while it is loaded.
+                if window is None:
+                    return _ollama_last_windows.get(key)
+                _ollama_last_windows[key] = window
         except httpx.ConnectError as exc:
             # retry a down or restarting server next turn instead of caching the miss for a minute.
             logger.info("No served context window from %s: %s", self.provider_type, exc)
