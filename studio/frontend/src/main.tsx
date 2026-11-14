@@ -31,6 +31,11 @@ import {
 } from "./features/auth/session";
 import { startStartupCredentialBootstrap } from "./features/credentials/bootstrap";
 import { loadChatPage, prefetchChatPage } from "./features/chat/load-chat-page";
+import { loadGpuRendering } from "./features/settings/api/gpu-rendering";
+import {
+  getAppliedInterfaceZoom,
+  subscribeAppliedInterfaceZoom,
+} from "./features/settings/lib/interface-scale-runtime";
 import {
   applyInterfaceScaleBeforeFirstPaint,
   useInterfaceScaleStore,
@@ -90,6 +95,19 @@ if (isTauri) {
 const uaLower = navigator.userAgent.toLowerCase();
 if (uaLower.includes("linux") && !uaLower.includes("android")) {
   document.documentElement.classList.add("render-linux");
+}
+
+// WebKitGTK's CPU painter re-blurs CSS shadows on every repaint; large ones become images.
+// Loaded on use: only the Linux desktop app needs it.
+if (isTauri && document.documentElement.classList.contains("render-linux")) {
+  void import("./lib/cpu-paint-shadows").then(({ armCpuPaintShadows }) =>
+    armCpuPaintShadows({
+      interfaceZoom: getAppliedInterfaceZoom,
+      subscribeInterfaceZoom: subscribeAppliedInterfaceZoom,
+      cpuPainting: () =>
+        loadGpuRendering().then((status) => status.cpuPainting),
+    }),
+  );
 }
 
 if (uaLower.includes("windows")) {
