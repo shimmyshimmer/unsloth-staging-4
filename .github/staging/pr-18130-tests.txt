@@ -1,0 +1,3 @@
+studio/backend/tests/test_anthropic_stream_error.py
+studio/backend/tests/test_anthropic_thinking_translation.py
+studio/backend/tests/test_research_runs_hardening.py
