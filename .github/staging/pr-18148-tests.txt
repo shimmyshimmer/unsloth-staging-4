@@ -1,0 +1,7 @@
+studio/backend/tests/test_anthropic_stream_error.py
+studio/backend/tests/test_anthropic_thinking_translation.py
+studio/backend/tests/test_gemini_provider.py
+studio/backend/tests/test_gemini_stream_error.py
+studio/backend/tests/test_nudge_tool_calls_wiring.py
+studio/backend/tests/test_research_runs_hardening.py
+studio/backend/tests/test_sandbox_files_and_storage_roots.py
