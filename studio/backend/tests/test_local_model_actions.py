@@ -112,6 +112,142 @@ def test_delete_ollama_tag_keeps_layers_another_tag_uses(lm_root, tmp_path, monk
     assert sorted(p.name for p in (store / "blobs").iterdir()) == ["sha256-shared"]
 
 
+def _v2_store(tmp_path, monkeypatch):
+    """Newer Ollama: a pull writes manifests-v2 plus a legacy downgrade anchor; ``ollama cp`` writes
+    a v2-only alias of the same manifest blob (Windows copies the blob instead of symlinking)."""
+    import hashlib
+
+    from hub.services.models import ollama
+
+    store = tmp_path / "ollama_v2"
+    blobs = store / "blobs"
+    blobs.mkdir(parents = True)
+    (blobs / "sha256-model").write_bytes(b"GGUF")
+    (blobs / "sha256-cfg").write_bytes(b"{}")
+    child = json.dumps(
+        {
+            "config": {"digest": "sha256:cfg"},
+            "layers": [
+                {"mediaType": "application/vnd.ollama.image.model", "digest": "sha256:model"}
+            ],
+        }
+    ).encode()
+    child_digest = hashlib.sha256(child).hexdigest()
+    (blobs / f"sha256-{child_digest}").write_bytes(child)
+    parent = json.dumps(
+        {
+            "mediaType": "application/vnd.ollama.manifest.list.v2+json",
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                    "digest": f"sha256:{child_digest}",
+                },
+                {
+                    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                    "digest": "sha256:" + "f" * 64,
+                },
+            ],
+        }
+    ).encode()
+    parent_digest = hashlib.sha256(parent).hexdigest()
+    (blobs / f"sha256-{parent_digest}").write_bytes(parent)
+    anchor = json.loads(child)
+    anchor["layers"] += [
+        {
+            "mediaType": "application/vnd.ollama.manifest.list.v2+json",
+            "digest": f"sha256:{parent_digest}",
+        },
+        {
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "digest": f"sha256:{child_digest}",
+        },
+    ]
+    legacy = store / "manifests" / "registry.ollama.ai" / "library" / "qwen" / "latest"
+    legacy.parent.mkdir(parents = True)
+    legacy.write_text(json.dumps(anchor))
+    v2 = store / "manifests-v2" / "ollama.com" / "library"
+    for name, data in (("qwen", parent), ("alias", child)):
+        (v2 / name).mkdir(parents = True)
+        (v2 / name / "latest").write_bytes(data)
+    monkeypatch.setattr(ollama, "_known_ollama_dirs", lambda: [store])
+    monkeypatch.setattr(ollama, "ollama_model_dirs", lambda: [store])
+    return store, ollama._ollama_manifest_ref(Path(os.path.realpath(legacy))), child_digest
+
+
+def test_delete_v2_pulled_tag_removes_both_trees_and_keeps_a_cp_alias(tmp_path, monkeypatch):
+    # #18058: an anchored tag is listed now; deleting it must match ``ollama rm``.
+    from hub.services.models import ollama
+
+    store, ref, child_digest = _v2_store(tmp_path, monkeypatch)
+    assert [row.load_id for row in ollama.scan_ollama_dir(store)] == [ref]
+
+    ollama.delete_ollama_model_ref(ref)
+
+    assert not (store / "manifests" / "registry.ollama.ai" / "library" / "qwen").exists()
+    assert not (store / "manifests-v2" / "ollama.com" / "library" / "qwen").exists()
+    assert (store / "manifests-v2" / "ollama.com" / "library" / "alias" / "latest").is_file()
+    assert sorted(p.name for p in (store / "blobs").iterdir()) == sorted(
+        ["sha256-cfg", "sha256-model", f"sha256-{child_digest}"]
+    )
+
+
+def test_delete_v2_pulled_tag_keeps_blobs_an_inline_list_child_uses(tmp_path, monkeypatch):
+    from hub.services.models import ollama
+
+    store, ref, _ = _v2_store(tmp_path, monkeypatch)
+    alias = store / "manifests-v2" / "ollama.com" / "library" / "alias" / "latest"
+    inline = {
+        "config": {"digest": "sha256:cfg"},
+        "layers": [{"mediaType": "application/vnd.ollama.image.model", "digest": "sha256:model"}],
+    }
+    alias.write_text(
+        json.dumps(
+            {"mediaType": "application/vnd.ollama.manifest.list.v2+json", "manifests": [inline]}
+        )
+    )
+
+    ollama.delete_ollama_model_ref(ref)
+
+    assert {"sha256-cfg", "sha256-model"} <= {p.name for p in (store / "blobs").iterdir()}
+
+
+@pytest.mark.parametrize("unreadable", ["child", "tag"])
+def test_delete_keeps_every_blob_when_a_retained_manifest_cannot_be_stat(
+    tmp_path, monkeypatch, unreadable
+):
+    import errno
+
+    from hub.services.models import ollama
+
+    store, ref, child_digest = _v2_store(tmp_path, monkeypatch)
+    alias = store / "manifests-v2" / "ollama.com" / "library" / "alias" / "latest"
+    child_ref = {
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "digest": f"sha256:{child_digest}",
+    }
+    alias.write_text(
+        json.dumps(
+            {"mediaType": "application/vnd.ollama.manifest.list.v2+json", "manifests": [child_ref]}
+        )
+    )
+    real_stat = os.stat
+
+    # os.stat, not Path.is_file: Python 3.14's is_file returns False on EIO instead of raising.
+    def flaky_stat(path, *args, **kwargs):
+        target = (
+            f"sha256-{child_digest}" if unreadable == "child" else os.path.join("alias", "latest")
+        )
+        if os.fspath(path).endswith(target):
+            raise OSError(errno.EIO, "I/O error")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", flaky_stat)
+    ollama.delete_ollama_model_ref(ref)
+    monkeypatch.setattr(os, "stat", real_stat)
+
+    assert {"sha256-cfg", "sha256-model"} <= {p.name for p in (store / "blobs").iterdir()}
+
+
 def test_delete_split_gguf_takes_every_shard(lm_root, tmp_path, monkeypatch):
     hermes = tmp_path / "hermes"
     hermes.mkdir()
