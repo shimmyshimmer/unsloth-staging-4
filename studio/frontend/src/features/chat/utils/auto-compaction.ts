@@ -64,6 +64,15 @@ export function normalizeAutoCompactTokens(value: unknown): number | undefined {
   return value;
 }
 
+/** Unset is "summary"; "evict" archives whole oldest turns with no summary call. */
+export type ProviderCompactionMode = "summary" | "evict";
+
+export function normalizeCompactionMode(
+  value: unknown,
+): ProviderCompactionMode | undefined {
+  return value === "summary" || value === "evict" ? value : undefined;
+}
+
 /** Blank clears the setting; anything else must be a whole number of tokens in range. */
 export function parseAutoCompactTokens(input: string): number | null {
   const trimmed = input.trim().replace(/[,_\s]/g, "");
@@ -132,6 +141,7 @@ export function apiCompactionRequestFields(options: {
   contextLength: number | null | undefined;
   /** The connection's "Auto-compact after", which replaces the 75% default. */
   autoCompactTokens?: number | null;
+  compactionMode?: ProviderCompactionMode | null;
   // /compact: asked for by the user, so it applies with auto-compaction off too
   compactNow?: boolean;
 }): {
@@ -140,9 +150,13 @@ export function apiCompactionRequestFields(options: {
   compaction_uncapped?: true;
   context_window?: number;
   compact_context?: true;
+  compaction_mode?: "evict";
 } {
   const { autoCompactEnabled, contextLength, compactNow } = options;
-  if (!autoCompactEnabled && !compactNow) return {};
+  const evict =
+    options.compactionMode === "evict" ? { compaction_mode: "evict" as const } : {};
+  // Still sent with auto-compact off: the backend replays a /compact epoch only for "evict".
+  if (!autoCompactEnabled && !compactNow) return evict;
   const requested = requestedCompactionThreshold(
     contextLength,
     options.autoCompactTokens,
@@ -154,5 +168,6 @@ export function apiCompactionRequestFields(options: {
     ...(requested?.uncapped ? { compaction_uncapped: true as const } : {}),
     ...(contextLength && contextLength > 0 ? { context_window: contextLength } : {}),
     ...(compactNow ? { compact_context: true as const } : {}),
+    ...evict,
   };
 }
