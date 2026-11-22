@@ -29839,6 +29839,23 @@ _ANTHROPIC_NATIVE_COMPACT_NOW_TOKENS = 60_000
 _EXTERNAL_COMPACTION_THRESHOLD_MAX = 2_000_000
 
 
+# Without max_tokens Ollama context-shifts past num_ctx and a gateway applies its own default,
+# so Max asks for what the model's window leaves after the prompt (llama.cpp and vLLM stop there).
+_WINDOW_ROOM_REPLY_PROVIDERS = frozenset({"ollama", "custom", "openrouter"})
+_UNKNOWN_WINDOW_MAX_TOKENS = 32_768
+_MIN_WINDOW_ROOM_TOKENS = 256
+
+
+def _window_room_max_tokens(window: int, prompt_tokens: int, compaction_threshold) -> int:
+    # A fit will shrink the prompt to the threshold first, so leave room for that prompt, not this one.
+    if compaction_threshold:
+        prompt_tokens = min(prompt_tokens, compaction_threshold)
+    if prompt_tokens >= window:
+        # Only a replayed summary or compaction epoch (applied later) can make this fit: guess.
+        return window // 4
+    return max(_MIN_WINDOW_ROOM_TOKENS, window - prompt_tokens - window // 32)
+
+
 def _extends_turn(old: Any, new: Any) -> bool:
     """``new`` is ``old`` with text or parts appended, as the loop's ``_append_user_turn`` merges."""
     if isinstance(old, str) and isinstance(new, str):
@@ -31132,6 +31149,45 @@ async def _proxy_to_external_provider(
         served = await client.served_context_window(model)
         return min(served, payload.context_window or served) if served else None
 
+    _reply_room = None
+    if (
+        managed is None
+        and provider_type in _WINDOW_ROOM_REPLY_PROVIDERS
+        and _effective_max_tokens(payload) is None
+        # OpenRouter models publish output caps below the window; only Studio's Max (which knows
+        # them and sends a number where one applies) opts into the window there.
+        and (provider_type != "openrouter" or _ui_stream_events_enabled(request))
+    ):
+        from routes.providers import cached_catalog_model_context
+
+        _reply_window = None
+        # A Responses endpoint is a hosted gateway with its own output caps: it keeps the old limit.
+        if api_type != "responses":
+            # Ollama's loaded num_ctx is usually far below the catalogued window: the smaller wins.
+            _reply_window = min(
+                filter(None, (payload.context_window, await client.served_context_window(model))),
+                default = None,
+            ) or cached_catalog_model_context(provider_type, model)
+        if _reply_window:
+            _room_threshold = (
+                payload.compaction_threshold
+                if payload.context_overflow == "truncate_oldest"
+                else None
+            )
+            _room_payload = payload
+
+            def _reply_room(messages, tools = _external_fit_tools) -> int:
+                return _window_room_max_tokens(
+                    _reply_window,
+                    _external_token_counter(_room_payload, tools)(messages),
+                    _room_threshold,
+                )
+
+            payload = payload.model_copy(update = {"max_tokens": _reply_room(chat_messages)})
+        elif _ui_stream_events_enabled(request):
+            # Studio's Max with no window to read; an API caller keeps the provider's default.
+            payload = payload.model_copy(update = {"max_tokens": _UNKNOWN_WINDOW_MAX_TOKENS})
+
     _external_truncation = None
     _external_max_tokens = _effective_max_tokens(payload)
     _compaction_fallback = None
@@ -31509,6 +31565,7 @@ async def _proxy_to_external_provider(
                     message_fitter = _external_fit_steps if _fit_active else None,
                     overflow_refitter = _external_overflow_refit if _overflow_recovery else None,
                     first_turn_overrides = _first_turn_overrides,
+                    reply_limit = _reply_room,
                     enabled_tools = loop_hosted_tools or None,
                     stream = True,
                     **_provider_kwargs,

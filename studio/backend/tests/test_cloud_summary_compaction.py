@@ -955,3 +955,87 @@ def test_the_summary_request_keeps_embedded_instructions_out_of_the_summary():
     assert "never repeated" in system["content"]
     # Repeated at the end, where small models weigh it most.
     assert user["content"].rstrip().endswith("that it was not followed.")
+
+
+def test_max_asks_for_the_room_the_window_leaves_after_the_prompt():
+    assert ri._window_room_max_tokens(64_000, 10_000, None) == 64_000 - 10_000 - 2_000
+    assert ri._window_room_max_tokens(64_000, 70_000, 6_000) == 64_000 - 6_000 - 2_000
+    assert ri._window_room_max_tokens(64_000, 63_000, None) == ri._MIN_WINDOW_ROOM_TOKENS
+    # Past the window with auto-compact off: a replayed summary shortens it later, so not 256.
+    assert ri._window_room_max_tokens(64_000, 200_000, None) == 16_000
+
+
+@pytest.mark.parametrize("provider_type", ["custom", "openrouter"])
+def test_a_request_without_max_tokens_gets_the_windows_room(provider_type, monkeypatch):
+    monkeypatch.setattr(ri, "_ui_stream_events_enabled", lambda request: True)
+    chat = [{"role": "user", "content": "hello"}]
+    _, sent = _proxy(provider_type, chat, max_tokens = None, context_window = 64_000)
+    assert 64_000 - 2_000 - 200 < sent["max_tokens"] < 64_000 - 2_000
+
+
+def test_studio_max_without_a_known_window_keeps_the_old_ceiling(monkeypatch):
+    chat = [{"role": "user", "content": "hello"}]
+    _, sent = _proxy("custom", chat, max_tokens = None)
+    assert "max_tokens" not in sent  # An API caller keeps the provider's own default.
+    monkeypatch.setattr(ri, "_ui_stream_events_enabled", lambda request: True)
+    _, sent = _proxy("custom", chat, max_tokens = None)
+    assert sent["max_tokens"] == ri._UNKNOWN_WINDOW_MAX_TOKENS
+
+
+def test_window_bounded_servers_and_explicit_limits_are_left_alone():
+    chat = [{"role": "user", "content": "hello"}]
+    _, sent = _proxy("llama_cpp", chat, max_tokens = None, context_window = 64_000)
+    assert "max_tokens" not in sent
+    _, sent = _proxy("custom", chat, max_tokens = 512, context_window = 64_000)
+    assert sent["max_tokens"] == 512
+
+
+def test_studio_max_on_a_custom_responses_connection_keeps_the_old_ceiling(monkeypatch):
+    monkeypatch.setattr(ri, "_ui_stream_events_enabled", lambda request: True)
+    seen = {}
+    real = ep_mod.ExternalProviderClient.stream_chat_completion
+
+    def spy(self, *args, **kwargs):
+        seen["max_tokens"] = kwargs.get("max_tokens")
+        seen["api_type"] = self.api_type
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(ep_mod.ExternalProviderClient, "stream_chat_completion", spy)
+    chat = [{"role": "user", "content": "hello"}]
+    _proxy("custom", chat, max_tokens = None, context_window = 64_000, provider_api_type = "responses")
+    assert seen == {"max_tokens": ri._UNKNOWN_WINDOW_MAX_TOKENS, "api_type": "responses"}
+
+
+def test_an_openrouter_api_caller_without_max_tokens_keeps_the_provider_default():
+    chat = [{"role": "user", "content": "hello"}]
+    _, sent = _proxy("openrouter", chat, max_tokens = None, context_window = 1_000_000)
+    assert "max_tokens" not in sent
+
+
+def test_each_tool_loop_round_gets_the_room_its_own_prompt_leaves():
+    from core.inference.external_tool_transport import OAICompatTransport
+
+    sent = []
+
+    class _Client:
+        provider_type = "custom"
+        api_type = "chat_completions"
+
+        async def stream_chat_completion(self, **kwargs):
+            sent.append(kwargs.get("max_tokens"))
+            yield 'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}'
+
+    transport = OAICompatTransport(
+        _Client(),
+        model = "m",
+        max_tokens = 9_000,
+        reply_limit = lambda messages, tools: 10_000 - 1_000 * len(messages),
+    )
+
+    async def run(messages):
+        async for _ in transport._stream_provider(messages, None, None):
+            pass
+
+    asyncio.run(run([{"role": "user", "content": "a"}]))
+    asyncio.run(run([{"role": "user", "content": "a"}] * 3))
+    assert sent == [9_000, 7_000]
