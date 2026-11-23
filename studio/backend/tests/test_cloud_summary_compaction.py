@@ -18,6 +18,7 @@ from starlette.requests import Request
 import routes.inference as ri
 from core.inference import cloud_compaction
 from core.inference import external_provider as ep_mod
+from core.inference.context_window import estimate_message_tokens_without_unpriced_media
 from core.inference.providers import PROVIDER_REGISTRY
 from storage import studio_db
 
@@ -88,6 +89,22 @@ class _SummarisingHandler(_Handler):
 
 class _CutOffSummary(_SummarisingHandler):
     summary_finish_reason = "length"
+
+
+class _CutOffOnce(_SummarisingHandler):
+    """Cuts the first summary call off at its token limit and finishes the next one."""
+
+    def do_POST(self) -> None:  # noqa: N802
+        cut = getattr(self.server, "summary_cut_offs", 0)
+        self.summary_finish_reason = "length" if cut == 0 else "stop"
+        self.server.summary_cut_offs = cut + 1  # type: ignore[attr-defined]
+        super().do_POST()
+
+
+class _LongSummaryAfterCutOff(_CutOffOnce):
+    """The retry writes a summary near its doubled limit, which the next call carries."""
+
+    summary_text = "word " * 2_200
 
 
 class _StalledSummary(_SummarisingHandler):
@@ -296,6 +313,8 @@ def test_a_cut_off_summary_is_not_asked_for_again_until_compact():
 
 def test_a_timed_out_summary_is_not_asked_for_again_until_compact(monkeypatch):
     monkeypatch.setattr(cloud_compaction, "SUMMARY_IDLE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(cloud_compaction, "SUMMARY_FIRST_LINE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(cloud_compaction, "SUMMARY_MIN_PREFILL_TOKENS_PER_S", 1e9)
     thread = _saved_thread("thread-timed-out-summary")
     chat = _long_chat()
     options = dict(thread_id = thread, **_SMALL_TRIGGER)
@@ -318,6 +337,50 @@ def test_a_timed_out_summary_is_not_asked_for_again_until_compact(monkeypatch):
     assert summaries
     assert studio_db.list_chat_thread_summaries(thread)
 
+
+def test_a_summary_cut_off_once_is_retried_with_twice_the_room():
+    thread = _saved_thread("thread-cut-off-retry")
+    chunks, [first, retry], [sent] = _bodies(_CutOffOnce, thread_id = thread, **_SMALL_TRIGGER)
+    assert retry["max_tokens"] == 2 * first["max_tokens"]
+    assert retry["messages"] == first["messages"]
+    assert _SUMMARY in _system_text(sent)
+    [truncation] = _truncations(chunks)
+    assert truncation["summarized"] is True and not truncation.get("summary_failed")
+
+
+def test_a_long_retried_summary_still_leaves_the_next_compaction_inside_the_window():
+    window = 16_000
+    thread = _saved_thread("thread-retry-window")
+    options = dict(
+        thread_id = thread,
+        context_overflow = "truncate_oldest",
+        compaction_threshold = 6_000,
+        context_window = window,
+    )
+    chat = _long_chat(turns = 12)
+    _, first, _ = _bodies(_LongSummaryAfterCutOff, messages = chat, **options)
+    assert first[-1]["max_tokens"] == 2 * first[0]["max_tokens"]
+    grown = list(chat)
+    for index in range(30):
+        grown.append({"role": "assistant", "content": f"more answer {index} " + "word " * 400})
+        grown.append({"role": "user", "content": f"more question {index} " + "word " * 400})
+    _, summaries, _ = _bodies(_SummarisingHandler, messages = grown, **options)
+    assert "word word" in summaries[0]["messages"][1]["content"]
+    for body in summaries:
+        prompt = sum(estimate_message_tokens_without_unpriced_media(m) for m in body["messages"])
+        assert prompt + body["max_tokens"] <= window
+
+
+def test_an_earlier_summary_call_cut_off_is_not_retried():
+    _, summaries, _ = _bodies(
+        _LongSummaryAfterCutOff,
+        messages = _long_chat(turns = 30),
+        thread_id = _saved_thread("thread-early-cut-off"),
+        context_overflow = "truncate_oldest",
+        compaction_threshold = 6_000,
+        context_window = 16_000,
+    )
+    assert len(summaries) == 1
 
 def test_a_summary_still_streaming_past_the_idle_timeout_is_kept(monkeypatch):
     # #18306: the whole summary took longer than the timeout, but the provider never went quiet.
@@ -459,6 +522,161 @@ def test_compact_without_a_saved_thread_is_ignored():
     )
     assert summaries == [] and _truncations(chunks) == []
     assert len(sent["messages"]) == len(_long_chat(turns = 2))
+
+
+def _progress_frames(chunks: list[dict], phase: str) -> list[dict]:
+    return [c for c in chunks if c.get("type") == "generation_progress" and c.get("phase") == phase]
+
+
+_COMPACT_CUSTOM = dict(
+    provider_type = "custom",
+    compact_context = True,
+    context_overflow = "truncate_oldest",
+    context_window = 128_000,
+)
+
+
+@pytest.mark.parametrize(
+    "handler, reason",
+    [(_CutOffSummary, "cut_off"), (_EmptySummary, "empty"), (_StalledSummary, "timed_out")],
+)
+def test_a_failed_compact_tells_the_client_why(handler, reason, monkeypatch):
+    monkeypatch.setattr(ri, "_ui_stream_events_enabled", lambda request: True)
+    monkeypatch.setattr(cloud_compaction, "SUMMARY_FIRST_LINE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(cloud_compaction, "SUMMARY_MIN_PREFILL_TOKENS_PER_S", 1e9)
+    thread = _saved_thread(f"thread-compact-fails-{reason}")
+    chat = _long_chat()
+    chunks, summaries, [sent] = _bodies(handler, messages = chat, thread_id = thread, **_COMPACT_CUSTOM)
+    # A cut-off summary is asked for once more with twice the room.
+    assert len(summaries) == (2 if reason == "cut_off" else 1)
+    assert [f["reason"] for f in _progress_frames(chunks, "compaction_failed")] == [reason]
+    assert _truncations(chunks) == []
+    assert len(sent["messages"]) == len(chat)
+
+
+def test_a_compact_that_worked_reports_no_failure(monkeypatch):
+    monkeypatch.setattr(ri, "_ui_stream_events_enabled", lambda request: True)
+    thread = _saved_thread("thread-compact-works")
+    chunks, [_], _ = _bodies(_SummarisingHandler, thread_id = thread, **_COMPACT_CUSTOM)
+    assert _progress_frames(chunks, "compacting")
+    assert _progress_frames(chunks, "compaction_failed") == []
+    [truncation] = _truncations(chunks)
+    assert truncation["manual"] is True and truncation["checkpoint_started"] is True
+
+
+def test_an_auto_summary_failure_sends_no_compact_failure(monkeypatch):
+    monkeypatch.setattr(ri, "_ui_stream_events_enabled", lambda request: True)
+    thread = _saved_thread("thread-auto-fails")
+    chunks, _, _ = _bodies(_CutOffSummary, thread_id = thread, **_SMALL_TRIGGER)
+    assert _progress_frames(chunks, "compaction_failed") == []
+    [truncation] = _truncations(chunks)
+    assert truncation["summary_failed"] is True
+
+
+@pytest.mark.parametrize(
+    "provider_type, fields, off",
+    [
+        # Ollama: "none" is think=false, refused only as true (openai/openai.go, server/routes.go).
+        ("ollama", {}, {"reasoning_effort": "none"}),
+        ("llama_cpp", {}, {"chat_template_kwargs": {"enable_thinking": False}}),
+        ("vllm", {}, {"chat_template_kwargs": {"enable_thinking": False}}),
+        (
+            "custom",
+            {"provider_reasoning_config": {"enabled": True, "style": "reasoning_effort"}},
+            {"reasoning_effort": "none"},
+        ),
+    ],
+)
+def test_a_self_hosted_summary_is_asked_for_without_thinking(provider_type, fields, off):
+    ep_mod._served_windows.clear()
+    _, [summary_call], _ = _bodies(
+        _SummarisingHandler, provider_type = provider_type, **_SMALL_TRIGGER, **fields
+    )
+    for key, value in off.items():
+        assert summary_call[key] == value
+
+
+def test_a_cloud_summary_keeps_the_providers_thinking_default():
+    _, [summary_call], _ = _bodies(
+        _SummarisingHandler, provider_type = "openrouter", **_SMALL_TRIGGER
+    )
+    assert "reasoning" not in summary_call and "reasoning_effort" not in summary_call
+
+
+def test_a_server_still_reading_the_prompt_is_waited_for(monkeypatch):
+    monkeypatch.setattr(cloud_compaction, "SUMMARY_IDLE_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(cloud_compaction, "SUMMARY_FIRST_LINE_TIMEOUT_S", 2.0)
+
+    async def stream(first_gap: float, later_gap: float):
+        await asyncio.sleep(first_gap)
+        yield 'data: {"choices":[{"delta":{"content":"the "}}]}'
+        await asyncio.sleep(later_gap)
+        yield 'data: {"choices":[{"delta":{"content":"summary"},"finish_reason":"stop"}]}'
+
+    assert asyncio.run(cloud_compaction.collect_summary(stream(0.4, 0.0))) == "the summary"
+    with pytest.raises(cloud_compaction.SummaryTimedOut):
+        asyncio.run(cloud_compaction.collect_summary(stream(0.0, 0.4)))
+
+
+def test_the_wait_for_a_first_line_grows_with_the_prompt():
+    assert cloud_compaction.summary_first_line_timeout(None) == 300.0
+    assert cloud_compaction.summary_first_line_timeout(5_000) == 300.0
+    assert cloud_compaction.summary_first_line_timeout(200_000) == 4_000.0
+
+
+def test_a_long_summary_prompt_widens_the_provider_read_timeout(monkeypatch):
+    seen = []
+    real = ep_mod.ExternalProviderClient.stream_chat_completion
+
+    def spy(self, *args, **kwargs):
+        seen.append(kwargs.get("read_timeout"))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(ep_mod.ExternalProviderClient, "stream_chat_completion", spy)
+    monkeypatch.setattr(cloud_compaction, "SUMMARY_MIN_PREFILL_TOKENS_PER_S", 1.0)
+    _bodies(_SummarisingHandler, thread_id = _saved_thread("thread-read-timeout"), **_SMALL_TRIGGER)
+    widened = [t for t in seen if t is not None]
+    assert widened and min(widened) > 300.0 + cloud_compaction.SUMMARY_IDLE_TIMEOUT_S
+
+
+def test_a_responses_connection_gets_the_widened_read_timeout_too(monkeypatch):
+    seen = []
+
+    class _Recorder:
+        def stream(self, *args, timeout = None, **kwargs):
+            seen.append(timeout)
+            raise RuntimeError("recorded")
+
+    monkeypatch.setattr(ep_mod, "_client", lambda: _Recorder())
+    client = ep_mod.ExternalProviderClient(
+        provider_type = "custom", base_url = "http://127.0.0.1:9/v1", api_key = "x", api_type = "responses"
+    )
+
+    async def drain():
+        try:
+            async for _ in client.stream_chat_completion(
+                messages = [{"role": "user", "content": "hi"}], model = "m", read_timeout = 4_000.0
+            ):
+                pass
+        except RuntimeError:
+            pass
+
+    asyncio.run(drain())
+    assert seen and seen[0].read == 4_000.0
+
+
+def test_a_long_prompt_read_under_keep_alives_does_not_count_against_the_total(monkeypatch):
+    monkeypatch.setattr(cloud_compaction, "SUMMARY_FIRST_LINE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(cloud_compaction, "SUMMARY_IDLE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(cloud_compaction, "SUMMARY_TIMEOUT_S", 0.3)
+
+    async def stream():
+        for _ in range(6):
+            await asyncio.sleep(0.1)
+            yield ":"
+        yield 'data: {"choices":[{"delta":{"content":"read"},"finish_reason":"stop"}]}'
+
+    assert asyncio.run(cloud_compaction.collect_summary(stream())) == "read"
 
 
 def test_compact_on_anthropic_lowers_the_native_trigger_for_a_long_chat():
