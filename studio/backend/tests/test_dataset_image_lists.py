@@ -2,6 +2,7 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import io
+import os
 import sys
 from pathlib import Path
 
@@ -254,6 +255,60 @@ def test_text_only_datasets_stay_text(row):
 
     assert dataset_format.check_dataset_format(dataset, is_vlm = False)["is_image"] is False
     assert format_detection.detect_multimodal_dataset(dataset)["is_image"] is False
+
+
+@pytest.mark.parametrize("column", ["filename", "file_name"])
+def test_filename_column_only_counts_as_image_when_it_names_an_image(column):
+    text_row = {"instruction": "Add 2 and 3.", "output": "5", column: "arithmetic.jsonl"}
+    image_row = {"caption": "A red square.", column: "red.png"}
+
+    text_dataset = Dataset.from_list([text_row])
+    assert dataset_format.check_dataset_format(text_dataset, is_vlm = False)["is_image"] is False
+    assert format_detection.detect_multimodal_dataset(text_dataset)["is_image"] is False
+    image_info = format_detection.detect_multimodal_dataset(Dataset.from_list([image_row]))
+    assert image_info["is_image"] is True
+    assert image_info["multimodal_columns"] == [column]
+
+
+@pytest.mark.parametrize("header, image", [(b"\x89PNG\r\n\x1a\n", True), (b"# Read me\n", False)])
+def test_extensionless_file_name_counts_as_image_only_when_the_file_is_one(tmp_path, header, image):
+    referenced = tmp_path / "README"
+    referenced.write_bytes(header)
+    dataset = Dataset.from_list(
+        [{"instruction": "Summarise", "output": "A readme", "file_name": str(referenced)}]
+    )
+
+    assert format_detection.detect_multimodal_dataset(dataset)["is_image"] is image
+    assert dataset_format.check_dataset_format(dataset, is_vlm = False)["is_image"] is image
+
+
+def _file_name_dataset(path):
+    return Dataset.from_list(
+        [{"instruction": "Summarise", "output": "A file", "file_name": str(path)}]
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason = "FIFOs are POSIX only")
+def test_file_name_pointing_at_a_fifo_does_not_block(tmp_path):
+    fifo = tmp_path / "source.jsonl"
+    os.mkfifo(fifo)
+
+    assert format_detection.detect_multimodal_dataset(_file_name_dataset(fifo))["is_image"] is False
+
+
+def test_managed_account_cannot_probe_a_file_it_may_not_read(tmp_path):
+    from utils.account_context import AccountContext, bind_account, reset_account
+
+    png = tmp_path / "owner_photo"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n")
+    token = bind_account(AccountContext("a1b2c3d4e5f6a7b8", "alice", "user"))
+    try:
+        assert (
+            format_detection.detect_multimodal_dataset(_file_name_dataset(png))["is_image"] is False
+        )
+    finally:
+        reset_account(token)
+    assert format_detection.detect_multimodal_dataset(_file_name_dataset(png))["is_image"] is True
 
 
 @pytest.mark.parametrize("detector", [dataset_format, format_detection])
