@@ -700,6 +700,23 @@ class TrainingStartRequest(BaseModel):
         ),
     )
 
+    parallel_mode: Optional[
+        Literal["auto", "single", "layer_split", "ddp", "fsdp2", "tp", "pp", "cp", "ep", "custom"]
+    ] = Field(
+        None,
+        description = (
+            "Multi-GPU layout. auto: Studio picks (DDP when the model fits each GPU, FSDP2 when it fits sharded, "
+            "expert parallel for MoE where Unsloth has it, else layers split across GPUs). single / layer_split: "
+            "one process. ddp / fsdp2 / tp / pp / cp / ep / custom: one process per GPU (Linux NVIDIA / AMD). "
+            "Omit for the behaviour before this field existed."
+        ),
+    )
+    parallel_spec: Optional[str] = Field(
+        None,
+        max_length = 200,
+        description = 'With parallel_mode "custom": the UNSLOTH_PARALLEL layout, e.g. "dp=2,tp=2".',
+    )
+
     s3_config: Optional[S3Config] = Field(
         None,
         description = 'S3 bucket configuration. Missing SDK installs on first use; preinstall offline support with: python -m pip install "unsloth[s3]"',
@@ -799,6 +816,34 @@ class TrainingStartRequest(BaseModel):
         return self
 
 
+class ParallelPlanRequest(BaseModel):
+    """POST /api/train/parallel/plan body."""
+
+    model_name: str = Field(..., max_length = 512)
+    training_type: Literal["LoRA/QLoRA", "Full Finetuning", "Continued Pretraining"] = "LoRA/QLoRA"
+    load_in_4bit: bool = TrainingStartRequest.model_fields["load_in_4bit"].default
+    batch_size: int = Field(TrainingStartRequest.model_fields["batch_size"].default, ge = 1)
+    max_seq_length: int = Field(TrainingStartRequest.model_fields["max_seq_length"].default, ge = 1)
+    lora_r: int = Field(TrainingStartRequest.model_fields["lora_r"].default, ge = 1)
+    target_modules: Optional[List[str]] = None
+    gradient_checkpointing: str = TrainingStartRequest.model_fields[
+        "gradient_checkpointing"
+    ].default
+    optim: str = TrainingStartRequest.model_fields["optim"].default
+    gpu_ids: Optional[List[int]] = None
+    parallel_mode: Optional[
+        Literal["auto", "single", "layer_split", "ddp", "fsdp2", "tp", "pp", "cp", "ep", "custom"]
+    ] = "auto"
+    parallel_spec: Optional[str] = Field(None, max_length = 200)
+    offload_layers: Optional[Union[int, str]] = None
+    packing: bool = TrainingStartRequest.model_fields["packing"].default
+    is_dataset_image: bool = False
+    is_dataset_audio: bool = False
+    is_embedding: bool = False
+    is_decision: bool = False
+    drafter: Optional[DrafterTrainingConfig] = None
+
+
 class TrainingJobResponse(BaseModel):
     """Immediate response when training is initiated"""
 
@@ -879,6 +924,11 @@ class TrainingStatus(BaseModel):
     )
     details: Optional[dict] = Field(
         None, description = "Phase-specific info, e.g. {'model_size': '8B'}"
+    )
+    parallel: Optional[dict] = Field(
+        None,
+        description = "Multi-GPU layout of the run (mode, world_size, gpu_ids, spec, launcher, "
+        "distributed_backend, reason); null when started without parallel_mode.",
     )
     metric_history: Optional[dict] = Field(
         None,
