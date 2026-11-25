@@ -93,9 +93,9 @@ def ep_env_mesh():
     return _ENV_MESH[0]
 
 
-def ep_env_load(fn, args, kwargs, four_bit):
-    """from_pretrained under UNSLOTH_EP_SIZE: a 4-bit quantize-on-load keeps only this rank's experts."""
-    if not four_bit:
+def ep_env_load(fn, args, kwargs, sharded):
+    """from_pretrained under UNSLOTH_EP_SIZE; `sharded` False (adapter or QAT load) loads in full."""
+    if not sharded:
         return fn(*args, **kwargs)
     try:
         with expert_parallel_loading(_split_mesh(ep_env_mesh())[0]):
@@ -126,8 +126,7 @@ def _tpn():
 
 @contextlib.contextmanager
 def expert_parallel_loading(ep_mesh = None):
-    """A bitsandbytes 4-bit quantize-on-load (transformers 5) keeps only this rank's routed expert stacks, cut as
-    transformers quantizes them (the tensor parallel cut); everything else loads whole. Other loads are untouched."""
+    """16-bit, bitsandbytes 4-bit or block-FP8 loads (transformers 5) keep only this rank's routed expert stacks; others load whole."""
     tpn = _tpn()
     with tpn._sharded_from_pretrained(
         {
@@ -251,8 +250,7 @@ def _localize(shard, ep):
         setattr(local, _EP, (dim, groups, per, E, E_pad, ep))
         owner._parameters[name] = local
     shard.swaps = []  # nothing left to swap: the parameters are local
-    for name in tpn._EXPERT_STACKS:
-        p = shard.leaf._parameters.get(name)
+    for p in shard.leaf._parameters.values():
         if tpn._is_params4bit(p):
             p.__dict__.pop("_unsloth_tp_layout", None)
             setattr(p, _EP, ("4bit", shard.experts, ep))
@@ -321,11 +319,11 @@ def apply_expert_parallel(model, mesh = None):
     for block, problem in kept:
         chain = tpn._experts_chain(block)
         if chain and any(
-            getattr(chain[-1]._parameters.get(n), tpn._EXPERT_PRELOAD, None) is not None
-            for n in tpn._EXPERT_STACKS
+            getattr(p, tpn._EXPERT_PRELOAD, None) is not None
+            for p in chain[-1]._parameters.values()
         ):
             raise ValueError(
-                f"Unsloth: expert_parallel_loading kept only this rank's 4-bit experts of "
+                f"Unsloth: expert_parallel_loading kept only this rank's experts of "
                 f"{type(block).__name__}, but they cannot be sharded now ({problem}); load in full."
             )
     if not sharded:
