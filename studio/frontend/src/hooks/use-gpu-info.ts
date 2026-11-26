@@ -66,8 +66,7 @@ export interface GpuInfo {
   dedicatedMemoryTotalGb: number;
   /** Image/video loads live on ONE device, so their fit math must not use the multi-GPU sum. */
   maxDeviceMemoryGb: number;
-  /** Lowest visible ordinal, where a bare "cuda" diffusion load lands; NOT maxDeviceMemoryGb on a
-   * heterogeneous host. */
+  /** Lowest visible ordinal, where bare "cuda" diffusion lands; not maxDeviceMemoryGb if mixed. */
   loadDeviceMemoryGb: number;
   loadDeviceSharedMemory: boolean;
   /** Includes Linux ROCm APUs, which report only unified_memory; offload frees nothing on either. */
@@ -126,8 +125,7 @@ function appleUnifiedLoadBudgetGb(
     finiteNonNegative(data?.memory?.available_gb);
   // The Metal inventory cannot see the resident's share, so a switch keeps the live budget.
   if (afterUnload && !metalInventory) {
-    // The AGX in-use figure holds the resident model's Metal buffers, which the loader frees first;
-    // other apps' memory stays counted. Unknown usage leaves only the working-set ceiling.
+    // Resident Metal buffers free on unload; other apps count; unknown usage: ceiling only.
     const usedGb = finiteNonNegative(device.vram_used_gb);
     freeGb = freeGb !== null && usedGb !== null ? freeGb + usedGb : null;
   }
@@ -311,8 +309,7 @@ function toGpuDevices(
     }));
 }
 
-/** Keep the previous array when unchanged: polls re-probe memory, and consumers memoise picker
- * options on this list. */
+/** Keeps the previous array when unchanged: polls re-probe memory and consumers memoise on it. */
 export function withStableSchemes(current: GpuInfo, next: GpuInfo): GpuInfo {
   const held = current.denseQuantSchemes;
   const fresh = next.denseQuantSchemes;
@@ -443,8 +440,7 @@ export function useGpuDevices(forDiffusion = false): SystemGpuDevice[] {
 /** Empty when there is nothing to choose; diffusion checkpoints are never sharded. */
 export function useDiffusionGpuChoices(): SystemGpuDevice[] {
   const devices = useGpuDevices(true);
-  // Memoized: a fresh array per render cascaded into the GGUF picker re-POSTing download plans
-  // on every status poll.
+  // Memoized: fresh arrays each render made the GGUF picker re-POST download plans every poll.
   return useMemo(() => {
     const context = pinnableGpuContext(devices, true);
     return (context.ids?.length ?? 0) > 1 ? (context.devices ?? []) : [];
