@@ -25,7 +25,6 @@ on:
       - 'tests/test_gc_skip_auto.py'
       - 'tests/test_native_resume_old_torch.py'
       - 'tests/test_ulysses_hybrid.py'
-      # Shared helpers, the conftest that loads them, and pytest's config.
       - 'tests/_*.py'
       - 'tests/_shared/**'
       - 'tests/conftest.py'
@@ -53,7 +52,6 @@ on:
       - 'tests/test_gc_skip_auto.py'
       - 'tests/test_native_resume_old_torch.py'
       - 'tests/test_ulysses_hybrid.py'
-      # Shared helpers, the conftest that loads them, and pytest's config.
       - 'tests/_*.py'
       - 'tests/_shared/**'
       - 'tests/conftest.py'
@@ -93,14 +91,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Native FSDP2's gloo tests spawn 2 to 4 ranks each: about ten minutes of this
-          # runner on their own, which pushed the catch-all to the 2100 s step cap. They run
-          # beside it instead.
-          # They then grew to 2092 s of the same cap on their own (364 tests by 2026-10-28)
-          # and were interrupted after passing, so they are split in two by file name: native_d
-          # onwards is about 55% of the measured time, everything else about 45%. Each glob
-          # must match a file, or bash hands pytest the literal pattern
-          # (tests/test_ci_repo_cpu_shards.py checks both).
+          # Native FSDP2 gloo tests pushed the catch-all to its 2100 s cap; split by file name, each
+          # glob must match a file or bash passes it literally (test_ci_repo_cpu_shards.py).
           - shard: fsdp2
             selection: >-
               tests/test_fsdp2_[!n]*.py
@@ -134,16 +126,14 @@ jobs:
           - shard: gloo-tp-env
             selection: >-
               tests/test_tp_[!n]*gloo*.py
-          # Issue 16407 grew the cp gloo file to a third of the shard; each gloo test spawns 2 to 8
-          # ranks, four at once peaked near 20 GB on a 16 GB runner, so 2 workers; test_p[!ap]*
-          # matches no shard.
+          # Issue 16407 grew the cp gloo file; each gloo test spawns 2 to 8 ranks, four at once
+          # peaked near 20 GB on a 16 GB runner, so 2 workers; test_p[!ap]* matches no shard.
           - shard: gloo-cp
             workers: 2
             selection: >-
               tests/test_parallel_c*gloo*.py
-          # Pipeline parallel growth (15655, 15656, 16167, 16417) hit the 2100 s cap, so TP and PP
-          # split; a gloo file named test_t[!p]* or test_tp[!_]* matches no shard and is reported
-          # dropped.
+          # Pipeline growth (15655, 15656, 16167, 16417) hit the 2100 s cap, so TP/PP split; gloo
+          # files named test_t[!p]* or test_tp[!_]* match no shard and are reported dropped.
           - shard: gloo-tp
             selection: >-
               tests/test_tp_n*gloo*.py
