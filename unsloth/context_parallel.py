@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import functools
+import os
 import sys
 import threading
 import types
@@ -2534,6 +2535,74 @@ class _GatherSequence(torch.autograd.Function):
 
 def gather_sequence(x, manager):
     return _GatherSequence.apply(x, manager.group, manager.mesh.get_local_rank(), manager.size)
+
+
+# UNSLOTH_CP_LOCAL_LOGPS=0: every peer scores every row (cp_local_row_scorer off).
+_LOCAL_ROWS_ENV = "UNSLOTH_CP_LOCAL_LOGPS"
+CP_LOCAL_ROWS_STATS = {"local": 0, "full": 0}
+
+
+class _GatherRows(torch.autograd.Function):
+    """All-gather of each peer's per-row results. Backward: this peer's slice x N. Every peer back-propagates the
+    same loss, so that equals what _GatherSequence's reduce-scatter gives full-sequence scoring."""
+
+    @staticmethod
+    def forward(ctx, x, group, rank, size, per, total):
+        ctx.lo, ctx.n, ctx.size = rank * per, x.shape[0], size
+        padded = (
+            torch.cat([x, x.new_zeros(per - x.shape[0])]) if x.shape[0] < per else x.contiguous()
+        )
+        if _all_gather_into is not None and _fused_gather_ok(group):
+            out = x.new_empty(size * per)
+            _all_gather_into(out, padded, group = group)
+        else:
+            parts = [torch.empty_like(padded) for _ in range(size)]
+            dist.all_gather(parts, padded, group = group)
+            out = torch.cat(parts)
+        return out[:total].clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad[ctx.lo : ctx.lo + ctx.n] * ctx.size, None, None, None, None, None
+
+
+def cp_local_row_scorer(fn):
+    """Wrap a GRPO row scorer `fn(hidden [B, T, H], lm_head, index [B, T], ...)` -> [B, T] (or a tuple with
+    entropies). Inside a CP scope every peer holds the same gathered rows, so each scores 1 / N of them and gathers
+    the rest. Returns `fn` itself outside a scope, for one rank, or under UNSLOTH_CP_LOCAL_LOGPS=0."""
+    manager = get_cp_manager()
+    if manager is None or manager.size < 2 or os.environ.get(_LOCAL_ROWS_ENV, "1") == "0":
+        return fn
+
+    @functools.wraps(fn)
+    def scorer(hidden_states, lm_head, index, *args, **kwargs):
+        size = manager.size
+        total = index.numel()
+        per = -(-total // size)
+        # Every peer sees the same shapes, so every peer takes the same branch.
+        if (
+            get_cp_manager() is not manager
+            or hidden_states.shape[:-1] != index.shape
+            or (size - 1) * per >= total
+        ):
+            CP_LOCAL_ROWS_STATS["full"] += 1
+            return fn(hidden_states, lm_head, index, *args, **kwargs)
+        rank = manager.mesh.get_local_rank()
+        lo, hi = rank * per, min(total, (rank + 1) * per)
+        rows = hidden_states.reshape(-1, hidden_states.shape[-1])[lo:hi].unsqueeze(0)
+        out = fn(rows, lm_head, index.reshape(-1)[lo:hi].unsqueeze(0), *args, **kwargs)
+        CP_LOCAL_ROWS_STATS["local"] += 1
+
+        def gathered(x):
+            if not isinstance(x, torch.Tensor):
+                return x
+            return _GatherRows.apply(x.reshape(-1), manager.group, rank, size, per, total).view(
+                index.shape
+            )
+
+        return tuple(gathered(x) for x in out) if isinstance(out, tuple) else gathered(out)
+
+    return scorer
 
 
 def _rl_decoder_pre_hook(module, args, kwargs):
