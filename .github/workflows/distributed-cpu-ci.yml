@@ -86,7 +86,7 @@ jobs:
       # `split: k/n` runs part k of the selection, weighted by tests/_shared/shard_durations.json.
       UNSLOTH_TEST_SPLIT: ${{ matrix.split || '' }}
       UNSLOTH_TEST_RANK_ZYGOTE_STATS: /tmp/unsloth_rank_zygote_stats
-      PYTEST_ADDOPTS: --durations=40
+      PYTEST_ADDOPTS: --durations=40 --junitxml=/tmp/g176-junit.xml
     strategy:
       # The multi-rank shards of Backend CI's Repo tests (CPU), moved here unchanged. Together with
       # studio-backend-ci.yml's repo-cpu-tests matrix every tests/ file lands in exactly one shard
@@ -358,6 +358,14 @@ jobs:
           timeout --signal=INT --kill-after=60 2100 \
           python -m pytest ${{ matrix.selection }} -q -rs --tb=short -n ${{ matrix.workers || 4 }} --dist loadgroup --timeout=330 --timeout-method=thread \
             -m 'not server and not e2e'
+
+      - name: g176 measurement (staging only) upload junit
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: junit-${{ matrix.shard }}
+          path: /tmp/g176-junit.xml
+          retention-days: 7
 
       - name: How the ranks started (forked from the zygote, or spawned again and why)
         if: always()
